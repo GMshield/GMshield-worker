@@ -1,0 +1,25 @@
+# Only what the build needs enters the build context.
+.git
+.github
+.gmshield
+.gmshield-reports
+.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.scannerwork
+.idea
+.vscode
+**/__pycache__
+**/*.py[cod]
+gmshield_worker/backend/generated
+reports
+out
+.coverage
+coverage.xml
+*.md
+sonar-project.properties
+Dockerfile
+.dockerignore
+.env
+.env*

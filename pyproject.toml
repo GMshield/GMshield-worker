@@ -1,0 +1,74 @@
+# GMshield worker. Every direct dependency is pinned exactly; uv.lock holds every transitive one.
+# Versions: the newest release at least two weeks old on 2026-11-13 (released by 2026-10-30).
+[project]
+name = "gmshield-worker"
+version = "0.1.0"
+description = "GMshield worker: ingestion, OCR, retrieval and model calls"
+requires-python = "==3.14.*"
+dependencies = [
+    "docling==2.145.0",
+    "torch==2.15.0",
+    "torchvision==0.29.2",
+    "anthropic==2.3.0",
+    "httpx==0.28.1",
+    "attrs==26.1.0",  # imported by the generated client
+]
+
+[dependency-groups]
+dev = [
+    "openapi-python-client==0.29.1",
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.13.6"
+# Every package, transitive ones included, was released on or before 2026-10-30.
+exclude-newer = "2026-10-31T00:00:00Z"
+
+# torch and torchvision come from the PyTorch CPU index: no CUDA wheels.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+extend-exclude = ["gmshield_worker/backend/generated"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PL"]
+ignore = ["PLR2004", "PLR0913"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S108", "PLC0415"]
+"tools/**" = ["S603"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+files = ["gmshield_worker", "tests", "tools"]
+exclude = ["gmshield_worker/backend/generated/"]
+
+[[tool.mypy.overrides]]
+module = ["gmshield_worker.backend.generated.*"]
+follow_imports = "silent"
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --ignore=tests/image"
+markers = ["image: runs only inside the production image"]
+
+[tool.coverage.run]
+source = ["gmshield_worker"]
+omit = ["gmshield_worker/backend/generated/*"]
+branch = true
