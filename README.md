@@ -39,11 +39,11 @@ image check.
 `uvx pip-audit` over `uv export --no-hashes` and Trivy 0.76.1 (the pipeline's image) over the
 lockfile and the production image:
 
-- **soupsieve 3.0.4** (transitive: Docling, then beautifulsoup4) has CVE-2026-126190 (HIGH, a
-  denial of service in the descendant combinator), fixed in 4.0. No fixed release meets the
-  two-week rule yet: 4.0 came out on 2026-11-03 and 4.0.1 on 2026-11-04, so the lock keeps 3.0.4.
-  Trivy counts it as fixable, so the pipeline's SCA and image gates block until it is raised;
-  4.0.1 meets the rule from 2026-11-18.
+- **soupsieve 4.0.1** (transitive: Docling, then beautifulsoup4) is an exception to the two-week
+  rule, approved by Dalton on 2026-11-13: 3.0.4 has CVE-2026-126190 (HIGH, a denial of service in
+  the descendant combinator), fixed in 4.0, and 4.0.1 (released 2026-11-04) is the fixed release.
+  `[tool.uv] exclude-newer-package` allows soupsieve up to 2026-11-05 only; remove that line once
+  the global `exclude-newer` date passes 2026-11-04.
 - **zlib1g**: the image installs trixie's current security update, unpinned because the security
   archive keeps only the newest version (on 2026-11-13, `1:1.3.dfsg+really1.3.1-1+deb13u1`, which
   fixes CVE-2026-76844 and CVE-2026-85091).
