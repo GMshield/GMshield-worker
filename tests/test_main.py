@@ -244,8 +244,13 @@ def test_start_up_never_listens_and_connects_only_to_the_backend(
     assert all(address == ("127.0.0.1", port) for address in connected)
 
 
-def run_process(environment: dict[str, str]) -> subprocess.Popen[str]:
-    env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(ROOT), **environment}
+def run_process(environment: dict[str, str], health_file: Path) -> subprocess.Popen[str]:
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(ROOT),
+        "GMSHIELD_HEALTH_FILE": str(health_file),
+        **environment,
+    }
     return subprocess.Popen(
         [sys.executable, "-m", "gmshield_worker.main"],
         cwd=ROOT,
@@ -268,7 +273,9 @@ def wait_for_event(process: subprocess.Popen[str], event: str) -> None:
 def test_sigterm_ends_with_status_0(stand_in: StandIn, tmp_path: Path, state: str) -> None:
     url = stand_in.url if state == "ready" else "http://127.0.0.1:9"
     work_dir = str(tmp_path / "w")
-    process = run_process({"GMSHIELD_MODE": "test", "GMSHIELD_BACKEND_URL": url, "GMSHIELD_WORK_DIR": work_dir})
+    process = run_process(
+        {"GMSHIELD_MODE": "test", "GMSHIELD_BACKEND_URL": url, "GMSHIELD_WORK_DIR": work_dir}, tmp_path / "healthy"
+    )
     try:
         wait_for_event(process, "worker.ready" if state == "ready" else "backend.unreachable")
         process.send_signal(signal.SIGTERM)
@@ -278,8 +285,8 @@ def test_sigterm_ends_with_status_0(stand_in: StandIn, tmp_path: Path, state: st
         process.communicate()
 
 
-def test_the_process_refuses_without_secrets() -> None:
-    process = run_process({})
+def test_the_process_refuses_without_secrets(tmp_path: Path) -> None:
+    process = run_process({}, tmp_path / "healthy")
     _out, err = process.communicate(timeout=30)
     assert process.returncode == 78
     refused = log_lines(err)[-1]

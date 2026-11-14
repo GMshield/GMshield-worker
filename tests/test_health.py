@@ -37,3 +37,11 @@ def test_a_file_from_the_future_is_unhealthy(tmp_path: Path) -> None:
     path = tmp_path / "healthy"
     health.mark_healthy(path)
     assert not health.is_healthy(path, now=path.stat().st_mtime - 60)
+
+
+def test_the_default_file_is_outside_world_writable_folders() -> None:
+    # SonarQube python:S5443: the image keeps it in /run/gmshield-worker, owned by the worker, mode 0700.
+    if "GMSHIELD_HEALTH_FILE" not in os.environ:
+        expected = Path("/run/gmshield-worker/healthy")
+        assert expected == health.HEALTH_FILE
+    assert not str(health.HEALTH_FILE).startswith(("/tmp/", "/var/tmp/", "/dev/shm/"))

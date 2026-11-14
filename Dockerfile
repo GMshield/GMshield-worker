@@ -60,7 +60,8 @@ RUN apt-get update \
     && rm -rf /usr/local/lib/python3.14/site-packages/pip /usr/local/lib/python3.14/site-packages/pip-* \
         /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.14 /usr/local/bin/idle* \
     && groupadd --system --gid 10001 gmshield \
-    && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin gmshield
+    && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin gmshield \
+    && install -d -o 10001 -g 10001 -m 0700 /var/lib/gmshield-worker/work /run/gmshield-worker
 COPY --from=build /opt/venv /opt/venv
 COPY --from=build /opt/docling-models /opt/docling-models
 # The application comes from the test stage, so the image exists only when the tests passed.
@@ -76,11 +77,12 @@ ENV PATH=/opt/venv/bin:$PATH \
     XDG_CACHE_HOME=/tmp/.cache \
     HF_HUB_OFFLINE=1 \
     DOCLING_ARTIFACTS_PATH=/opt/docling-models
-# Not root, and nothing written outside /tmp: the root filesystem can be read-only.
-# /tmp is a volume so that `--read-only` works without any other option; a tmpfs on /tmp replaces it.
+# Not root, and nothing written outside /tmp, the work folder and the health folder: the root
+# filesystem can be read-only. All three are volumes so that `--read-only` works without any other
+# option; Docker fills each new volume from the image's folder, owner and mode included.
 # No EXPOSE: the worker opens no port. Health is a file that the supervisor keeps fresh.
 USER 10001:10001
-VOLUME ["/tmp"]
+VOLUME ["/tmp", "/var/lib/gmshield-worker/work", "/run/gmshield-worker"]
 HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=3 \
     CMD ["python", "-m", "gmshield_worker.health"]
 CMD ["python", "-m", "gmshield_worker.main"]

@@ -13,7 +13,10 @@ import sys
 import time
 from pathlib import Path
 
-HEALTH_FILE = Path("/tmp/gmshield-worker.healthy")  # noqa: S108 - /tmp is the only writable place
+# A folder of the image owned by the worker (mode 0700), not a world-writable one; a VOLUME, so it
+# stays writable with a read-only root filesystem. GMSHIELD_HEALTH_FILE moves it, for tests that run
+# the worker outside the image (the worker and the HEALTHCHECK read the same environment).
+HEALTH_FILE = Path(os.environ.get("GMSHIELD_HEALTH_FILE") or "/run/gmshield-worker/healthy")
 # Three missed re-checks (every 30 s) and the worker counts as hung.
 MAX_AGE_SECONDS = 90.0
 

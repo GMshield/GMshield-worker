@@ -14,3 +14,6 @@ openapi = ""                 # no HTTP surface to scan
 
 [deploy]
 host_port = 0               # 127.0.0.1:<host_port> on roberto-server (0 = not published)
+# Decrypted material lives only in the work folder (AD-21): a named volume, gmshield-worker-work,
+# in Docker's data on the encrypted volume (AD-24). The worker empties it at start.
+mounts = [{ name = "work", target = "/var/lib/gmshield-worker/work" }]

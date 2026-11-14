@@ -3,8 +3,10 @@
 - `GMSHIELD_MODE=test` (set only by the pipeline): no secret is needed, the model is the fake
   model, and the backend is `http://stand-in-backend:8080` unless `GMSHIELD_BACKEND_URL` is set.
 - No mode: `GMSHIELD_BACKEND_URL` and every secret in `REQUIRED_SECRETS` are required.
-- `GMSHIELD_WORK_DIR` is optional (default `/tmp/gmshield-work`; Story 1.5 moves it onto the
+- `GMSHIELD_WORK_DIR` is optional (default `/var/lib/gmshield-worker/work`, a folder of the image
+  owned by the worker; production mounts the named volume `gmshield-worker-work` there, on the
   encrypted volume).
+- `GMSHIELD_HEALTH_FILE` (read in `health.py`) is for tests that run the worker outside the image.
 
 A refusal names settings and never holds a value.
 """
@@ -24,7 +26,7 @@ WORK_DIR = "GMSHIELD_WORK_DIR"
 ANTHROPIC_API_KEY = "GMSHIELD_ANTHROPIC_API_KEY"
 
 TEST_MODE_BACKEND_URL = "http://stand-in-backend:8080"
-DEFAULT_WORK_DIR = "/tmp/gmshield-work"  # noqa: S108 - the only writable place; Story 1.5 moves it
+DEFAULT_WORK_DIR = "/var/lib/gmshield-worker/work"
 
 # Required outside test mode (Dalton, 2026-11-13). The worker's service credential and its Redis
 # credentials join this list in Story 1.12, which first uses them.
