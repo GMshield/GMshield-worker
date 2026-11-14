@@ -6,8 +6,9 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-import re
 from pathlib import Path
+
+from openapi_python_client.strings import PythonIdentifier, snake_case
 
 from gmshield_worker.backend.generated import _contract
 from gmshield_worker.backend.generated.api.contract import get_internal_contract_version
@@ -15,10 +16,21 @@ from gmshield_worker.backend.generated.api.contract import get_internal_contract
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / "contracts" / "internal.json"
 GENERATED = ROOT / "gmshield_worker" / "backend" / "generated"
+HTTP_METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 
 
-def snake(name: str) -> str:
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+def operations(contract: dict[str, object]) -> list[dict[str, object]]:
+    """Every operation of the contract; path-level keys such as `parameters` are not operations."""
+    paths = contract["paths"]
+    assert isinstance(paths, dict)
+    return [item[method] for item in paths.values() for method in HTTP_METHODS if method in item]
+
+
+def tag_module(operation: dict[str, object]) -> str:
+    """The folder the generator puts an operation in: its first tag, or `default` (as the generator)."""
+    tags = operation.get("tags") or ["default"]
+    assert isinstance(tags, list)
+    return str(PythonIdentifier(value=str(tags[0]), prefix="tag"))
 
 
 def test_the_client_was_generated_from_this_contract() -> None:
@@ -29,18 +41,18 @@ def test_the_client_was_generated_from_this_contract() -> None:
 
 def test_every_operation_has_a_generated_module() -> None:
     contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
-    for path_item in contract["paths"].values():
-        for operation in path_item.values():
-            tag = snake(operation["tags"][0])
-            module = GENERATED / "api" / tag / f"{snake(operation['operationId'])}.py"
-            assert module.is_file(), module
+    found = operations(contract)
+    assert found
+    for operation in found:
+        module = GENERATED / "api" / tag_module(operation) / f"{snake_case(str(operation['operationId']))}.py"
+        assert module.is_file(), module
     assert callable(get_internal_contract_version.sync_detailed)
 
 
 def test_every_schema_has_a_generated_model() -> None:
     contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
     for schema in contract["components"]["schemas"]:
-        assert (GENERATED / "models" / f"{snake(schema)}.py").is_file(), schema
+        assert (GENERATED / "models" / f"{snake_case(schema)}.py").is_file(), schema
 
 
 def test_no_hand_written_class_describes_a_backend_schema() -> None:

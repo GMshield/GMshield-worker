@@ -45,11 +45,12 @@ ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.title="gmshield-worker" \
       org.opencontainers.image.revision="${GIT_SHA}"
 # Tesseract 5.5.0 from Debian trixie with its Portuguese and English data, pinned by package
-# version, and zlib1g's trixie security fix (CVE-2026-76844, CVE-2026-85091; checked 2026-11-13).
+# version, and zlib1g's current trixie security update (unpinned: the security archive keeps only
+# the newest; on 2026-11-13 it fixed CVE-2026-76844 and CVE-2026-85091).
 # pip is not needed to run, and is only more to patch.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1 \
+        zlib1g \
         tesseract-ocr=5.5.0-1+b1 \
         libtesseract5=5.5.0-1+b1 \
         tesseract-ocr-por=1:4.1.0-2 \

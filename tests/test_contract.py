@@ -13,6 +13,8 @@ from gmshield_worker.backend.contract import MINIMUM_BACKEND_CONTRACT_VERSION, m
         ("1.0", None),
         ("01.0.0", None),
         ("1.0.0-rc.1", None),
+        ("1\u0661.0.0", None),
+        ("\u0661.0.0", None),
         (" 1.0.0", None),
         (None, None),
         (100, None),

@@ -28,6 +28,10 @@ package = false
 required-version = ">=0.13.6"
 # Every package, transitive ones included, was released on or before 2026-10-30.
 exclude-newer = "2026-10-31T00:00:00Z"
+# Security exception (Dalton, 2026-11-13): soupsieve 4.0.1 (released 2026-11-04) fixes
+# CVE-2026-126190 (HIGH) and is newer than the two-week rule allows. Remove this line once the
+# global date passes 2026-11-04.
+exclude-newer-package = { soupsieve = "2026-11-05T00:00:00Z" }
 
 # torch and torchvision come from the PyTorch CPU index: no CUDA wheels.
 [[tool.uv.index]]

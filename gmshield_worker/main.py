@@ -3,7 +3,9 @@
 Start-up order:
   1. Check the settings. Outside test mode a missing secret or setting stops the start with exit
      status 78 and one `startup.refused` line that names the settings, never a value.
-  2. Empty the work folder (its contents, never the folder; links are not followed).
+  2. Empty the work folder (its contents, never the folder; links are not followed). A folder
+     that is a link or a file, or that cannot be read or created, stops the start with exit
+     status 78; a failed removal of one entry is logged and the start continues.
   3. Ask the backend for its internal contract version, retrying with exponential backoff (1 s up
      to 30 s, with jitter, 2 s per attempt) until it answers.
 
@@ -32,8 +34,8 @@ from gmshield_worker.backend.client import VersionAnswer, fetch_contract_version
 from gmshield_worker.backend.contract import MINIMUM_BACKEND_CONTRACT_VERSION, meets_minimum, parse_version
 from gmshield_worker.log import log_event, new_trace_id
 from gmshield_worker.models import select_model_client
-from gmshield_worker.settings import SettingsRefused, check_settings
-from gmshield_worker.workdir import empty_work_dir
+from gmshield_worker.settings import WORK_DIR, SettingsRefused, check_settings
+from gmshield_worker.workdir import WorkDirUnusable, empty_work_dir
 
 UNIT = "worker.supervisor"
 # Exit status of a refused start (EX_CONFIG), the same as the backend's and the frontend's.
@@ -199,7 +201,11 @@ def run(
         model=model.kind,
         minimumContractVersion=MINIMUM_BACKEND_CONTRACT_VERSION,
     )
-    empty_work_dir(settings.work_dir, trace_id)
+    try:
+        empty_work_dir(settings.work_dir, trace_id)
+    except WorkDirUnusable:
+        log_event("ERROR", UNIT, "startup.refused", trace_id, reason="workdir.unusable", settings=[WORK_DIR])
+        return REFUSED_EXIT_STATUS
 
     Supervisor(
         backend_url=settings.backend_url,

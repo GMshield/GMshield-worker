@@ -24,24 +24,29 @@ every transitive one, and `[tool.uv] exclude-newer` keeps them all on or before 
 | pytest, pytest-cov | 9.2.0, 7.1.0 | `pyproject.toml` (development) |
 | ruff | 0.17.3 | `pyproject.toml` (development) |
 | mypy | 2.4.1 | `pyproject.toml` (development) |
-| Tesseract | 5.5.0 (Debian trixie `tesseract-ocr` 5.5.0-1+b1), with `tesseract-ocr-por` and `tesseract-ocr-eng` 1:4.1.0-2 | `Dockerfile` |
+| Tesseract | 5.5.0 (Debian trixie `tesseract-ocr` and `libtesseract5` 5.5.0-1+b1), with `tesseract-ocr-por`, `tesseract-ocr-eng` and `tesseract-ocr-osd` (orientation detection, used to straighten pages) 1:4.1.0-2 | `Dockerfile` |
 
 **Tesseract differs from the architecture spine**, which names 5.5.4: only Debian unstable has
 that version. The image uses trixie's 5.5.0, pinned by package version, so that every package comes
-from the base image's own release.
+from the base image's own release. A Debian point release can replace these versions in the
+archive, and the build then fails at `apt-get install`: look up the new versions with
+`apt-cache policy tesseract-ocr libtesseract5 tesseract-ocr-por tesseract-ocr-eng tesseract-ocr-osd`
+in the pinned Python image, update the pins in the `Dockerfile` and this table, and rerun the
+image check.
 
 ### Security check of the pinned versions (2026-11-13)
 
 `uvx pip-audit` over `uv export --no-hashes` and Trivy 0.76.1 (the pipeline's image) over the
 lockfile and the production image:
 
-- **soupsieve 3.0.4** (transitive: Docling, then beautifulsoup4) has CVE-2026-126190 (HIGH, a
-  denial of service in the descendant combinator), fixed in 4.0. No fixed release meets the
-  two-week rule yet: 4.0 came out on 2026-11-03 and 4.0.1 on 2026-11-04, so the lock keeps 3.0.4.
-  Trivy counts it as fixable, so the pipeline's SCA and image gates block until it is raised;
-  4.0.1 meets the rule from 2026-11-18.
-- **zlib1g**: the image installs trixie's security update `1:1.3.dfsg+really1.3.1-1+deb13u1`
-  (CVE-2026-76844, CVE-2026-85091).
+- **soupsieve 4.0.1** (transitive: Docling, then beautifulsoup4) is an exception to the two-week
+  rule, approved by Dalton on 2026-11-13: 3.0.4 has CVE-2026-126190 (HIGH, a denial of service in
+  the descendant combinator), fixed in 4.0, and 4.0.1 (released 2026-11-04) is the fixed release.
+  `[tool.uv] exclude-newer-package` allows soupsieve up to 2026-11-05 only; remove that line once
+  the global `exclude-newer` date passes 2026-11-04.
+- **zlib1g**: the image installs trixie's current security update, unpinned because the security
+  archive keeps only the newest version (on 2026-11-13, `1:1.3.dfsg+really1.3.1-1+deb13u1`, which
+  fixes CVE-2026-76844 and CVE-2026-85091).
 - Every other high or critical finding in the image is a Debian package with no fix released
   (Trivy status `affected`, `will_not_fix` or `fix_deferred`), including Tesseract 5.5.0 and
   libxml2; the pipeline's image gate counts only fixable findings.
@@ -70,7 +75,8 @@ lockfile and the production image:
    78 and one `startup.refused` line that names the settings, never a value.
 2. **Work folder.** Everything inside `GMSHIELD_WORK_DIR` is removed; the folder itself stays, and
    a symbolic link is removed as a link, never followed. A removal that fails is logged by error
-   type and the start continues.
+   type and the start continues. A folder that is a link or a file, or that cannot be created or
+   read, stops the start with exit status 78 (`startup.refused`, reason `workdir.unusable`).
 3. **Backend.** `GET /internal/v1/version` is retried with exponential backoff (1 s doubling up to
    30 s, with jitter of plus or minus 20%, 2 s per attempt) until the backend answers. Each failure
    is logged by attempt and error type only.
@@ -86,10 +92,13 @@ lockfile and the production image:
   `traceparent` with the start-up trace id and a new span id, a 2 s timeout, no redirects, and no
   proxy taken from the environment.
 - **Model.** `models/` has one interface, `ModelClient`, with the fake model (deterministic, no
-  network) and the Claude client (Anthropic SDK, model `claude-opus-5-5`; the SDK client is
-  created on first use, so building it calls nothing). Test mode always uses the fake model.
+  network) and the Claude client (Anthropic SDK, default model `claude-sonnet-5-5`, the full tier;
+  `claude-haiku-5-5` is the lightweight tier, and the backend will choose per job under AD-18; the
+  SDK client is created on first use, so building it calls nothing). Test mode always uses the fake
+  model; outside it a missing key is an error, never a silent fake.
   Nothing calls a model, Qdrant or Ollama in this story.
-- **Logs.** One JSON object per line: `timestamp`, `level`, `traceId`, `unit`, `event`, then ids,
+- **Logs.** One JSON object per line, ERROR lines on standard error and the rest on standard
+  output: `timestamp`, `level`, `traceId`, `unit`, `event`, then ids,
   numbers, versions, status codes, setting names or error types. Never content, never a secret,
   never a URL.
 - **Shutdown.** SIGTERM or SIGINT ends the process with exit status 0, whether it is retrying or

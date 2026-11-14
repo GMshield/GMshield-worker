@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import anthropic
 
-DEFAULT_MODEL = "claude-opus-5-5"
+# The architecture's full tier; the lightweight tier is claude-haiku-5-5. The backend will choose
+# the model per job (AD-18).
+DEFAULT_MODEL = "claude-sonnet-5-5"
 
 
 class ClaudeModelClient:

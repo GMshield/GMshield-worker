@@ -7,7 +7,7 @@ import pytest
 from gmshield_worker.models import select_model_client
 from gmshield_worker.models.claude import DEFAULT_MODEL, ClaudeModelClient
 from gmshield_worker.models.fake import FakeModelClient
-from gmshield_worker.settings import check_settings
+from gmshield_worker.settings import Settings, check_settings
 
 
 def test_the_fake_model_is_deterministic() -> None:
@@ -65,3 +65,9 @@ def test_the_claude_client_sends_one_message_through_the_sdk(monkeypatch: pytest
     monkeypatch.setattr(client, "_client", sdk)
     assert client.complete("system", "prompt", max_tokens=16) == "an answer"
     assert seen[0].url.path == "/v1/messages"
+
+
+def test_outside_test_mode_a_missing_key_is_an_error_not_the_fake_model() -> None:
+    settings = Settings(test_mode=False, backend_url="http://b:8080", work_dir="/tmp/w", anthropic_api_key=None)
+    with pytest.raises(ValueError, match="API key"):
+        select_model_client(settings)

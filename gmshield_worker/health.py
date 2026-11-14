@@ -34,7 +34,8 @@ def is_healthy(path: Path = HEALTH_FILE, *, now: float | None = None, max_age: f
     except OSError:
         return False
     current = time.time() if now is None else now
-    return current - modified <= max_age
+    # A future time (the clock stepped back) is not fresh: it would never go stale.
+    return 0 <= current - modified <= max_age
 
 
 def main() -> int:

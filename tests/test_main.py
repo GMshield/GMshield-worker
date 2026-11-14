@@ -139,14 +139,42 @@ def test_a_body_that_is_not_a_version_is_never_echoed(
     assert incompatible[0]["backendContractVersion"] == "invalid"
 
 
-def test_an_error_status_is_retried(stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_a_body_that_is_not_the_contract_is_retried(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     stand_in.status = 500
     stand_in.body = b"internal details that must not be logged"
     with running(mode_env(stand_in, tmp_path), tmp_path / "healthy"):
         wait_for(lambda: len(stand_in.requests) >= 2)
     output = capsys.readouterr().out
     assert "internal details" not in output
-    assert any(line["event"] in ("backend.unexpected_answer", "backend.unreachable") for line in log_lines(output))
+    failures = [line for line in log_lines(output) if line["event"] == "backend.unreachable"]
+    assert failures
+    assert failures[0]["errorType"] == "JSONDecodeError"
+
+
+def test_a_problem_answer_is_retried_until_the_backend_answers(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stand_in.status = 503
+    stand_in.body = (
+        b'{"type":"urn:gmshield:problem:service.unavailable","title":"t","status":503,'
+        b'"category":"service","code":"service.unavailable","params":{},"traceId":"x"}'
+    )
+    health_file = tmp_path / "healthy"
+    with running(mode_env(stand_in, tmp_path), health_file):
+        wait_for(lambda: len(stand_in.requests) >= 3)
+        assert not health_file.exists()
+        stand_in.status, stand_in.body = 200, None
+        wait_for(lambda: health.is_healthy(health_file))
+    lines = log_lines(capsys.readouterr().out)
+    unexpected = [line for line in lines if line["event"] == "backend.unexpected_answer"]
+    assert len(unexpected) >= 3
+    assert all(line["status"] == 503 for line in unexpected)
+    attempts = [line["attempt"] for line in unexpected]
+    assert attempts == list(range(1, len(attempts) + 1))
+    assert "service.unavailable" not in str(lines)
+    assert any(line["event"] == "worker.ready" for line in lines)
 
 
 def test_missing_secret(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -268,3 +296,35 @@ def test_the_signal_stop_wakes_a_waiter() -> None:
     assert time.monotonic() - started < 2
     stop.set()  # twice: no error
     assert stop.is_set()
+
+
+def test_a_link_in_place_of_the_work_folder_refuses_the_start(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "work").symlink_to(outside, target_is_directory=True)
+    status = main.run(mode_env(stand_in, tmp_path), threading.Event(), health_file=tmp_path / "healthy")
+    assert status == 78
+    refused = log_lines(capsys.readouterr().err)[-1]
+    assert refused["event"] == "startup.refused"
+    assert refused["reason"] == "workdir.unusable"
+    assert refused["settings"] == ["GMSHIELD_WORK_DIR"]
+    assert stand_in.requests == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_an_unwritable_parent_refuses_the_start(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parent = tmp_path / "locked"
+    parent.mkdir(mode=0o500)
+    environment = {**mode_env(stand_in, tmp_path), "GMSHIELD_WORK_DIR": str(parent / "work")}
+    try:
+        status = main.run(environment, threading.Event(), health_file=tmp_path / "healthy")
+    finally:
+        parent.chmod(0o700)
+    assert status == 78
+    lines = log_lines(capsys.readouterr().err)
+    assert [line["event"] for line in lines[-2:]] == ["workdir.unusable", "startup.refused"]
+    assert lines[-1]["reason"] == "workdir.unusable"

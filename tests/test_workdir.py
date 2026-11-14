@@ -56,10 +56,64 @@ def test_a_link_in_place_of_the_folder_is_not_followed(tmp_path: Path, capsys: p
     work = tmp_path / "work"
     work.symlink_to(outside, target_is_directory=True)
 
-    assert workdir.empty_work_dir(str(work), TRACE) == 1
+    with pytest.raises(workdir.WorkDirUnusable):
+        workdir.empty_work_dir(str(work), TRACE)
 
     assert (outside / "keep.txt").exists()
     assert log_lines(capsys.readouterr().err)[-1]["event"] == "workdir.not_a_directory"
+
+
+def test_a_file_in_place_of_the_folder_is_unusable(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.write_text("x", encoding="utf-8")
+    with pytest.raises(workdir.WorkDirUnusable):
+        workdir.empty_work_dir(str(work), TRACE)
+    assert work.read_text(encoding="utf-8") == "x"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_folder_that_cannot_be_created_is_unusable(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parent = tmp_path / "locked"
+    parent.mkdir(mode=0o500)
+    try:
+        with pytest.raises(workdir.WorkDirUnusable):
+            workdir.empty_work_dir(str(parent / "work"), TRACE)
+    finally:
+        parent.chmod(0o700)
+    line = log_lines(capsys.readouterr().err)[-1]
+    assert line["event"] == "workdir.unusable"
+    assert line["errorType"] == "PermissionError"
+    assert "locked" not in str(line)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_folder_that_cannot_be_read_is_unusable(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir(mode=0o300)
+    try:
+        with pytest.raises(workdir.WorkDirUnusable):
+            workdir.empty_work_dir(str(work), TRACE)
+    finally:
+        work.chmod(0o700)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_folder_entry_that_is_not_fully_removed_is_not_counted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    work = tmp_path / "work"
+    stuck = work / "job" / "stuck"
+    stuck.mkdir(parents=True)
+    (stuck / "piece").write_text("x", encoding="utf-8")
+    (work / "file").write_text("x", encoding="utf-8")
+    stuck.chmod(0o500)
+    try:
+        assert workdir.empty_work_dir(str(work), TRACE) >= 1
+    finally:
+        stuck.chmod(0o700)
+    emptied = log_lines(capsys.readouterr().out)[-1]
+    assert emptied["event"] == "workdir.emptied"
+    assert emptied["removed"] == 1
 
 
 def test_a_removal_error_is_logged_and_the_rest_continues(
