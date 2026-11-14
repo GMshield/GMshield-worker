@@ -192,6 +192,14 @@ Reports for every run are kept by the pipeline; see [GMshield-pipeline](https://
 
 ## Pipeline contract
 
+In production (Story 1.6) the worker joins `gmshield-work` (the backend at
+`http://gmshield-backend:8080`, later Redis and Qdrant), `gmshield-model` (Ollama on the network's
+gateway) and `gmshield-outbound` (the model provider), runs as 10001 with a read-only root
+filesystem and every capability dropped, and finds the private authority's certificate at
+`/run/gmshield/certs/ca.crt`. `~/gmshield-ci/secrets/worker.env` already holds its Redis account
+(`worker`, consumer-group commands on the two work streams only) and the Qdrant API key, which the
+worker does not use until Story 1.12 and Epic 2.
+
 The pipeline reads [`.gmshield/pipeline.toml`](.gmshield/pipeline.toml) and builds the multi-stage
 `Dockerfile`: `test` generates the client and runs ruff, mypy and pytest; `test-reports` holds the
 JUnit results and Cobertura `coverage.xml`; the production image is the last stage. The worker has

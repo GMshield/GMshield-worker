@@ -13,7 +13,15 @@ path = "/"
 openapi = ""                 # no HTTP surface to scan
 
 [deploy]
-host_port = 0               # 127.0.0.1:<host_port> on roberto-server (0 = not published)
+host_port = 0               # the worker opens no port
+# Story 1.6 (AD-14): gmshield-work (the backend at http://gmshield-backend:8080, later Redis and Qdrant),
+# gmshield-model (Ollama on the network's gateway), gmshield-outbound (the model provider).
+networks = ["gmshield-work", "gmshield-model", "gmshield-outbound"]
+certs = true                # ~/gmshield-ci/certs/worker/ca.crt at /run/gmshield/certs, for Redis and Qdrant later
+read_only = true
+user = "10001:10001"
+cap_drop = ["ALL"]
+tmpfs = ["/tmp"]
 # Decrypted material lives only in the work folder (AD-21): a named volume, gmshield-worker-work,
 # in Docker's data on the encrypted volume (AD-24). The worker empties it at start.
 mounts = [{ name = "work", target = "/var/lib/gmshield-worker/work" }]
