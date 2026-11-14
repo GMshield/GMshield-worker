@@ -26,10 +26,15 @@ class ModelClient(Protocol):
 
 
 def select_model_client(settings: Settings) -> ModelClient:
-    """The fake model in test mode; the Claude client otherwise. Neither calls anything here."""
+    """The fake model in test mode; the Claude client otherwise. Neither calls anything here.
+
+    Raises `ValueError` outside test mode without a key: the fake model never stands in silently.
+    """
     from gmshield_worker.models.claude import ClaudeModelClient  # noqa: PLC0415
     from gmshield_worker.models.fake import FakeModelClient  # noqa: PLC0415
 
-    if settings.test_mode or settings.anthropic_api_key is None:
+    if settings.test_mode:
         return FakeModelClient()
+    if settings.anthropic_api_key is None:
+        raise ValueError("The Claude client needs an API key outside test mode")
     return ClaudeModelClient(api_key=settings.anthropic_api_key)

@@ -11,7 +11,7 @@ import re
 
 MINIMUM_BACKEND_CONTRACT_VERSION = "1.0.0"
 
-_VERSION = re.compile(r"(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})")
+_VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})", re.ASCII)
 
 type Version = tuple[int, int, int]
 

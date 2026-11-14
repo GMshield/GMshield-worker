@@ -1,5 +1,5 @@
-"""One JSON object per line on standard output: `timestamp`, `level`, `traceId`, `unit` and
-`event`, then the event's own fields.
+"""One JSON object per line: `timestamp`, `level`, `traceId`, `unit` and `event`, then the event's
+own fields. ERROR lines go to standard error, every other line to standard output.
 
 Fields are ids, numbers, versions, status codes, setting names and error types: never content,
 never a secret, never a setting's value, never a URL with credentials. W3C trace context helpers

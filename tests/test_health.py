@@ -31,3 +31,9 @@ def test_the_command_reads_the_file(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert health.main() == 1
     health.mark_healthy(tmp_path / "healthy")
     assert health.main() == 0
+
+
+def test_a_file_from_the_future_is_unhealthy(tmp_path: Path) -> None:
+    path = tmp_path / "healthy"
+    health.mark_healthy(path)
+    assert not health.is_healthy(path, now=path.stat().st_mtime - 60)

@@ -91,8 +91,10 @@ def check_settings(environment: Mapping[str, str]) -> Settings:
 
     configured_dir = environment.get(WORK_DIR)
     work_dir = configured_dir.strip() if configured_dir and _present(configured_dir) else DEFAULT_WORK_DIR
-    path = PurePosixPath(work_dir)
-    if not path.is_absolute() or path == PurePosixPath("/") or ".." in path.parts:
+    # Repeated slashes collapse ("//" is not "/" to PurePosixPath, but it is the root).
+    parts = [part for part in work_dir.split("/") if part not in ("", ".")]
+    path = PurePosixPath("/" + "/".join(parts))
+    if not work_dir.startswith("/") or not parts or ".." in parts:
         raise SettingsRefused("setting.invalid", [WORK_DIR])
 
     return Settings(

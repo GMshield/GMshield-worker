@@ -61,7 +61,7 @@ def test_invalid_backend_url_is_refused_without_its_value(url: str) -> None:
     assert str(refused.value) == f"setting.invalid: {BACKEND_URL}"
 
 
-@pytest.mark.parametrize("work_dir", ["relative/dir", "/", "/tmp/../etc"])
+@pytest.mark.parametrize("work_dir", ["relative/dir", "/", "//", "///", "///x/..", "/./", "/tmp/../etc"])
 def test_invalid_work_dir_is_refused(work_dir: str) -> None:
     with pytest.raises(SettingsRefused) as refused:
         check_settings({**COMPLETE, WORK_DIR: work_dir})
@@ -89,3 +89,4 @@ def test_test_mode_ignores_a_given_key_and_honours_the_backend_url() -> None:
 
 def test_work_dir_is_configurable() -> None:
     assert check_settings({**COMPLETE, WORK_DIR: "/data/work/"}).work_dir == "/data/work"
+    assert check_settings({**COMPLETE, WORK_DIR: "//data//work"}).work_dir == "/data/work"
