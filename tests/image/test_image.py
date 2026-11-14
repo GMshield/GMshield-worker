@@ -78,9 +78,24 @@ def test_docling_converts_offline() -> None:
     assert "GMshield" in text, text
 
 
+def test_worker_folders_are_private_and_writable() -> None:
+    """The work and health folders: owned by the worker, mode 0700, writable with a read-only root."""
+    for folder in (Path("/var/lib/gmshield-worker/work"), Path("/run/gmshield-worker")):
+        info = folder.stat()
+        assert (info.st_uid, info.st_mode & 0o777) == (10001, 0o700), f"{folder}: {info.st_uid} {info.st_mode:o}"
+        probe = folder / ".probe"
+        probe.write_text("x", encoding="ascii")
+        probe.unlink()
+
+
 def main() -> int:
     failures = 0
-    for check in (test_tesseract_lists_portuguese_and_english, test_docling_converts_offline):
+    checks = (
+        test_worker_folders_are_private_and_writable,
+        test_tesseract_lists_portuguese_and_english,
+        test_docling_converts_offline,
+    )
+    for check in checks:
         try:
             check()
         except Exception as error:

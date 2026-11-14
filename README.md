@@ -85,7 +85,7 @@ lockfile and the production image:
   is the oldest backend contract the worker accepts. After a compatible answer the worker logs
   `worker.ready`, writes the health file and re-checks every 30 s. Against an older backend it logs
   one `backend.incompatible` line with both versions, stays up, unhealthy, and keeps checking.
-- **Health.** The file `/tmp/gmshield-worker.healthy`, refreshed on every compatible re-check and
+- **Health.** The file `/run/gmshield-worker/healthy` (a folder owned by the worker, mode 0700), refreshed on every compatible re-check and
   removed as soon as a check fails. `python -m gmshield_worker.health` exits 0 when it exists and
   is at most 90 s old. The worker opens no port, so health cannot be an HTTP endpoint.
 - **Backend calls.** Only through the generated client, a new one per request: a W3C
@@ -110,7 +110,8 @@ lockfile and the production image:
 |---|---|
 | `GMSHIELD_BACKEND_URL` | the backend's address, `http` or `https`, without credentials (required outside test mode) |
 | `GMSHIELD_ANTHROPIC_API_KEY` | the model provider's key (required outside test mode; secret) |
-| `GMSHIELD_WORK_DIR` | optional, absolute; default `/tmp/gmshield-work` (Story 1.5 moves it onto the encrypted volume) |
+| `GMSHIELD_WORK_DIR` | optional, absolute; default `/var/lib/gmshield-worker/work`, where production mounts the named volume `gmshield-worker-work` (on the encrypted volume) |
+| `GMSHIELD_HEALTH_FILE` | for tests that run the worker outside the image only; default `/run/gmshield-worker/healthy` |
 | `GMSHIELD_MODE` | unset, or `test` |
 
 The worker's service credential and its Redis credentials become required in Story 1.12, which
@@ -167,9 +168,11 @@ docker build -t gmshield-worker .
 docker run --rm --network none --read-only --tmpfs /tmp gmshield-worker python /app/tests/image/test_image.py
 ```
 
-The image check asserts that Tesseract lists `por` and `eng` and that Docling converts a small
+The image check asserts that the work and health folders are owned by the worker, mode 0700 and
+writable under `--read-only`, that Tesseract lists `por` and `eng` and that Docling converts a small
 generated PDF, with Tesseract as its OCR engine, with no network. The production image runs as UID
-10001, writes nothing outside `/tmp` (so its root filesystem can be read-only), has no `EXPOSE`, no
+10001, writes only to `/tmp`, `/var/lib/gmshield-worker/work` and `/run/gmshield-worker`, all three volumes and the last two
+owned by the worker with mode 0700 (so its root filesystem can be read-only), has no `EXPOSE`, no
 pip and no compiler, and sets `HF_HUB_OFFLINE=1` and `DOCLING_ARTIFACTS_PATH=/opt/docling-models`.
 Docling's `layout` and `tableformer` models are downloaded into `/opt/docling-models` when the image
 is built.

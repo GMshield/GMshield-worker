@@ -12,7 +12,9 @@ from gmshield_worker.settings import Settings, check_settings
 
 def test_the_fake_model_is_deterministic() -> None:
     fake = FakeModelClient()
-    assert fake.complete("system", "prompt") == fake.complete("system", "prompt")
+    first = fake.complete("system", "prompt")
+    second = fake.complete("system", "prompt")
+    assert first == second
     assert fake.complete("system", "prompt") != fake.complete("system", "other")
     assert fake.kind == "fake"
 
