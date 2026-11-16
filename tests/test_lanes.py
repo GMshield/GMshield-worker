@@ -12,14 +12,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import pytest
+import redis
 
 from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome
-from gmshield_worker.lanes import Lanes, consumer_name, handlers, probe
+from gmshield_worker.lanes import Lanes, build_lanes, consumer_name, handlers, probe
 from gmshield_worker.lanes.consumer import Lane
 from gmshield_worker.lanes.handlers import Handler
-from gmshield_worker.lanes.streams import Message
+from gmshield_worker.lanes.streams import Message, RedisWorkStream, connect
 from gmshield_worker.log import new_trace_id
-from gmshield_worker.settings import check_settings
+from gmshield_worker.settings import RedisSettings, check_settings
 from tests.conftest import StandIn, log_lines
 
 CREDENTIAL = "w" * 64
@@ -82,6 +83,8 @@ def lane(
     capacity: int = 2,
     handlers_by_kind: Mapping[str, Handler] | None = None,
     stream: FakeStream | None = None,
+    *,
+    report_give_up_seconds: float = 120.0,
 ) -> Iterator[tuple[Lane, FakeStream]]:
     work = stream or FakeStream(f"gmshield:work:{name}")
     running = Lane(
@@ -96,6 +99,7 @@ def lane(
         read_block_ms=50,
         backoff_initial=0.01,
         renewal_retry_seconds=0.05,
+        report_give_up_seconds=report_give_up_seconds,
     )
     running.start()
     try:
@@ -330,6 +334,24 @@ def test_an_outcome_without_an_answer_is_retried(stand_in: StandIn) -> None:
         wait_for(lambda: job_state(stand_in, job_id) == "done")
 
 
+def test_an_outcome_that_never_gets_an_answer_is_given_up_and_frees_the_slot(
+    stand_in: StandIn, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stand_in.outcome_status = 503
+    first = stand_in.offer("probe", {"workMs": 0})
+    second = stand_in.offer("probe", {"workMs": 0})
+    with lane(stand_in, capacity=1, report_give_up_seconds=0.5) as (_lane, stream):
+        stream.add(first)
+        output = Output(capsys)
+        wait_for(lambda: output.reason() == "outcome_unanswered")
+        stand_in.outcome_status = None
+        stream.add(second)
+        wait_for(lambda: job_state(stand_in, second) == "done")
+    # The first job is left to the backend: its claim lapses, nothing more is sent about it.
+    assert stand_in.jobs[first].state == "running"
+    assert stand_in.jobs[first].outcomes == []
+
+
 def test_stopping_the_lane_abandons_a_running_job_unreported(
     stand_in: StandIn, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -409,3 +431,32 @@ def test_both_lanes_start_interactive_first_and_stop_together() -> None:
     first, second = consumer_name(), consumer_name()
     assert first != second
     assert len(first) <= 60
+
+
+def test_redis_is_reached_over_verified_tls_unless_switched_off() -> None:
+    settings = RedisSettings(host="redis", username="worker", password="p", tls=True)  # noqa: S106 - a test value
+    secure = connect(settings).connection_pool
+    assert secure.connection_class is redis.SSLConnection
+    options = secure.connection_kwargs
+    assert options["ssl_cert_reqs"] == "required"
+    assert options["ssl_check_hostname"] is True
+    assert options["ssl_ca_certs"] == "/run/gmshield/certs/ca.crt"
+    assert options["protocol"] == 2
+    plain = connect(RedisSettings(host="redis", tls=False)).connection_pool
+    assert plain.connection_class is redis.Connection
+    assert "ssl_ca_certs" not in plain.connection_kwargs
+
+
+def test_build_lanes_puts_the_interactive_lane_first_with_its_capacity() -> None:
+    settings = check_settings({"GMSHIELD_MODE": "test", "GMSHIELD_INTERACTIVE_CAPACITY": "4"})
+    built = build_lanes(settings, new_trace_id())
+    first, second = built.lanes
+    assert (first.name, first.capacity) == ("interactive", 4)
+    assert (second.name, second.capacity) == ("ingestion", 1)
+    assert isinstance(first.stream, RedisWorkStream)
+    assert isinstance(second.stream, RedisWorkStream)
+    assert first.stream.name == "gmshield:work:interactive"
+    assert second.stream.name == "gmshield:work:ingestion"
+    assert first.consumer == second.consumer
+    assert first.stop_event is second.stop_event is built.stop_event
+    assert set(first.handlers) == {"probe"}

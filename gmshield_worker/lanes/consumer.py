@@ -14,6 +14,7 @@ minutes (`XAUTOCLAIM`): a worker that died between reading and claiming.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol
@@ -31,6 +32,10 @@ READ_BLOCK_MS = 2_000
 BACKOFF_INITIAL_SECONDS = 1.0
 BACKOFF_MAX_SECONDS = 30.0
 REPORT_RETRY_MAX_SECONDS = 5.0
+# An outcome still unanswered after this long is given up: the renewal stops, the claim lapses and the
+# backend decides (an outcome that always fails, for example a handler of the backend that throws, would
+# otherwise hold the job and the lane's slot for ever).
+REPORT_GIVE_UP_SECONDS = 120.0
 
 
 class JobRoutes(Protocol):
@@ -59,6 +64,7 @@ class Lane:
         take_over_after_ms: int = TAKE_OVER_AFTER_MS,
         backoff_initial: float = BACKOFF_INITIAL_SECONDS,
         renewal_retry_seconds: float = 2.0,
+        report_give_up_seconds: float = REPORT_GIVE_UP_SECONDS,
         renewal_factory: Callable[..., Renewal] = Renewal,
     ) -> None:
         if capacity < 1:
@@ -76,6 +82,7 @@ class Lane:
         self._take_over_after_ms = take_over_after_ms
         self._backoff_initial = backoff_initial
         self._renewal_retry = renewal_retry_seconds
+        self._report_give_up = report_give_up_seconds
         self._renewal_factory = renewal_factory
         self._slots = threading.BoundedSemaphore(capacity)
         self._pool = ThreadPoolExecutor(max_workers=capacity, thread_name_prefix=f"lane-{name}")
@@ -111,6 +118,7 @@ class Lane:
                     self._stream_failed(error, failures)
                     continue
                 taken_over = True
+                failures = 0
                 if pending:
                     self.log.info("lane.took_over", lane=self.name, messages=len(pending))
                 for message in pending:
@@ -224,6 +232,7 @@ class Lane:
     def _report(self, job: ClaimedJob, outcome: Outcome, cancel: threading.Event, log: TraceLog) -> None:
         job_id = str(job.job_id)
         delay = 0.5
+        give_up_at = time.monotonic() + self._report_give_up
         while True:
             try:
                 answer = self.api.report(job, outcome)
@@ -244,8 +253,9 @@ class Lane:
                     log.warn("outcome.refused", lane=self.name, jobId=job_id, status=answer.status, code=answer.code)
                     return
                 log.warn("outcome.unanswered", lane=self.name, jobId=job_id, status=answer.status)
-            # Retried while the claim lives; the renewal timer sets `cancel` once it lapsed.
-            if cancel.wait(delay):
+            # Retried while the claim lives (the renewal timer sets `cancel` once it lapsed), for a bounded time.
+            remaining = give_up_at - time.monotonic()
+            if remaining <= 0 or cancel.wait(min(delay, remaining)):
                 log.warn("job.abandoned", lane=self.name, jobId=job_id, reason="outcome_unanswered")
                 return
             delay = min(delay * 2, REPORT_RETRY_MAX_SECONDS)
