@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from gmshield_worker.log import NO_TRACE_ID, log_event, log_line, new_trace_id, traceparent
+from gmshield_worker.log import NO_TRACE_ID, TraceLog, log_event, log_line, new_trace_id, parse_traceparent, traceparent
 
 
 def test_trace_ids_are_valid_and_new() -> None:
@@ -34,3 +34,38 @@ def test_one_json_line_per_event(capsys: pytest.CaptureFixture[str]) -> None:
     out, err = capsys.readouterr()
     assert json.loads(out)["event"] == "one"
     assert json.loads(err)["event"] == "two"
+
+
+def test_a_traceparent_gives_back_its_trace_id_as_the_backend_reads_it() -> None:
+    trace_id = new_trace_id()
+    assert parse_traceparent(traceparent(trace_id)) == trace_id
+    assert parse_traceparent(f" 00-{trace_id}-00f067aa0ba902b7-01 ") == trace_id
+    assert parse_traceparent(f"01-{trace_id}-00f067aa0ba902b7-01-extra") == trace_id
+    for bad in (
+        None,
+        42,
+        "",
+        f"ff-{trace_id}-00f067aa0ba902b7-01",
+        f"00-{trace_id}-00f067aa0ba902b7-01-extra",
+        f"00-{NO_TRACE_ID}-00f067aa0ba902b7-01",
+        f"00-{trace_id}-0000000000000000-01",
+        f"00-{trace_id.upper()}-00f067aa0ba902b7-01",
+    ):
+        assert parse_traceparent(bad) is None, bad
+
+
+def test_a_trace_log_writes_under_its_trace_id(capsys: pytest.CaptureFixture[str]) -> None:
+    trace_id = new_trace_id()
+    log = TraceLog("worker.lane", trace_id)
+    log.info("job.claimed", jobId="j")
+    log.warn("job.abandoned")
+    log.error("job.handler_failed")
+    captured = capsys.readouterr()
+    out = [json.loads(line) for line in captured.out.splitlines()]
+    err = [json.loads(line) for line in captured.err.splitlines()]
+    assert [(line["level"], line["event"], line["traceId"]) for line in out] == [
+        ("INFO", "job.claimed", trace_id),
+        ("WARN", "job.abandoned", trace_id),
+    ]
+    assert err[0]["level"] == "ERROR"
+    assert err[0]["traceId"] == trace_id

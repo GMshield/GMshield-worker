@@ -6,13 +6,16 @@ Start-up order:
   2. Empty the work folder (its contents, never the folder; links are not followed). A folder
      that is a link or a file, or that cannot be read or created, stops the start with exit
      status 78; a failed removal of one entry is logged and the start continues.
-  3. Ask the backend for its internal contract version, retrying with exponential backoff (1 s up
-     to 30 s, with jitter, 2 s per attempt) until it answers.
+  3. Ask the backend for its internal contract version, with the worker's credential, retrying
+     with exponential backoff (1 s up to 30 s, with jitter, 2 s per attempt) until it answers.
+  4. After the first compatible answer, start both work lanes (Story 1.12): the interactive lane,
+     then the ingestion lane (`gmshield_worker.lanes`).
 
 The worker is healthy only after a compatible answer, and re-checks every 30 s. Against an older
 backend it logs both versions once, stays up, unhealthy, and keeps checking. SIGTERM (or SIGINT)
-ends the process with exit status 0. Nothing here opens a listening port or calls a model,
-Qdrant or Ollama.
+stops the lanes (a running job is abandoned unreported: the backend takes it back when its claim
+lapses) and ends the process with exit status 0. Nothing here opens a listening port or calls a
+model, Qdrant or Ollama.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import signal
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from types import FrameType
 from typing import Any, Protocol
@@ -32,9 +36,10 @@ from typing import Any, Protocol
 from gmshield_worker import health
 from gmshield_worker.backend.client import VersionAnswer, fetch_contract_version
 from gmshield_worker.backend.contract import MINIMUM_BACKEND_CONTRACT_VERSION, meets_minimum, parse_version
+from gmshield_worker.lanes import build_lanes
 from gmshield_worker.log import log_event, new_trace_id
 from gmshield_worker.models import select_model_client
-from gmshield_worker.settings import WORK_DIR, SettingsRefused, check_settings
+from gmshield_worker.settings import WORK_DIR, Settings, SettingsRefused, check_settings
 from gmshield_worker.workdir import WorkDirUnusable, empty_work_dir
 
 UNIT = "worker.supervisor"
@@ -46,6 +51,17 @@ BACKOFF_MAX_SECONDS = 30.0
 RECHECK_SECONDS = 30.0
 
 type Fetch = Callable[[str, str], VersionAnswer]
+
+
+class Startable(Protocol):
+    """What the supervisor starts after the first compatible answer and stops at the end: the lanes."""
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+
+type LanesFactory = Callable[[Settings, str], Startable]
 
 
 class Stop(Protocol):
@@ -109,7 +125,10 @@ class Supervisor:
     backoff_initial: float = BACKOFF_INITIAL_SECONDS
     backoff_max: float = BACKOFF_MAX_SECONDS
     recheck_seconds: float = RECHECK_SECONDS
+    # Called once, after the first compatible answer: starts the lanes.
+    on_ready: Callable[[], None] | None = None
     ready: bool = field(default=False, init=False)
+    _started: bool = field(default=False, init=False)
     _failures: int = field(default=0, init=False)
     _incompatible: str | None = field(default=None, init=False)
 
@@ -148,6 +167,9 @@ class Supervisor:
                 )
             self.ready = True
             self._incompatible = None
+            if not self._started and self.on_ready is not None:
+                self._started = True
+                self.on_ready()
             return self.recheck_seconds
 
         self._unhealthy()
@@ -177,10 +199,11 @@ def run(
     stop: Stop,
     *,
     health_file: Path = health.HEALTH_FILE,
-    fetch: Fetch = fetch_contract_version,
+    fetch: Fetch | None = None,
     rng: Callable[[], float] = random.random,
     backoff_initial: float = BACKOFF_INITIAL_SECONDS,
     recheck_seconds: float = RECHECK_SECONDS,
+    lanes_factory: LanesFactory = build_lanes,
 ) -> int:
     """Runs the worker until `stop` is set. Returns the exit status."""
     trace_id = new_trace_id()
@@ -200,6 +223,8 @@ def run(
         testMode=settings.test_mode,
         model=model.kind,
         minimumContractVersion=MINIMUM_BACKEND_CONTRACT_VERSION,
+        interactiveCapacity=settings.interactive_capacity,
+        redisTls=settings.redis.tls,
     )
     try:
         empty_work_dir(settings.work_dir, trace_id)
@@ -207,16 +232,21 @@ def run(
         log_event("ERROR", UNIT, "startup.refused", trace_id, reason="workdir.unusable", settings=[WORK_DIR])
         return REFUSED_EXIT_STATUS
 
-    Supervisor(
-        backend_url=settings.backend_url,
-        trace_id=trace_id,
-        stop=stop,
-        health_file=health_file,
-        fetch=fetch,
-        rng=rng,
-        backoff_initial=backoff_initial,
-        recheck_seconds=recheck_seconds,
-    ).run()
+    lanes = lanes_factory(settings, trace_id)
+    try:
+        Supervisor(
+            backend_url=settings.backend_url,
+            trace_id=trace_id,
+            stop=stop,
+            health_file=health_file,
+            fetch=fetch or partial(fetch_contract_version, credential=settings.worker_credential),
+            rng=rng,
+            backoff_initial=backoff_initial,
+            recheck_seconds=recheck_seconds,
+            on_ready=lanes.start,
+        ).run()
+    finally:
+        lanes.stop()
     log_event("INFO", UNIT, "worker.stopped", trace_id)
     return 0
 

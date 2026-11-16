@@ -32,7 +32,16 @@ def test_outside_test_mode_the_claude_client_is_built_without_calling_anything(
 
     monkeypatch.setattr(socket.socket, "connect", no_connection)
     monkeypatch.setattr(socket, "getaddrinfo", no_connection)
-    settings = check_settings({"GMSHIELD_BACKEND_URL": "http://b:8080", "GMSHIELD_ANTHROPIC_API_KEY": "sk-abc"})
+    settings = check_settings(
+        {
+            "GMSHIELD_BACKEND_URL": "http://b:8080",
+            "GMSHIELD_ANTHROPIC_API_KEY": "sk-abc",
+            "GMSHIELD_WORKER_CREDENTIAL": "w" * 64,
+            "GMSHIELD_REDIS_HOST": "redis",
+            "GMSHIELD_REDIS_USERNAME": "worker",
+            "GMSHIELD_REDIS_PASSWORD": "redis-password",
+        }
+    )
     client = select_model_client(settings)
     assert isinstance(client, ClaudeModelClient)
     assert client.kind == "claude"

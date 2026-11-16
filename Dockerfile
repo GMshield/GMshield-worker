@@ -2,6 +2,8 @@
 #   test          generates the internal API client, then ruff, mypy and pytest with coverage;
 #                 a failure fails the build
 #   test-reports  JUnit results and Cobertura coverage.xml, exported for the artifacts and SonarQube
+#   integration   the integration tests (tests/integration), run as a container beside a throwaway
+#                 Redis (.gmshield/pipeline.toml [test]) as an unprivileged user; built here, run offline
 #   production    the image that runs (last stage)
 # Images are pinned by version and digest: Python 3.14.10 on Debian trixie and uv 0.13.6, the
 # newest releases at least two weeks old on 2026-11-13.
@@ -39,6 +41,16 @@ RUN python tools/generate_client.py \
 FROM scratch AS test-reports
 COPY --from=test /workspace/reports/junit/ /junit/
 COPY --from=test /workspace/reports/coverage.xml /coverage.xml
+
+# The pipeline runs this image with GMSHIELD_MODE=test on an internal network (no internet) where Redis
+# answers as redis:6379; the backend is the stand-in inside the tests. Everything is in the test stage.
+FROM test AS integration
+RUN groupadd --system --gid 10001 gmshield \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin gmshield
+ENV HOME=/tmp \
+    PYTHONDONTWRITEBYTECODE=1
+USER 10001:10001
+CMD ["pytest", "-p", "no:cacheprovider", "-o", "addopts=--strict-markers", "tests/integration"]
 
 FROM python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f AS production
 ARG GIT_SHA=unknown
