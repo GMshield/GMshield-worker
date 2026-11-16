@@ -19,6 +19,7 @@ every transitive one, and `[tool.uv] exclude-newer` keeps them all on or before 
 | torch, torchvision (CPU builds, from the PyTorch CPU index) | 2.15.0, 0.29.2 | `pyproject.toml` |
 | anthropic | 2.3.0 | `pyproject.toml` |
 | httpx | 0.28.1 | `pyproject.toml` |
+| redis (redis-py, released 2026-07-30) | 8.1.0 | `pyproject.toml` |
 | attrs (used by the generated client) | 26.1.0 | `pyproject.toml` |
 | openapi-python-client (client generator) | 0.29.1 | `pyproject.toml` (development) |
 | pytest, pytest-cov | 9.2.0, 7.1.0 | `pyproject.toml` (development) |
@@ -64,10 +65,11 @@ lockfile and the production image:
 | `gmshield_worker/workdir.py` | emptying the work folder |
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
 | `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
-| `gmshield_worker/lanes/`, `ingestion/`, `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
+| `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind) and `probe.py` (test mode only) |
+| `ingestion/`, `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
-| `tests/` | unit tests; `tests/image/` runs only inside the production image |
+| `tests/` | unit tests; `tests/image/` runs only inside the production image, `tests/integration/` only beside a Redis (the `integration` stage) |
 
 ## Start-up and behaviour
 
@@ -80,6 +82,8 @@ lockfile and the production image:
 3. **Backend.** `GET /internal/v1/version` is retried with exponential backoff (1 s doubling up to
    30 s, with jitter of plus or minus 20%, 2 s per attempt) until the backend answers. Each failure
    is logged by attempt and error type only.
+4. **Lanes.** After the first compatible answer the supervisor starts the interactive lane, then
+   the ingestion lane; SIGTERM stops both.
 
 - **Contract version.** `MINIMUM_BACKEND_CONTRACT_VERSION` in `gmshield_worker/backend/contract.py`
   is the oldest backend contract the worker accepts. After a compatible answer the worker logs
@@ -88,9 +92,10 @@ lockfile and the production image:
 - **Health.** The file `/run/gmshield-worker/healthy` (a folder owned by the worker, mode 0700), refreshed on every compatible re-check and
   removed as soon as a check fails. `python -m gmshield_worker.health` exits 0 when it exists and
   is at most 90 s old. The worker opens no port, so health cannot be an HTTP endpoint.
-- **Backend calls.** Only through the generated client, a new one per request: a W3C
-  `traceparent` with the start-up trace id and a new span id, a 2 s timeout, no redirects, and no
-  proxy taken from the environment.
+- **Backend calls.** Only through the generated client, a new one per request: the worker's
+  credential (`Authorization: Bearer`), a W3C `traceparent` with the start-up trace id (a job's own
+  for its renewals and outcome) and a new span id, a 2 s timeout, no redirects, and no proxy taken
+  from the environment.
 - **Model.** `models/` has one interface, `ModelClient`, with the fake model (deterministic, no
   network) and the Claude client (Anthropic SDK, default model `claude-sonnet-5-5`, the full tier;
   `claude-haiku-5-5` is the lightweight tier, and the backend will choose per job under AD-18; the
@@ -101,8 +106,34 @@ lockfile and the production image:
   output: `timestamp`, `level`, `traceId`, `unit`, `event`, then ids,
   numbers, versions, status codes, setting names or error types. Never content, never a secret,
   never a URL.
-- **Shutdown.** SIGTERM or SIGINT ends the process with exit status 0, whether it is retrying or
-  ready.
+- **Lanes (Story 1.12).** Each lane reads only its own stream (`gmshield:work:interactive` or
+  `gmshield:work:ingestion`) with `XREADGROUP`, group `workers`, under one consumer name per process,
+  one message at a time and only while it has a free slot: the interactive lane has
+  `GMSHIELD_INTERACTIVE_CAPACITY` (default 2), the ingestion lane 1, so an interactive job is claimed
+  at once even while ingestion is busy. At start a lane takes over the messages pending for more than
+  2 minutes (`XAUTOCLAIM`): a worker that died between reading and claiming.
+  - For each message it claims the job (`POST /internal/v1/jobs/{id}/claims`). After a definite
+    answer (2xx or 409) the message is acknowledged (`XACK`); after no answer or a 5xx it stays
+    pending, and the backend offers the job again if nobody claims it. The backend alone decides
+    retries.
+  - A claimed job runs its kind's handler while a timer renews the claim at its `renewAt`
+    (`POST …/claims/{claimId}/renewals`, with `X-Job-Grant`). A refused renewal, or none answered
+    before `lapsesAt`, stops the work and nothing is reported: the backend takes the job back. The
+    outcome (`POST …/claims/{claimId}/outcome`: `done` with a result, or `failed` with a code) is
+    retried while the claim lives. A handler that raises is a failed attempt (`worker.handler_failed`),
+    a kind without a handler `worker.unknown_kind`.
+  - Every line about a job, and every renewal and outcome, carries the job's trace id (the claim's
+    `traceparent`): the backend logs the same id for the same job.
+  - Handlers: only the test-mode `probe` until Story 1.15 (it works `workMs`, fails its first
+    `failTimes` attempts with `probe.failed`).
+  - Redis down, restarted or not yet holding the group (`NOGROUP`): the lane logs
+    `stream.unavailable` by error type and retries with backoff (1 s doubling up to 30 s). The worker
+    never runs `XADD`, `XTRIM` or `XGROUP`; its Redis account allows only `AUTH`, `HELLO`, `PING`,
+    `XREADGROUP`, `XACK`, `XAUTOCLAIM`, `XCLAIM` and `XPENDING` on the two streams. The client speaks
+    RESP2 and sends no `CLIENT SETINFO`.
+- **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
+  backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
+  is retrying or ready.
 
 ## Settings
 
@@ -110,14 +141,20 @@ lockfile and the production image:
 |---|---|
 | `GMSHIELD_BACKEND_URL` | the backend's address, `http` or `https`, without credentials (required outside test mode) |
 | `GMSHIELD_ANTHROPIC_API_KEY` | the model provider's key (required outside test mode; secret) |
+| `GMSHIELD_WORKER_CREDENTIAL` | the worker's credential for `/internal/v1` (required outside test mode; secret): 32 to 512 characters of `A-Z a-z 0-9 . _ ~ + / = -`, the same value as the backend's |
+| `GMSHIELD_REDIS_HOST`, `GMSHIELD_REDIS_PORT` | Redis (the host required outside test mode; port default 6379) |
+| `GMSHIELD_REDIS_USERNAME`, `GMSHIELD_REDIS_PASSWORD` | the worker's Redis account (required outside test mode; `worker` in production; the password is secret) |
+| `GMSHIELD_REDIS_TLS` | `true` (default): TLS verified, chain and host name, against `/run/gmshield/certs/ca.crt`; `false` only in the development setup |
+| `GMSHIELD_INTERACTIVE_CAPACITY` | interactive jobs at once, 1 to 16 (default 2); the ingestion lane runs one |
 | `GMSHIELD_WORK_DIR` | optional, absolute; default `/var/lib/gmshield-worker/work`, where production mounts the named volume `gmshield-worker-work` (on the encrypted volume) |
 | `GMSHIELD_HEALTH_FILE` | for tests that run the worker outside the image only; default `/run/gmshield-worker/healthy` |
 | `GMSHIELD_MODE` | unset, or `test` |
 
-The worker's service credential and its Redis credentials become required in Story 1.12, which
-first uses them. `GMSHIELD_MODE=test` is set only by the pipeline: it needs no secret, uses the
-fake model, and uses `http://stand-in-backend:8080` unless `GMSHIELD_BACKEND_URL` is set; the
-worker then connects to that address only.
+`GMSHIELD_MODE=test` is set only by the pipeline: it needs no secret, uses the fake model, uses
+`http://stand-in-backend:8080` unless `GMSHIELD_BACKEND_URL` is set, Redis at `redis:6379` (or
+`GMSHIELD_REDIS_HOST`/`GMSHIELD_REDIS_PORT`) without an account, a password or TLS, and the fixed,
+public worker credential `gmshield-test-mode-worker-credential-not-a-secret` that the backend's test
+mode knows. A worker credential that is the test-mode value is refused outside test mode.
 
 ## Internal API client
 
@@ -166,7 +203,17 @@ docker build --target test .
 docker build --target test-reports --output type=local,dest=out .   # out/junit/, out/coverage.xml
 docker build -t gmshield-worker .
 docker run --rm --network none --read-only --tmpfs /tmp gmshield-worker python /app/tests/image/test_image.py
+docker build --target integration -t gmshield-worker-it .              # the integration tests, beside a Redis:
+docker network create wk-it
+docker run -d --name wk-it-redis --network wk-it --network-alias redis redis:8.10.3-alpine
+docker run --rm --network wk-it -e GMSHIELD_MODE=test gmshield-worker-it   # exit 0: passed
 ```
+
+The integration tests (`tests/integration`) run the lanes against a real Redis as an account with
+exactly the production worker ACL, with the internal API stood in: claim, run, report and
+acknowledge; a claim without an answer leaves the message pending; the take-over at start; a lane
+that waits for the group and resumes after Redis is flushed; and the commands the account refuses.
+Locally: `GMSHIELD_REDIS_HOST=127.0.0.1 GMSHIELD_REDIS_PORT=<port> uv run pytest -o addopts= tests/integration`.
 
 The image check asserts that the work and health folders are owned by the worker, mode 0700 and
 writable under `--read-only`, that Tesseract lists `por` and `eng` and that Docling converts a small
@@ -193,15 +240,18 @@ Reports for every run are kept by the pipeline; see [GMshield-pipeline](https://
 ## Pipeline contract
 
 In production (Story 1.6) the worker joins `gmshield-work` (the backend at
-`http://gmshield-backend:8080`, later Redis and Qdrant), `gmshield-model` (Ollama on the network's
+`http://gmshield-backend:8080`, Redis, later Qdrant), `gmshield-model` (Ollama on the network's
 gateway) and `gmshield-outbound` (the model provider), runs as 10001 with a read-only root
 filesystem and every capability dropped, and finds the private authority's certificate at
-`/run/gmshield/certs/ca.crt`. `~/gmshield-ci/secrets/worker.env` already holds its Redis account
-(`worker`, consumer-group commands on the two work streams only) and the Qdrant API key, which the
-worker does not use until Story 1.12 and Epic 2.
+`/run/gmshield/certs/ca.crt`. `~/gmshield-ci/secrets/worker.env` holds its Redis account
+(`worker`, consumer-group commands on the two work streams only), the worker's credential (the same
+value as in `backend.env`, written by `deploy/data-credentials.sh`; Dalton reruns it at the first
+release that carries Story 1.12) and the Qdrant API key, which the worker does not use until Epic 2.
 
 The pipeline reads [`.gmshield/pipeline.toml`](.gmshield/pipeline.toml) and builds the multi-stage
 `Dockerfile`: `test` generates the client and runs ruff, mypy and pytest; `test-reports` holds the
-JUnit results and Cobertura `coverage.xml`; the production image is the last stage. The worker has
+JUnit results and Cobertura `coverage.xml`; `integration` runs the integration tests (`[test]`: the
+pipeline's integration stage runs it on `develop` beside a throwaway Redis); the production image is
+the last stage. The worker has
 no port (`port = 0`), so the pipeline skips staging and DAST, and a deploy is healthy when the
 container is still running after 20 s: the worker keeps retrying the backend rather than exiting.

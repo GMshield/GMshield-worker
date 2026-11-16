@@ -24,15 +24,37 @@ from tests.conftest import StandIn, log_lines
 ROOT = Path(__file__).resolve().parent.parent
 
 
+class FakeLanes:
+    """Stands in for the lanes: records when the supervisor starts and stops them."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def start(self) -> None:
+        self.events.append("start")
+
+    def stop(self) -> None:
+        self.events.append("stop")
+
+
 @contextmanager
-def running(environment: dict[str, str], health_file: Path, **options: Any) -> Iterator[dict[str, object]]:
+def running(
+    environment: dict[str, str], health_file: Path, lanes: FakeLanes | None = None, **options: Any
+) -> Iterator[dict[str, object]]:
     """Runs the worker in a thread until the block ends; yields a dict that receives the status."""
     stop = threading.Event()
     result: dict[str, object] = {}
+    fake = lanes or FakeLanes()
 
     def target() -> None:
         result["status"] = main.run(
-            environment, stop, health_file=health_file, backoff_initial=0.01, recheck_seconds=0.05, **options
+            environment,
+            stop,
+            health_file=health_file,
+            backoff_initial=0.01,
+            recheck_seconds=0.05,
+            lanes_factory=lambda _settings, _trace: fake,
+            **options,
         )
 
     thread = threading.Thread(target=target)
@@ -43,6 +65,10 @@ def running(environment: dict[str, str], health_file: Path, **options: Any) -> I
         stop.set()
         thread.join(timeout=10)
         assert not thread.is_alive()
+
+
+def no_lanes(_settings: object, _trace_id: str) -> FakeLanes:
+    return FakeLanes()
 
 
 def wait_for(condition: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -112,7 +138,7 @@ def test_old_backend(stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFi
     incompatible = [line for line in lines if line["event"] == "backend.incompatible"]
     assert len(incompatible) == 1
     assert incompatible[0]["backendContractVersion"] == "0.9.0"
-    assert incompatible[0]["minimumContractVersion"] == "1.0.0"
+    assert incompatible[0]["minimumContractVersion"] == "1.1.0"
     assert not any(line["event"] == "worker.ready" for line in lines)
 
 
@@ -121,7 +147,7 @@ def test_an_old_backend_that_is_upgraded_becomes_healthy(stand_in: StandIn, tmp_
     health_file = tmp_path / "healthy"
     with running(mode_env(stand_in, tmp_path), health_file):
         wait_for(lambda: len(stand_in.requests) >= 2)
-        stand_in.version = "1.0.0"
+        stand_in.version = "1.1.0"
         wait_for(lambda: health.is_healthy(health_file))
         stand_in.version = "0.9.0"
         wait_for(lambda: not health_file.exists())
@@ -179,12 +205,18 @@ def test_a_problem_answer_is_retried_until_the_backend_answers(
 
 def test_missing_secret(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     environment = {"GMSHIELD_BACKEND_URL": "http://marker-host-123:8080"}
-    status = main.run(environment, threading.Event(), health_file=tmp_path / "healthy")
+    status = main.run(environment, threading.Event(), health_file=tmp_path / "healthy", lanes_factory=no_lanes)
     assert status == 78
     captured = capsys.readouterr()
     lines = log_lines(captured.err)
     assert lines[-1]["event"] == "startup.refused"
-    assert lines[-1]["settings"] == ["GMSHIELD_ANTHROPIC_API_KEY"]
+    assert lines[-1]["settings"] == [
+        "GMSHIELD_REDIS_HOST",
+        "GMSHIELD_REDIS_USERNAME",
+        "GMSHIELD_ANTHROPIC_API_KEY",
+        "GMSHIELD_WORKER_CREDENTIAL",
+        "GMSHIELD_REDIS_PASSWORD",
+    ]
     assert "marker-host-123" not in captured.out + captured.err
 
 
@@ -249,6 +281,9 @@ def run_process(environment: dict[str, str], health_file: Path) -> subprocess.Po
         "PATH": os.environ.get("PATH", ""),
         "PYTHONPATH": str(ROOT),
         "GMSHIELD_HEALTH_FILE": str(health_file),
+        # The lanes run for real here: a Redis port where nothing listens, so they only retry.
+        "GMSHIELD_REDIS_HOST": "127.0.0.1",
+        "GMSHIELD_REDIS_PORT": "9",
         **environment,
     }
     return subprocess.Popen(
@@ -291,7 +326,14 @@ def test_the_process_refuses_without_secrets(tmp_path: Path) -> None:
     assert process.returncode == 78
     refused = log_lines(err)[-1]
     assert refused["event"] == "startup.refused"
-    assert refused["settings"] == ["GMSHIELD_BACKEND_URL", "GMSHIELD_ANTHROPIC_API_KEY"]
+    # run_process gives a Redis host: everything else is missing.
+    assert refused["settings"] == [
+        "GMSHIELD_BACKEND_URL",
+        "GMSHIELD_REDIS_USERNAME",
+        "GMSHIELD_ANTHROPIC_API_KEY",
+        "GMSHIELD_WORKER_CREDENTIAL",
+        "GMSHIELD_REDIS_PASSWORD",
+    ]
 
 
 def test_the_signal_stop_wakes_a_waiter() -> None:
@@ -311,7 +353,9 @@ def test_a_link_in_place_of_the_work_folder_refuses_the_start(
     outside = tmp_path / "outside"
     outside.mkdir()
     (tmp_path / "work").symlink_to(outside, target_is_directory=True)
-    status = main.run(mode_env(stand_in, tmp_path), threading.Event(), health_file=tmp_path / "healthy")
+    status = main.run(
+        mode_env(stand_in, tmp_path), threading.Event(), health_file=tmp_path / "healthy", lanes_factory=no_lanes
+    )
     assert status == 78
     refused = log_lines(capsys.readouterr().err)[-1]
     assert refused["event"] == "startup.refused"
@@ -328,10 +372,50 @@ def test_an_unwritable_parent_refuses_the_start(
     parent.mkdir(mode=0o500)
     environment = {**mode_env(stand_in, tmp_path), "GMSHIELD_WORK_DIR": str(parent / "work")}
     try:
-        status = main.run(environment, threading.Event(), health_file=tmp_path / "healthy")
+        status = main.run(environment, threading.Event(), health_file=tmp_path / "healthy", lanes_factory=no_lanes)
     finally:
         parent.chmod(0o700)
     assert status == 78
     lines = log_lines(capsys.readouterr().err)
     assert [line["event"] for line in lines[-2:]] == ["workdir.unusable", "startup.refused"]
     assert lines[-1]["reason"] == "workdir.unusable"
+
+
+def test_the_lanes_start_after_the_first_compatible_answer_and_stop_at_the_end(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    stand_in.version = "1.0.0"
+    lanes = FakeLanes()
+    health_file = tmp_path / "healthy"
+    with running(mode_env(stand_in, tmp_path), health_file, lanes=lanes):
+        wait_for(lambda: len(stand_in.requests) >= 3)
+        assert lanes.events == []  # an older backend: nothing is claimed from it
+        stand_in.version = "1.1.0"
+        wait_for(lambda: health.is_healthy(health_file))
+        wait_for(lambda: len(stand_in.requests) >= 6)  # re-checked, never started twice
+        assert lanes.events == ["start"]
+    assert lanes.events == ["start", "stop"]
+
+
+def test_every_check_carries_the_workers_credential(stand_in: StandIn, tmp_path: Path) -> None:
+    stand_in.credential = "gmshield-test-mode-worker-credential-not-a-secret"
+    health_file = tmp_path / "healthy"
+    with running(mode_env(stand_in, tmp_path), health_file):
+        wait_for(lambda: health.is_healthy(health_file))
+    assert all(
+        request["authorization"] == "Bearer gmshield-test-mode-worker-credential-not-a-secret"
+        for request in stand_in.requests
+    )
+
+
+def test_a_wrong_credential_is_an_unexpected_answer_and_never_logged(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stand_in.credential = "another-credential-of-at-least-32-characters"
+    with running(mode_env(stand_in, tmp_path), tmp_path / "healthy"):
+        wait_for(lambda: len(stand_in.requests) >= 2)
+    output = capsys.readouterr().out
+    unexpected = [line for line in log_lines(output) if line["event"] == "backend.unexpected_answer"]
+    assert unexpected
+    assert unexpected[0]["status"] == 401
+    assert "not-a-secret" not in output

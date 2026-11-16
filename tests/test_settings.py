@@ -6,14 +6,32 @@ from gmshield_worker.settings import (
     ANTHROPIC_API_KEY,
     BACKEND_URL,
     DEFAULT_WORK_DIR,
+    INTERACTIVE_CAPACITY,
     MODE,
+    REDIS_CA_FILE,
+    REDIS_HOST,
+    REDIS_PASSWORD,
+    REDIS_PORT,
+    REDIS_TLS,
+    REDIS_USERNAME,
     TEST_MODE_BACKEND_URL,
+    TEST_MODE_WORKER_CREDENTIAL,
     WORK_DIR,
+    WORKER_CREDENTIAL,
     SettingsRefused,
     check_settings,
 )
 
-COMPLETE = {BACKEND_URL: "http://backend:8080/", ANTHROPIC_API_KEY: "sk-secret-value"}
+CREDENTIAL = "c0ffee" * 10 + "beef"
+COMPLETE = {
+    BACKEND_URL: "http://backend:8080/",
+    ANTHROPIC_API_KEY: "sk-secret-value",
+    WORKER_CREDENTIAL: CREDENTIAL,
+    REDIS_HOST: "redis",
+    REDIS_USERNAME: "worker",
+    REDIS_PASSWORD: "redis-secret-value",
+}
+SECRETS = ("sk-secret-value", CREDENTIAL, "redis-secret-value")
 
 
 def test_complete_settings_start() -> None:
@@ -22,16 +40,28 @@ def test_complete_settings_start() -> None:
     assert settings.backend_url == "http://backend:8080"
     assert settings.work_dir == DEFAULT_WORK_DIR
     assert settings.anthropic_api_key == "sk-secret-value"
-    assert "sk-secret-value" not in repr(settings)
+    assert settings.worker_credential == CREDENTIAL
+    assert settings.interactive_capacity == 2
+    redis = settings.redis
+    assert (redis.host, redis.port, redis.username, redis.password) == ("redis", 6379, "worker", "redis-secret-value")
+    assert redis.tls
+    assert redis.ca_file == REDIS_CA_FILE == "/run/gmshield/certs/ca.crt"
+    for secret in SECRETS:
+        assert secret not in repr(settings)
 
 
 @pytest.mark.parametrize(
     ("environment", "missing"),
     [
-        ({}, [BACKEND_URL, ANTHROPIC_API_KEY]),
-        ({BACKEND_URL: "http://backend:8080"}, [ANTHROPIC_API_KEY]),
-        ({ANTHROPIC_API_KEY: "sk-secret-value"}, [BACKEND_URL]),
-        ({BACKEND_URL: "http://backend:8080", ANTHROPIC_API_KEY: "   "}, [ANTHROPIC_API_KEY]),
+        (
+            {},
+            [BACKEND_URL, REDIS_HOST, REDIS_USERNAME, ANTHROPIC_API_KEY, WORKER_CREDENTIAL, REDIS_PASSWORD],
+        ),
+        ({**COMPLETE, ANTHROPIC_API_KEY: ""}, [ANTHROPIC_API_KEY]),
+        ({k: v for k, v in COMPLETE.items() if k != BACKEND_URL}, [BACKEND_URL]),
+        ({**COMPLETE, ANTHROPIC_API_KEY: "   "}, [ANTHROPIC_API_KEY]),
+        ({**COMPLETE, WORKER_CREDENTIAL: " "}, [WORKER_CREDENTIAL]),
+        ({k: v for k, v in COMPLETE.items() if k not in (REDIS_HOST, REDIS_PASSWORD)}, [REDIS_HOST, REDIS_PASSWORD]),
     ],
 )
 def test_missing_settings_are_refused_by_name(environment: dict[str, str], missing: list[str]) -> None:
@@ -39,7 +69,8 @@ def test_missing_settings_are_refused_by_name(environment: dict[str, str], missi
         check_settings(environment)
     assert refused.value.reason == "setting.missing"
     assert refused.value.settings == missing
-    assert "sk-secret-value" not in str(refused.value)
+    for secret in SECRETS:
+        assert secret not in str(refused.value)
 
 
 @pytest.mark.parametrize(
@@ -79,6 +110,69 @@ def test_test_mode_needs_no_secret_and_uses_the_stand_in() -> None:
     assert settings.test_mode
     assert settings.backend_url == TEST_MODE_BACKEND_URL
     assert settings.anthropic_api_key is None
+    assert settings.worker_credential == TEST_MODE_WORKER_CREDENTIAL
+    redis = settings.redis
+    assert (redis.host, redis.port, redis.username, redis.password, redis.tls) == ("redis", 6379, None, None, False)
+
+
+def test_test_mode_ignores_redis_credentials_and_tls_but_may_move_redis() -> None:
+    settings = check_settings(
+        {
+            MODE: "test",
+            REDIS_HOST: "127.0.0.1",
+            REDIS_PORT: "16379",
+            REDIS_USERNAME: "u",
+            REDIS_PASSWORD: "p",
+            REDIS_TLS: "true",
+            WORKER_CREDENTIAL: CREDENTIAL,
+        }
+    )
+    redis = settings.redis
+    assert (redis.host, redis.port, redis.username, redis.password, redis.tls) == (
+        "127.0.0.1",
+        16379,
+        None,
+        None,
+        False,
+    )
+    assert settings.worker_credential == TEST_MODE_WORKER_CREDENTIAL
+
+
+def test_redis_tls_can_be_switched_off_for_development_only_by_false() -> None:
+    assert not check_settings({**COMPLETE, REDIS_TLS: "false"}).redis.tls
+    assert check_settings({**COMPLETE, REDIS_TLS: "true"}).redis.tls
+    with pytest.raises(SettingsRefused) as refused:
+        check_settings({**COMPLETE, REDIS_TLS: "no"})
+    assert refused.value.settings == [REDIS_TLS]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        (WORKER_CREDENTIAL, "short"),
+        (WORKER_CREDENTIAL, "has space " + "a" * 32),
+        (WORKER_CREDENTIAL, TEST_MODE_WORKER_CREDENTIAL),
+        (REDIS_HOST, "bad host"),
+        (REDIS_HOST, "-leading"),
+        (REDIS_PORT, "0"),
+        (REDIS_PORT, "65536"),
+        (REDIS_PORT, "six"),
+        (INTERACTIVE_CAPACITY, "0"),
+        (INTERACTIVE_CAPACITY, "17"),
+        (INTERACTIVE_CAPACITY, "two"),
+    ],
+)
+def test_invalid_values_are_refused_by_name_never_by_value(name: str, value: str) -> None:
+    with pytest.raises(SettingsRefused) as refused:
+        check_settings({**COMPLETE, name: value})
+    assert refused.value.reason == "setting.invalid"
+    assert refused.value.settings == [name]
+    assert value not in str(refused.value)
+
+
+def test_the_interactive_capacity_is_configurable() -> None:
+    assert check_settings({**COMPLETE, INTERACTIVE_CAPACITY: "4"}).interactive_capacity == 4
+    assert check_settings({MODE: "test", INTERACTIVE_CAPACITY: "1"}).interactive_capacity == 1
 
 
 def test_test_mode_ignores_a_given_key_and_honours_the_backend_url() -> None:

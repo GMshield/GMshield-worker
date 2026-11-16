@@ -12,6 +12,7 @@ dependencies = [
     "anthropic==2.3.0",
     "httpx==0.28.1",
     "attrs==26.1.0",  # imported by the generated client
+    "redis==8.1.0",  # the work streams (Story 1.12)
 ]
 
 [dependency-groups]
@@ -69,7 +70,9 @@ ignore_errors = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--strict-markers --ignore=tests/image"
+# tests/image runs inside the production image, tests/integration beside a Redis (the Dockerfile's
+# `integration` stage, which overrides these options).
+addopts = "--strict-markers --ignore=tests/image --ignore=tests/integration"
 markers = ["image: runs only inside the production image"]
 
 [tool.coverage.run]
