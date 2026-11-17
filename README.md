@@ -68,7 +68,7 @@ lockfile and the production image:
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
 | `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
 | `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind) and `probe.py` (test mode only) |
-| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.17): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `triage.py` (pypdfium2), `layout.py` (Docling), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
+| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.18): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `triage.py` (pypdfium2), `layout.py` (Docling), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
 | `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
@@ -164,7 +164,7 @@ lockfile and the production image:
   - Logs carry the job's trace id, the sizes, counts and times, and the child's and the worker's
     peak RSS (`childMaxRssKib`, `workerMaxRssKib`). A generated 1 GiB PDF is cleaned with a child
     peak under 512 MiB (`tests/test_clean.py`).
-- **Reading pages (Stories 1.16 and 1.17, `PIPELINE_VERSION` "3").** The clean report asks one `triage` step per
+- **Reading pages (Stories 1.16 and 1.17; `PIPELINE_VERSION` "3", now "4").** The clean report asks one `triage` step per
   batch. Triage (`triage.py`, pypdfium2) gives each page a layer: `text` when its text layer has at
   least 16 characters other than whitespace, unless it has fewer than 200 and one image covers at least
   half of the page, else `image`; its report gives the `layers`, one `layout` step per run of text pages,
@@ -188,6 +188,27 @@ lockfile and the production image:
   - From the claim's second attempt on, triage, layout and OCR run one child per page, each with 540 s
     divided by the step's pages; a page whose child fails, crashes or runs out of time is reported
     `unreadable`.
+- **Passages (Story 1.18, `PIPELINE_VERSION` "4", backend contract 1.4.0 or later).** The clean report and the text
+  report end their `next` with `{"stage": "passages", "firstPage": 1, "lastPage": <pageTotal>, "input": "texts"}`:
+  a step over every text file of the version, which the backend holds with no job until every page has an outcome.
+  Its claim input names those files in page order (`texts: [{name: "text-<fileId>", firstPage, lastPage}]`). The
+  stage runs in-process, with no child (it reads only our own JSON): it downloads one text file at a time
+  (`GET …/inputs/text-<fileId>`) and feeds its page records to `passages.py`, which carries the heading stack across
+  files.
+  - PDF records: blocks in reading order; a heading block (`headingLevel` set) closes the open sections at its level
+    or deeper and opens its own; the section path is the open headings, outermost first, and every heading with text
+    is an outline entry `{level, title, page}`. Text records: `headingPath` is the section path, and each heading a
+    page newly enters is an outline entry whose level is its depth. `page_header` and `page_footer` blocks, and
+    blocks with no text, never enter a passage.
+  - Cutting at 3,000 code points (the text stage's page limit): a new passage starts at a new section, at a new page
+    (a passage lies on one page) or when the next block would pass the limit. A passage that does not open its
+    section starts with its leaf heading, so each part of a long stat block repeats it. A table (rows one per line,
+    cells joined by ` | `) stays whole while it fits; a longer one is cut between rows, each part starting with the
+    heading and the first row. Any other block over the limit is cut as `text.py` cuts; a text page at its blank
+    lines.
+  - The report gives `passages: [{page, sectionPath, text, boxes | range}]` in reading order (`boxes`: the blocks'
+    boxes on the page; `range`: `[start, end)` in code points of the page's text) and `outline`. The backend mints
+    the passage ids and stores both encrypted; a version with no text file (every page unreadable) reports none.
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.
