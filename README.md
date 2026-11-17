@@ -21,6 +21,7 @@ every transitive one, and `[tool.uv] exclude-newer` keeps them all on or before 
 | httpx | 0.28.1 | `pyproject.toml` |
 | redis (redis-py, released 2026-07-30) | 8.1.0 | `pyproject.toml` |
 | attrs (used by the generated client) | 26.1.0 | `pyproject.toml` |
+| pikepdf (the clean stage, Story 1.15; MPL-2.0, released 2026-10-11, qpdf 12.4.2 inside) | 10.17.0 | `pyproject.toml` |
 | openapi-python-client (client generator) | 0.29.1 | `pyproject.toml` (development) |
 | pytest, pytest-cov | 9.2.0, 7.1.0 | `pyproject.toml` (development) |
 | ruff | 0.17.3 | `pyproject.toml` (development) |
@@ -62,17 +63,20 @@ lockfile and the production image:
 | `gmshield_worker/settings.py` | the settings check |
 | `gmshield_worker/log.py` | JSON log lines and W3C trace context |
 | `gmshield_worker/health.py` | the health file and `python -m gmshield_worker.health` (the image's `HEALTHCHECK`) |
-| `gmshield_worker/workdir.py` | emptying the work folder |
-| `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
+| `gmshield_worker/workdir.py` | emptying the work folder, each step's own folder and the sweep thread |
+| `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
 | `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
 | `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind) and `probe.py` (test mode only) |
-| `ingestion/`, `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
+| `gmshield_worker/ingestion/` | ingestion steps (Story 1.15): `step.py` (the `ingestion` handler, dispatch on the stage), `clean.py` (the clean stage's child, pikepdf), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
+| `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
 | `tests/` | unit tests; `tests/image/` runs only inside the production image, `tests/integration/` only beside a Redis (the `integration` stage) |
 
 ## Start-up and behaviour
 
+0. **Non-dumpable** (Story 1.15). `PR_SET_DUMPABLE 0`, before anything else; refused, the start
+   stops with exit status 78 (`startup.refused`, reason `process.dumpable`).
 1. **Settings.** Outside test mode a missing or invalid setting stops the start with exit status
    78 and one `startup.refused` line that names the settings, never a value.
 2. **Work folder.** Everything inside `GMSHIELD_WORK_DIR` is removed; the folder itself stays, and
@@ -124,13 +128,41 @@ lockfile and the production image:
     a kind without a handler `worker.unknown_kind`.
   - Every line about a job, and every renewal and outcome, carries the job's trace id (the claim's
     `traceparent`): the backend logs the same id for the same job.
-  - Handlers: only the test-mode `probe` until Story 1.15 (it works `workMs`, fails its first
-    `failTimes` attempts with `probe.failed`).
+  - Handlers: `ingestion` in every mode (Story 1.15, below) and the test-mode `probe` (it works
+    `workMs`, fails its first `failTimes` attempts with `probe.failed`).
   - Redis down, restarted or not yet holding the group (`NOGROUP`): the lane logs
     `stream.unavailable` by error type and retries with backoff (1 s doubling up to 30 s). The worker
     never runs `XADD`, `XTRIM` or `XGROUP`; its Redis account allows only `AUTH`, `HELLO`, `PING`,
     `XREADGROUP`, `XACK`, `XAUTOCLAIM`, `XCLAIM` and `XPENDING` on the two streams. The client speaks
     RESP2 and sends no `CLIENT SETINFO`.
+- **Ingestion steps (Story 1.15).** The `ingestion` handler runs one step of a version's chain; this
+  story has one stage, `clean`, for a PDF. In `<work>/<jobId>/` (erased however the step ends) it
+  streams the step's input (`GET …/claims/{claimId}/inputs/source`, 8 MiB chunks, its own timeouts:
+  2 s to connect, 60 s per read), runs `ingestion/clean.py` in the sandbox, streams the cleaned
+  original and every batch of 20 pages back (`POST …/outputs`, each checked against the answer's
+  size and SHA-256) and reports `{pipelineVersion, pageTotal, original, batches, next: []}`. A PDF
+  that needs a user password fails with `ingestion.password_required` and one qpdf cannot read with
+  `ingestion.file_unreadable`, both with `retry: false`; a crash, the deadline or a failed transfer
+  is `ingestion.step_failed`, which the backend retries while attempts remain.
+  - The clean stage removes JavaScript, embedded and attached files, `OpenAction` and every `AA`,
+    every action other than GoTo and URI, XFA, and RichMedia, Movie, Sound, Screen, 3D and file
+    attachment annotations, and saves without encryption (an owner password is dropped). A batch
+    holds nothing of the other pages.
+  - **Sandbox.** The child runs isolated (`python -I -B`) with only `PATH`, `LANG` and `HOME` (its
+    folder) in its environment, its folder as working directory, every other descriptor closed and
+    standard input and output on `/dev/null`, in a session of its own that is killed at 9 minutes
+    30 seconds, on cancel, and when it ends. A launcher installs a seccomp filter before `exec`
+    (`PR_SET_NO_NEW_PRIVS`, then classic BPF through ctypes for x86-64 and AArch64; any other
+    machine refuses to start the child) that answers `EACCES` to `socket()` for every family but
+    `AF_UNIX`, to `io_uring_setup`, and to any call of another ABI. A network namespace is not
+    possible: the container drops every capability and runs with no-new-privileges. The worker
+    makes itself non-dumpable (`PR_SET_DUMPABLE 0`) before anything else, so no child can read its
+    memory or `/proc/<pid>/environ`.
+  - **Work folder.** Besides the emptying at start, a sweep thread removes every 2 minutes what no
+    running step holds and was last changed more than 10 minutes ago.
+  - Logs carry the job's trace id, the sizes, counts and times, and the child's and the worker's
+    peak RSS (`childMaxRssKib`, `workerMaxRssKib`). A generated 1 GiB PDF is cleaned with a child
+    peak under 512 MiB (`tests/test_clean.py`).
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.
