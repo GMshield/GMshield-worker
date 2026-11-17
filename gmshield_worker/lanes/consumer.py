@@ -27,6 +27,11 @@ from gmshield_worker.lanes.streams import Message, WorkStream
 from gmshield_worker.log import TraceLog
 
 UNIT = "worker.lane"
+# These timings are the worker's own and need not follow the backend's GMSHIELD_JOB_* settings. The
+# takeover, at start only, rescues a message a dead worker read but never claimed; the backend re-offers
+# an unclaimed job after GMSHIELD_JOB_REOFFER_AFTER regardless, and a second message for a claimed job
+# gets 409, which is acknowledged. The outcome's retries already end when the claim lapses
+# (GMSHIELD_JOB_CLAIM_LAPSE, through the renewal's `cancel`); REPORT_GIVE_UP_SECONDS only bounds them.
 TAKE_OVER_AFTER_MS = 120_000
 READ_BLOCK_MS = 2_000
 BACKOFF_INITIAL_SECONDS = 1.0
