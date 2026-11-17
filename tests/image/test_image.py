@@ -201,7 +201,11 @@ def test_the_triage_and_layout_children_read_two_columns_and_a_table_offline_in_
             cancel=threading.Event(),
         )
         assert result.returncode == 0, result
-        assert json.loads((folder / "out" / "manifest.json").read_text(encoding="utf-8")) == {"pages": [7]}
+        manifest = json.loads((folder / "out" / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["pages"] == [7], manifest
+        # Story 1.19: the page's WebP picture, its longer side 2,000 pixels (a US Letter page: 1546 x 2000).
+        assert manifest["pictures"] == [{"page": 7, "width": 1546, "height": 2000}], manifest
+        assert (folder / "out" / "page-0000007.webp").read_bytes()[8:12] == b"WEBP"
         record = json.loads((folder / "out" / "page-0000007.json").read_text(encoding="utf-8"))
     print(f"layout child: {result.seconds:.1f} s, peak {result.max_rss_kib // 1024} MiB")
     assert record["page"] == 7
@@ -273,11 +277,16 @@ def test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox() -> N
         folder = Path(name)
         scan_pdf(folder)
         result, manifest = run_ocr(folder, 1, 5)
-        assert manifest == {"pages": [1, 2, 3, 5], "unreadable": [4]}, manifest
+        assert {key: manifest[key] for key in ("pages", "unreadable")} == {"pages": [1, 2, 3, 5], "unreadable": [4]}
         records = [json.loads((folder / "out" / layout.page_file(page)).read_text(encoding="utf-8")) for page in
                    (1, 2, 3, 5)]  # fmt: skip
         written = sorted(path.name for path in (folder / "out").iterdir())
-        assert written == ["manifest.json", *(layout.page_file(page) for page in (1, 2, 3, 5))], written
+        expected = ["manifest.json", *(layout.page_file(page) for page in (1, 2, 3, 5))]
+        expected += [layout.picture_file(page) for page in range(1, 6)]
+        assert written == sorted(expected), written
+        # Story 1.19: every page read has its straightened picture, the blank one too, its longer side 2,000 pixels.
+        assert [item["page"] for item in manifest["pictures"]] == [1, 2, 3, 4, 5], manifest
+        assert all(max(item["width"], item["height"]) == layout.PICTURE_SIDE for item in manifest["pictures"])
     print(f"ocr child: 5 pages in {result.seconds:.1f} s, peak {result.max_rss_kib // 1024} MiB")
     for record in records:
         text = " ".join(block["text"] for block in record["blocks"])

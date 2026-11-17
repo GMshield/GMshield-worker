@@ -68,7 +68,7 @@ lockfile and the production image:
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
 | `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
 | `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind) and `probe.py` (test mode only) |
-| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.18): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `triage.py` (pypdfium2), `layout.py` (Docling), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
+| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.19): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
 | `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
@@ -164,7 +164,7 @@ lockfile and the production image:
   - Logs carry the job's trace id, the sizes, counts and times, and the child's and the worker's
     peak RSS (`childMaxRssKib`, `workerMaxRssKib`). A generated 1 GiB PDF is cleaned with a child
     peak under 512 MiB (`tests/test_clean.py`).
-- **Reading pages (Stories 1.16 and 1.17; `PIPELINE_VERSION` "3", now "4").** The clean report asks one `triage` step per
+- **Reading pages (Stories 1.16 and 1.17; `PIPELINE_VERSION` "3", now "5").** The clean report asks one `triage` step per
   batch. Triage (`triage.py`, pypdfium2) gives each page a layer: `text` when its text layer has at
   least 16 characters other than whitespace, unless it has fewer than 200 and one image covers at least
   half of the page, else `image`; its report gives the `layers`, one `layout` step per run of text pages,
@@ -209,6 +209,20 @@ lockfile and the production image:
   - The report gives `passages: [{page, sectionPath, text, boxes | range}]` in reading order (`boxes`: the blocks'
     boxes on the page; `range`: `[start, end)` in code points of the page's text) and `outline`. The backend mints
     the passage ids and stores both encrypted; a version with no text file (every page unreadable) reports none.
+- **Page views (Story 1.19, `PIPELINE_VERSION` "5", backend contract 1.5.0 or later).** Every page a reading child
+  reads gets a page view in its step's report, `pageViews: [{page, picture: {fileId, width, height}, lines: [{text,
+  box}]}]`, or for a text page `{page, text}`. A page whose child fails, crashes or times out gets none.
+  - `layout.py` renders each page it read with pypdfium2, after Docling, at the scale whose longer side is 2,000
+    pixels (never above the OCR stage's 3.0), and writes it as WebP of quality 80 (`page-NNNNNNN.webp`, listed with its
+    size in the manifest's `pictures`). `ocr.py` keeps the straightened picture it hands to Docling, shrunk the same
+    way, so its boxes (fractions of that picture) still lie over its lines; a blank scan reported `unreadable` keeps
+    its picture with no lines.
+  - The parent checks each listed picture (pages asked for, each once, a plain file of its own, 1 to 10,000 pixels a
+    side), sends it back as an output, and takes the page's lines from its record: those with text and a box of four
+    fractions, each cut to 4,096 code points, at most 10,000. The text stage gives each page's text from its own
+    `texts` files (at most 16,384 code points).
+  - The backend stores one encrypted page view per page and adopts each picture as a `picture` file of its page; a
+    report replaces the views of the pages it carries. Deploy the backend before this worker.
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.

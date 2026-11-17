@@ -10,9 +10,14 @@ line: ARTIFACTS is the folder of its layout and table models (baked into the ima
 the number of threads torch and Docling may use. Docling runs without OCR (`do_ocr=False`), with table structure, and
 infers heading levels (from the PDF's bookmarks, numbering and font style).
 
-It imports Docling, torch and the standard library only (never `gmshield_worker`), holds no credential, reaches no
-network, and writes only under OUT_DIR: one `page-NNNNNNN.json` per page read, and `manifest.json` listing them,
-`{"pages": [N, ...]}`. A page record is
+Each page read is also rendered with pypdfium2 (Story 1.19) at the scale whose longer side is `PICTURE_SIDE` pixels,
+never more than `MAX_PICTURE_SCALE` (the OCR stage's own scale), and written as a WebP picture of quality
+`PICTURE_QUALITY`: the page view's picture, over which its lines' boxes lie.
+
+It imports Docling, torch, pypdfium2, Pillow and the standard library only (never `gmshield_worker`), holds no
+credential, reaches no network, and writes only under OUT_DIR: one `page-NNNNNNN.json` and one `page-NNNNNNN.webp`
+per page read, and `manifest.json` listing them, `{"pages": [N, ...], "pictures": [{"page", "width", "height"}]}`.
+A page record is
 
     {"page": N, "lines": [{"text", "box"}],
      "blocks": [{"label", "text", "box", "headingLevel", "rows"}]}
@@ -27,16 +32,75 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pypdfium2 as pdfium  # type: ignore[import-untyped]
+from PIL import Image
+
 MANIFEST = "manifest.json"
 DIGITS = 4
+# A page picture's longer side, in pixels (Story 1.19): zoom stays sharp to about twice the 560-pixel source view.
+PICTURE_SIDE = 2000
+# The largest scale a page is rendered at: the OCR stage's (`ocr.SCALE`, 216 DPI), so a small page is never blown up.
+MAX_PICTURE_SCALE = 3.0
+PICTURE_QUALITY = 80
 
 
 def page_file(page: int) -> str:
     return f"page-{page:07d}.json"
+
+
+def picture_file(page: int) -> str:
+    return f"page-{page:07d}.webp"
+
+
+def picture_scale(width: float, height: float) -> float:
+    """The scale that renders a page of `width` x `height` points with its longer side at `PICTURE_SIDE` pixels, never
+    above `MAX_PICTURE_SCALE`."""
+    return min(MAX_PICTURE_SCALE, PICTURE_SIDE / max(width, height, 1.0))
+
+
+def write_webp(picture: np.ndarray, target: Path) -> tuple[int, int]:
+    """A picture as WebP of quality `PICTURE_QUALITY`, shrunk (never enlarged) to a longer side of `PICTURE_SIDE`
+    pixels; answers its width and height."""
+    image = Image.fromarray(picture)
+    factor = PICTURE_SIDE / max(image.width, image.height, 1)
+    if factor < 1.0:
+        size = (max(1, round(image.width * factor)), max(1, round(image.height * factor)))
+        image = image.resize(size, Image.Resampling.LANCZOS)
+    image.save(target, format="WEBP", quality=PICTURE_QUALITY)
+    return image.width, image.height
+
+
+def render_picture(document: Any, index: int, target: Path) -> tuple[int, int]:
+    """Page `index` (from 0) of a pypdfium2 document, rendered at `picture_scale` and written as WebP; its size."""
+    page = document[index]
+    try:
+        width, height = page.get_size()
+        bitmap = page.render(scale=picture_scale(width, height), rev_byteorder=True)
+        try:
+            picture = np.array(bitmap.to_numpy()[:, :, :3], dtype=np.uint8)
+        finally:
+            bitmap.close()
+    finally:
+        page.close()
+    return write_webp(picture, target)
+
+
+def write_pictures(source: Path, out: Path, offset: int, pages: list[int]) -> list[dict[str, int]]:
+    """Each page's picture (numbered as in the version; the batch's first page is `offset`), one page at a time."""
+    document = pdfium.PdfDocument(source)
+    try:
+        pictures = []
+        for page in pages:
+            width, height = render_picture(document, page - offset, out / picture_file(page))
+            pictures.append({"page": page, "width": width, "height": height})
+        return pictures
+    finally:
+        document.close()
 
 
 def fraction_box(box: tuple[float, float, float, float], width: float, height: float) -> list[float]:
@@ -141,17 +205,29 @@ def convert(source: Path, first: int, last: int, artifacts: Path, threads: int) 
     return converter.convert(source, page_range=(first, last))
 
 
-def run(source: Path, out: Path, *, offset: int, first: int, last: int, artifacts: Path, threads: int) -> int:
+def run(
+    source: Path,
+    out: Path,
+    *,
+    offset: int,
+    first: int,
+    last: int,
+    artifacts: Path,
+    threads: int,
+    converter: Callable[[Path, int, int, Path, int], Any] = convert,
+) -> int:
     if offset < 1 or first < offset or last < first or threads < 1:
         return 2
-    result = convert(source, first - offset + 1, last - offset + 1, artifacts, threads)
+    result = converter(source, first - offset + 1, last - offset + 1, artifacts, threads)
     out.mkdir(exist_ok=True)
     written = []
     for record in page_records(result, offset):
         if first <= record["page"] <= last:
             (out / page_file(record["page"])).write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
             written.append(record["page"])
-    (out / MANIFEST).write_text(json.dumps({"pages": written}), encoding="utf-8")
+    del result
+    pictures = write_pictures(source, out, offset, written)
+    (out / MANIFEST).write_text(json.dumps({"pages": written, "pictures": pictures}), encoding="utf-8")
     return 0
 
 

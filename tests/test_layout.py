@@ -1,7 +1,8 @@
 """The layout child's records (Story 1.16), from a Docling result built by hand: Docling itself runs only in the
 production image (`tests/image`), where its models are. Boxes become fractions from the top-left corner whichever
 origin Docling used; blocks keep reading order, with heading levels and table rows; pages are numbered as in the
-version."""
+version. Each page read is rendered as a WebP picture whose longer side is 2,000 pixels, never above the OCR stage's
+scale (Story 1.19)."""
 
 from __future__ import annotations
 
@@ -10,7 +11,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
+import pikepdf
+import pytest
 from docling_core.types.doc.base import BoundingBox, CoordOrigin
+from PIL import Image
 
 from gmshield_worker.ingestion import layout
 
@@ -112,3 +117,50 @@ def test_the_child_refuses_bad_arguments_without_writing(tmp_path: Path) -> None
     assert layout.run(source, out, offset=1, first=1, last=1, artifacts=tmp_path, threads=0) == 2
     assert not (tmp_path / "out").exists()
     assert layout.page_file(9) == "page-0000009.json"
+
+
+def test_the_child_writes_each_page_read_and_its_webp_picture_at_a_longer_side_of_2000_pixels(tmp_path: Path) -> None:
+    # A batch that starts at page 5 of its version: a US Letter page, a small one, and a landscape one.
+    pdf = pikepdf.Pdf.new()
+    for size in ((612, 792), (100, 50), (792, 612)):
+        pdf.add_blank_page(page_size=size)
+    pdf.save(tmp_path / "source.pdf")
+    asked: list[tuple[int, int]] = []
+
+    def converter(_source: Path, first: int, last: int, _artifacts: Path, _threads: int) -> Any:
+        asked.append((first, last))
+        return result([], [page(number, [cell("Linha", 10, 10, 90, 20)]) for number in range(first, last + 1)])
+
+    out = tmp_path / "out"
+    status = layout.run(
+        tmp_path / "source.pdf", out, offset=5, first=5, last=7, artifacts=tmp_path, threads=2, converter=converter
+    )
+
+    assert status == 0
+    assert asked == [(1, 3)]
+    manifest = json.loads((out / layout.MANIFEST).read_text(encoding="utf-8"))
+    assert manifest == {
+        "pages": [5, 6, 7],
+        "pictures": [
+            {"page": 5, "width": 1546, "height": 2000},
+            {"page": 6, "width": 300, "height": 150},
+            {"page": 7, "width": 2000, "height": 1546},
+        ],
+    }
+    for item in manifest["pictures"]:
+        with Image.open(out / layout.picture_file(item["page"])) as written:
+            assert written.format == "WEBP"
+            assert written.size == (item["width"], item["height"])
+            # A blank page is white.
+            assert np.array(written.convert("L")).min() > 240
+    assert json.loads((out / layout.page_file(5)).read_text(encoding="utf-8"))["lines"][0]["text"] == "Linha"
+
+
+def test_a_picture_is_never_enlarged_and_shrinks_to_its_longer_side(tmp_path: Path) -> None:
+    assert layout.picture_scale(612, 792) == pytest.approx(2000 / 792)
+    assert layout.picture_scale(100, 100) == layout.MAX_PICTURE_SCALE
+    assert layout.picture_scale(14_400, 1) == pytest.approx(2000 / 14_400)
+    assert layout.write_webp(np.full((300, 200, 3), 255, dtype=np.uint8), tmp_path / "small.webp") == (200, 300)
+    assert layout.write_webp(np.full((3000, 1000), 0, dtype=np.uint8), tmp_path / "tall.webp") == (667, 2000)
+    assert layout.write_webp(np.full((1, 9000, 3), 0, dtype=np.uint8), tmp_path / "thin.webp") == (2000, 1)
+    assert layout.picture_file(12) == "page-0000012.webp"

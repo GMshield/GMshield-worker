@@ -1,7 +1,8 @@
 """One ingestion step end to end (Story 1.15), against the stand-in backend and the real sandbox: the clean stage of a
 PDF with active content, a password, a broken file, a crash, the deadline and a bad manifest, the step folder erased
 every time, and the outcome through a lane (`retry: false`, the result) under the job's trace id. Then triage, layout
-and text (Story 1.16), OCR (Story 1.17), and the passages stage over every text file (Story 1.18)."""
+and text (Story 1.16), OCR (Story 1.17), the passages stage over every text file (Story 1.18), and the page views the
+reading stages report (Story 1.19)."""
 
 from __future__ import annotations
 
@@ -371,8 +372,18 @@ def test_a_retried_triage_runs_one_child_per_page_and_a_page_whose_child_fails_i
     ]
 
 
+PICTURE = b"RIFF\x00\x00\x00\x00WEBPVP8 "
+
+
+def write_picture(out: Path, page: int) -> dict[str, int]:
+    """A page picture as a child writes it (the parent never parses one), and its manifest entry."""
+    (out / layout.picture_file(page)).write_bytes(PICTURE + str(page).encode())
+    return {"page": page, "width": 1545, "height": 2000}
+
+
 def fake_layout(failing: set[int] | None = None, missing: set[int] | None = None) -> Any:
-    """A layout child that writes a page record for each page asked for, except those it fails on or leaves out."""
+    """A layout child that writes a page record and a picture for each page asked for, except those it fails on or
+    leaves out."""
     calls: list[list[str]] = []
 
     def run(_script: Path, arguments: list[str], *, folder: Path, **_options: Any) -> sandbox.ChildResult:
@@ -388,7 +399,8 @@ def fake_layout(failing: set[int] | None = None, missing: set[int] | None = None
                       "blocks": [{"label": "text", "text": f"Page {page}.", "box": [0, 0, 1, 1], "headingLevel": None,
                                   "rows": None}]}  # fmt: skip
             (out / layout.page_file(page)).write_text(json.dumps(record), encoding="utf-8")
-        (out / layout.MANIFEST).write_text(json.dumps({"pages": written}), encoding="utf-8")
+        pictures = [write_picture(out, page) for page in written]
+        (out / layout.MANIFEST).write_text(json.dumps({"pages": written, "pictures": pictures}), encoding="utf-8")
         return sandbox.ChildResult(returncode=0, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
 
     run.calls = calls  # type: ignore[attr-defined]
@@ -413,6 +425,13 @@ def test_layout_reads_its_run_into_one_json_file_and_reports_every_page_read_dir
     assert [page["page"] for page in sent["pages"]] == [23, 24, 25]
     assert sent["pages"][0]["blocks"][0]["text"] == "Page 23."
     assert outcome.result["next"] == []
+    # Matrix row "Digital page" (Story 1.19): each page's picture sent back, with its size and its lines.
+    views = outcome.result["pageViews"]
+    assert [view["page"] for view in views] == [23, 24, 25]
+    assert views[0]["picture"]["width"] == 1545 and views[0]["picture"]["height"] == 2000
+    assert stand_in.outputs[views[0]["picture"]["fileId"]] == PICTURE + b"23"
+    assert views[2]["lines"] == [{"text": "line 25", "box": [0, 0, 1, 0.1]}]
+    assert ingestion_result_valid(stand_in.jobs[str(job.job_id)], outcome.result)
     assert stand_in.jobs[str(job.job_id)].state == "running"
     assert list(work.iterdir()) == []
 
@@ -445,6 +464,8 @@ def test_a_retried_layout_reads_page_by_page_and_leaves_the_failed_page_out_of_i
     for item in outcome.result["texts"]:
         pages = [page["page"] for page in json.loads(stand_in.outputs[item["fileId"]])["pages"]]
         assert pages == list(range(item["firstPage"], item["lastPage"] + 1))
+    # Matrix row "Crashed page": the page whose child failed has no view.
+    assert [view["page"] for view in outcome.result["pageViews"]] == [21, 22, 24, 25]
     # The stand-in, like the backend, accepts it.
     assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
 
@@ -468,6 +489,8 @@ def test_a_markdown_upload_comes_back_unchanged_with_its_pages_read_directly(sta
     pages = json.loads(stand_in.outputs[text_file["fileId"]])["pages"]
     assert [page["headingPath"] for page in pages] == [["A"], ["A", "B"], ["A", "B"], ["A", "B"], ["A", "B"]]
     assert all(len(page["text"]) <= 3000 for page in pages)
+    # Matrix row "Text page" (Story 1.19): each page's text, no picture.
+    assert result["pageViews"] == [{"page": page["page"], "text": page["text"]} for page in pages]
     assert result["next"] == [{"stage": "passages", "firstPage": 1, "lastPage": 5, "input": "texts"}]
     assert list(work.iterdir()) == []
     assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
@@ -538,7 +561,8 @@ def fake_ocr(crashing: set[int] | None = None, blank: set[int] | None = None) ->
                       "blocks": [{"label": "text", "text": f"Scan {page}.", "box": [0, 0, 1, 1], "headingLevel": None,
                                   "rows": None}]}  # fmt: skip
             (out / layout.page_file(page)).write_text(json.dumps(record), encoding="utf-8")
-        manifest = {"pages": written, "unreadable": unreadable}
+        pictures = [write_picture(out, page) for page in range(first, last + 1)]
+        manifest = {"pages": written, "unreadable": unreadable, "pictures": pictures}
         (out / layout.MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
         return sandbox.ChildResult(returncode=0, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
 
@@ -567,6 +591,12 @@ def test_ocr_reads_its_run_with_one_child_and_reports_pages_read_by_ocr_and_a_bl
     assert [page["page"] for page in sent["pages"]] == [8, 9, 10]
     assert sent["pages"][0]["blocks"][0]["text"] == "Scan 8."
     assert outcome.result["next"] == []
+    # Matrix row "Blank scan" (Story 1.19): every page has its picture; the blank one has no lines.
+    views = {view["page"]: view for view in outcome.result["pageViews"]}
+    assert sorted(views) == list(range(1, 11))
+    assert views[7]["lines"] == []
+    assert views[8]["lines"] == [{"text": "Capitulo", "box": [0, 0, 1, 0.1]}]
+    assert stand_in.outputs[views[7]["picture"]["fileId"]] == PICTURE + b"7"
     assert list(work.iterdir()) == []
     assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
 
@@ -604,6 +634,7 @@ def test_a_retried_ocr_reads_page_by_page_with_a_share_of_the_budget_and_a_crash
     assert [call[3:5] for call in runner.calls] == [[str(p), str(p)] for p in range(1, 6)]
     assert set(deadlines) == {108.0}
     assert outcome.result is not None
+    assert [view["page"] for view in outcome.result["pageViews"]] == [1, 2, 4, 5]
     assert outcome.result["pages"] == [
         {"firstPage": 1, "lastPage": 2, "outcome": "read_by_ocr"},
         {"firstPage": 3, "lastPage": 3, "outcome": "unreadable"},
@@ -797,3 +828,108 @@ def test_the_stand_in_refuses_passages_the_backend_would_refuse(stand_in: StandI
         answer = api.report(job, Outcome.done(bad))
         assert (answer.status, answer.code) == (400, "job.result_invalid"), bad
     assert stand_in.jobs[str(job.job_id)].state == "running"
+
+
+# --- Story 1.19: page views
+
+
+def test_a_picture_manifest_that_names_a_page_twice_another_page_a_bad_size_or_no_file_is_refused(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / layout.picture_file(1)).write_bytes(PICTURE)
+    good = {"page": 1, "width": 10, "height": 20}
+    found = None
+    for pictures, refused in (
+        ([good], False),
+        ([good, good], True),
+        ([{**good, "page": 3}], True),
+        ([{**good, "page": 2}], True),  # no file
+        ([{**good, "width": 0}], True),
+        ([{**good, "height": 10_001}], True),
+        ([{**good, "width": "10"}], True),
+        ([{"page": 1}], True),
+        ("all", True),
+    ):
+        (tmp_path / layout.MANIFEST).write_text(json.dumps({"pages": [1], "pictures": pictures}), encoding="utf-8")
+        if refused:
+            with pytest.raises(StepFailed):
+                step.read_pictures(tmp_path, [1, 2])
+        else:
+            found = step.read_pictures(tmp_path, [1, 2])
+    assert found == {1: step.Picture(tmp_path / layout.picture_file(1), 10, 20)}
+    (tmp_path / layout.MANIFEST).write_text(json.dumps({"pages": [1]}), encoding="utf-8")
+    assert step.read_pictures(tmp_path, [1]) == {}
+
+
+def test_a_page_views_lines_keep_those_the_backend_takes_cut_to_its_limits(tmp_path: Path) -> None:
+    lines: list[object] = [
+        {"text": "kept", "box": [0, 0.5, 1, 1]},
+        {"text": "", "box": [0, 0, 1, 1]},
+        {"text": "no box"},
+        {"text": "outside", "box": [0, 0, 1.5, 1]},
+        {"text": "short", "box": [0, 0, 1]},
+        {"text": "bool", "box": [True, 0, 1, 1]},
+        "not a line",
+        {"text": "ç" * 5000, "box": [0, 0, 1, 1]},
+    ]
+    record = tmp_path / "page.json"
+    record.write_text(json.dumps({"page": 1, "lines": lines}), encoding="utf-8")
+    kept = step.page_lines(record)
+    assert [line["text"][:4] for line in kept] == ["kept", "çççç"]
+    assert len(kept[1]["text"]) == step.MAX_LINE
+    record.write_text(json.dumps({"page": 1, "lines": [{"text": "a", "box": [0, 0, 1, 1]}] * 10_005}), encoding="utf-8")
+    assert len(step.page_lines(record)) == step.MAX_LINES
+    record.write_text("{", encoding="utf-8")
+    with pytest.raises(StepFailed):
+        step.page_lines(record)
+
+
+def test_a_text_files_pages_become_page_views_or_the_step_fails(tmp_path: Path) -> None:
+    path = tmp_path / "text-00001.json"
+    path.write_text(json.dumps({"pages": [{"page": 1, "text": "Um"}, {"page": 2, "text": "Dois"}]}), encoding="utf-8")
+    assert step.text_views(path, 1, 2) == [{"page": 1, "text": "Um"}, {"page": 2, "text": "Dois"}]
+    for first, last in ((1, 3), (2, 3)):
+        with pytest.raises(StepFailed):
+            step.text_views(path, first, last)
+    path.write_text(json.dumps({"pages": [{"page": 1, "text": "a" * 16_385}]}), encoding="utf-8")
+    with pytest.raises(StepFailed):
+        step.text_views(path, 1, 1)
+    path.write_text(json.dumps({"pages": [{"page": 1}]}), encoding="utf-8")
+    with pytest.raises(StepFailed):
+        step.text_views(path, 1, 1)
+
+
+def test_the_stand_in_refuses_page_views_the_backend_would_refuse(stand_in: StandIn, tmp_path: Path) -> None:
+    job = claim(stand_in, batch_pdf(tmp_path), step_input("layout", 21, 23))
+    api = JobsApi(stand_in.url, CREDENTIAL)
+    picture = str(JobFiles(stand_in.url, CREDENTIAL).upload(job, _written(tmp_path / "p.webp")).file_id)
+    other = str(JobFiles(stand_in.url, CREDENTIAL).upload(job, _written(tmp_path / "q.webp")).file_id)
+    frame: dict[str, Any] = {"fileId": picture, "width": 10, "height": 10}
+    view: dict[str, Any] = {"page": 21, "picture": frame, "lines": [{"text": "a", "box": [0, 0, 1, 1]}]}
+    good = {
+        "pipelineVersion": PIPELINE_VERSION,
+        "pages": [{"firstPage": 21, "lastPage": 23, "outcome": "unreadable"}],
+        "pageViews": [view, {"page": 22, "text": "texto"}],
+        "next": [],
+    }
+    assert ingestion_result_valid(stand_in.jobs[str(job.job_id)], good)
+    for bad in (
+        [{**view, "page": 24}],
+        [view, {**view, "picture": {**frame, "fileId": other}}],
+        [{**view, "picture": {**frame, "fileId": str(UUID(int=7))}}],
+        [view, {**view, "page": 22}],
+        [{**view, "picture": {**frame, "width": 0}}],
+        [{**view, "lines": [{"text": "", "box": [0, 0, 1, 1]}]}],
+        [{**view, "lines": [{"text": "a", "box": [0, 0, 2, 1]}]}],
+        [{**view, "text": "both"}],
+        [{"page": 21}],
+        [{"page": 21, "text": "a" * 16_385}],
+    ):
+        answer = api.report(job, Outcome.done({**good, "pageViews": bad}))
+        assert (answer.status, answer.code) == (400, "job.result_invalid"), bad
+    assert api.report(job, Outcome.done(good)).status == 204
+
+
+def _written(path: Path) -> Path:
+    path.write_bytes(PICTURE)
+    return path

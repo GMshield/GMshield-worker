@@ -4,8 +4,9 @@
 is a script of its own, started through `sandbox.py`: `clean.py` (pikepdf), `triage.py` (pypdfium2), `layout.py`
 (Docling), `ocr.py` (OpenCV, Docling and Tesseract; Story 1.17) and, for a text upload, `text.py` (Story 1.16).
 `errors.py` holds the codes a step reports. The `passages` stage (Story 1.18) runs in-process with no child, since it
-reads only our own JSON: `passages.py` cuts every text file of a version into passages and an outline. Later stages
-(page pictures, photos) arrive with Stories 1.19 and 1.21.
+reads only our own JSON: `passages.py` cuts every text file of a version into passages and an outline. From Story
+1.19 the reading stages also report a page view per page they read: `layout.py` renders each page with pypdfium2,
+`ocr.py` keeps its straightened picture, both as WebP; `text` reports each page's text. Photos arrive with Story 1.21.
 
 `PIPELINE_VERSION` names this worker's stages and batches: every step reports it, and the backend keeps the first
 report's, so a chain never mixes the output of two pipelines. A step of a chain started under another version fails
@@ -13,7 +14,8 @@ with `ingestion.pipeline_changed`, and the backend restarts the chain. "2" (Stor
 then layout per run of text pages; or one text step. "3" (Story 1.17): triage also sends a page with fewer than 200
 characters under a half-page image to OCR, and asks an `ocr` step for each run of at most 10 image pages. "4"
 (Story 1.18): clean and text also ask the `passages` step over every text file, which the backend holds until every
-page has an outcome.
+page has an outcome. "5" (Story 1.19): layout, OCR and text also report `pageViews` (layout and OCR send each page's
+WebP picture back).
 """
 
-PIPELINE_VERSION = "4"
+PIPELINE_VERSION = "5"
