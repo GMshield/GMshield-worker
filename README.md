@@ -137,6 +137,9 @@ lockfile and the production image:
 
 ## Settings
 
+[`.env.example`](.env.example) lists them with their defaults and empty secrets, for a start by hand
+(`docker run --env-file .env`).
+
 | Setting | Meaning |
 |---|---|
 | `GMSHIELD_BACKEND_URL` | the backend's address, `http` or `https`, without credentials (required outside test mode) |
