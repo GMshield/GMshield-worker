@@ -11,7 +11,9 @@ Since Story 1.15 it also serves a claimed job's files: `GET .../inputs/{name}` a
 `offer(inputs=...)` gave for that name (404 for another name), and `POST .../outputs` keeps the body
 in `outputs` under a new id and answers `{fileId, size, sha256}`; both need the live claim's grant.
 `output_status` forces the output's answer, and `wrong_sha256` makes the answer's hash wrong.
-A failed outcome with `retry: false` ends the job at once, as the backend does.
+A failed outcome with `retry: false` ends the job at once, as the backend does. A done `ingestion`
+outcome is checked against the backend's rules for a step report (`ingestion_result_valid`) and
+answered 400 `job.result_invalid` otherwise, so a renamed field fails the worker's tests.
 
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
@@ -35,6 +37,7 @@ from typing import Any
 import pytest
 
 PR_SET_DUMPABLE = 4
+PIPELINE_VERSION = re.compile(r"[A-Za-z0-9._-]{1,32}")
 CLAIMS = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims")
 CLAIM_ROUTE = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs)")
 INPUT_ROUTE = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/inputs/([^/]+)")
@@ -62,6 +65,7 @@ class StandInJob:
     outcomes: list[dict[str, Any]] = field(default_factory=list)
     renewals: int = 0
     inputs: dict[str, bytes] = field(default_factory=dict)
+    output_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -155,11 +159,12 @@ def _granted(state: StandIn, job_id: str, claim_id: str, grant: str | None) -> S
     return job
 
 
-def _output(state: StandIn, body: bytes) -> tuple[int, Any]:
+def _output(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     if state.output_status is not None:
         return problem(state.output_status, "job.output_too_large")
     file_id = str(uuid.uuid4())
     state.outputs[file_id] = body
+    job.output_ids.add(file_id)
     digest = hashlib.sha256(body).hexdigest()
     return 201, {"fileId": file_id, "size": len(body), "sha256": "0" * 64 if state.wrong_sha256 else digest}
 
@@ -189,7 +194,7 @@ def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tu
     if job is None:
         return problem(403, "job.grant_refused")
     if action == "outputs":
-        return _output(state, body)
+        return _output(state, job, body)
     return _renewal(state, job) if action == "renewals" else _outcome(state, job, body)
 
 
@@ -199,8 +204,42 @@ def _renewal(state: StandIn, job: StandInJob) -> tuple[int, Any]:
     return 200, {"renewAt": renew_at, "lapsesAt": lapses_text}
 
 
+def _page(value: object, total: int) -> bool:
+    return type(value) is int and 1 <= value <= total
+
+
+def ingestion_result_valid(job: StandInJob, result: object) -> bool:
+    """The backend's rules for a done `ingestion` step (`IngestionSteps.Report.of`), as the clean stage uses them: a
+    pipeline version, an integer page total, an original and batches that are outputs of this job with pages within the
+    total, and `next` an array."""
+    if not isinstance(result, dict):
+        return False
+    version, total, original = result.get("pipelineVersion"), result.get("pageTotal"), result.get("original")
+    batches, following = result.get("batches", []), result.get("next")
+    if not isinstance(version, str) or not PIPELINE_VERSION.fullmatch(version):
+        return False
+    if type(total) is not int or total < 1 or not isinstance(following, list) or not isinstance(batches, list):
+        return False
+    if original is not None and (not isinstance(original, dict) or original.get("fileId") not in job.output_ids):
+        return False
+    return all(
+        isinstance(batch, dict)
+        and batch.get("fileId") in job.output_ids
+        and _page(batch.get("firstPage"), total)
+        and _page(batch.get("lastPage"), total)
+        and batch["firstPage"] <= batch["lastPage"]
+        for batch in batches
+    )
+
+
 def _outcome(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     outcome = json.loads(body)
+    if (
+        outcome["outcome"] == "done"
+        and job.kind == "ingestion"
+        and not ingestion_result_valid(job, outcome.get("result"))
+    ):
+        return problem(400, "job.result_invalid")
     job.outcomes.append(outcome)
     if outcome["outcome"] == "failed":
         last = outcome.get("retry") is False or job.attempt >= state.max_attempts

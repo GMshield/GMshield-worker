@@ -95,6 +95,10 @@ ENV PATH=/opt/venv/bin:$PATH \
 # No EXPOSE: the worker opens no port. Health is a file that the supervisor keeps fresh.
 USER 10001:10001
 VOLUME ["/tmp", "/var/lib/gmshield-worker/work", "/run/gmshield-worker"]
+# The check runs with an emptied environment (Story 1.15): it is a process of the worker's user, so with the worker's
+# secrets in its environment a compromised parsing child could read them from /proc/<pid>/environ. It needs only the
+# interpreter, the application and the default health file.
 HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python", "-m", "gmshield_worker.health"]
+    CMD ["/usr/bin/env", "-i", "PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin", "PYTHONPATH=/app", \
+         "PYTHONDONTWRITEBYTECODE=1", "python", "-m", "gmshield_worker.health"]
 CMD ["python", "-m", "gmshield_worker.main"]

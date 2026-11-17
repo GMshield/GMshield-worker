@@ -212,3 +212,19 @@ def test_through_a_lane_a_password_is_reported_with_retry_false_and_a_clean_step
     assert reported["result"]["pageTotal"] == 2
     assert reported["result"]["original"]["fileId"] in stand_in.outputs
     assert list(work.iterdir()) == []
+
+
+def test_the_stand_in_refuses_a_done_ingestion_result_the_backend_would_refuse(stand_in: StandIn) -> None:
+    job = claim(stand_in, b"%PDF-1.7\n")
+    api = JobsApi(stand_in.url, CREDENTIAL)
+    good = {"pipelineVersion": PIPELINE_VERSION, "pageTotal": 2, "batches": [], "next": []}
+    for bad in (
+        {**good, "pipelineVersion": ""},
+        {**good, "pageTotal": "2"},
+        {**good, "next": None},
+        {**good, "original": {"fileId": "0195a3c0-0000-7000-8000-000000000001"}},
+        {**good, "page_total": 2, "pageTotal": None},
+    ):
+        answer = api.report(job, Outcome.done(bad))
+        assert (answer.status, answer.code) == (400, "job.result_invalid"), bad
+    assert stand_in.jobs[str(job.job_id)].state == "running"

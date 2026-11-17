@@ -107,6 +107,30 @@ def active(path: Path, page_count: int = 3) -> Path:
     return path
 
 
+UNSAFE_URIS = (
+    "javascript:app.alert(1)",
+    "\x01javascript:app.alert(1)",
+    "java\tscript:app.alert(1)",
+    " JavaScript :app.alert(1)",
+    "file:///etc/passwd",
+    "smb://host/share",
+    "data:text/html,<script>alert(1)</script>",
+    "vbscript:msgbox(1)",
+    "relative/page.html",
+    "",
+)
+SAFE_URIS = ("https://example.test/a", "http://example.test/b", "mailto:gm@example.test", " HTTPS://example.test/c")
+
+
+def uris(path: Path) -> Path:
+    """One page with a URI link for each unsafe and each safe address, a null and an integer in its /Annots."""
+    pdf = pages(1)
+    links = [_link(pdf, Dictionary(S=Name.URI, URI=String(uri))) for uri in (*UNSAFE_URIS, *SAFE_URIS)]
+    pdf.pages[0].obj.Annots = Array([*links, None, 7])
+    pdf.save(path)
+    return path
+
+
 def encrypted(path: Path, *, user: str) -> Path:
     """Three pages under an owner password, and a user password when `user` is not empty."""
     pages(3).save(path, encryption=pikepdf.Encryption(owner="owner-secret", user=user, R=6))

@@ -12,8 +12,9 @@ no credential, reaches no network, and writes only under OUT_DIR:
 - `manifest.json`: `{"pageTotal": N, "original": "original.pdf", "batches": [{"file", "firstPage", "lastPage"}]}`.
 
 Cleaning removes JavaScript (document, page, form and annotation actions, and the name tree), embedded and attached
-files (and associated files), `OpenAction` and every additional action (`AA`), every action other than GoTo and URI
-(a `javascript:` URI included), XFA forms, and RichMedia, Movie, Sound, Screen, 3D and file attachment annotations.
+files (and associated files), `OpenAction` and every additional action (`AA`), every action other than GoTo and URI,
+a URI action whose scheme (read after dropping control characters and whitespace) is not http, https or mailto, XFA
+forms, and RichMedia, Movie, Sound, Screen, 3D and file attachment annotations.
 qpdf writes only what is still reachable, so whatever was cut off is not kept. The exit status says how it went:
 0 done, `EXIT_PASSWORD` (a user password is needed), `EXIT_UNREADABLE` (qpdf cannot read it, or it has no page);
 anything else is a crash. Nothing is printed: the parent logs the status only.
@@ -35,7 +36,8 @@ BATCH_PAGES = 20
 MANIFEST = "manifest.json"
 ORIGINAL = "original.pdf"
 
-ALLOWED_ACTIONS = frozenset({"/GoTo", "/URI"})
+# A URI action is kept only for these schemes (javascript:, file:, smb:, data:, vbscript: and the rest are removed).
+SAFE_URI_SCHEMES = frozenset({"http", "https", "mailto"})
 # Every action type of PDF 2.0: a dictionary whose /S is one of them is an action.
 ACTION_TYPES = frozenset(
     {
@@ -76,11 +78,27 @@ def _is_action(item: Dictionary | Stream) -> bool:
     return item.get("/Type") == Name.Action or (isinstance(kind, Name) and str(kind) in ACTION_TYPES)
 
 
+def _uri_scheme(uri: object) -> str | None:
+    """The URI's scheme in lower case, read after dropping C0 controls and whitespace; None without one."""
+    if not isinstance(uri, pikepdf.String):
+        return None
+    text = "".join(character for character in str(uri) if ord(character) > 0x20 and not character.isspace())
+    scheme, colon, _rest = text.partition(":")
+    if not colon or not scheme or not scheme[0].isascii() or not scheme[0].isalpha():
+        return None
+    if not all(character.isascii() and (character.isalnum() or character in "+.-") for character in scheme):
+        return None
+    return scheme.lower()
+
+
 def _allowed(action: object) -> bool:
-    if not isinstance(action, Dictionary) or str(action.get("/S")) not in ALLOWED_ACTIONS:
+    """A GoTo action, or a URI action to an http, https or mailto address: nothing else is kept."""
+    if not isinstance(action, Dictionary):
         return False
-    uri = action.get("/URI")
-    return uri is None or not str(uri).strip().lower().startswith("javascript:")
+    kind = str(action.get("/S"))
+    if kind == "/GoTo":
+        return True
+    return kind == "/URI" and _uri_scheme(action.get("/URI")) in SAFE_URI_SCHEMES
 
 
 def _clean(item: Dictionary | Stream) -> None:
@@ -99,7 +117,12 @@ def _clean(item: Dictionary | Stream) -> None:
                     del item[key]
     annotations = item.get("/Annots")
     if isinstance(annotations, Array):
-        kept = [annotation for annotation in annotations if str(annotation.get("/Subtype")) not in REMOVED_ANNOTATIONS]
+        # An entry that is not a dictionary (a null, a dangling reference) is left as it is: never a crash.
+        kept = [
+            annotation
+            for annotation in annotations
+            if not (isinstance(annotation, Dictionary) and str(annotation.get("/Subtype")) in REMOVED_ANNOTATIONS)
+        ]
         if len(kept) != len(annotations):
             item["/Annots"] = Array(kept)
 

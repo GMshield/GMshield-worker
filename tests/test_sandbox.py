@@ -6,6 +6,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import platform
 import socket
 import struct
 import threading
@@ -30,6 +31,8 @@ for family in ("AF_INET", "AF_INET6", "AF_UNIX", "AF_NETLINK", "AF_PACKET"):
         found[family] = error.errno
 libc = ctypes.CDLL(None, use_errno=True)
 found["io_uring_setup"] = ctypes.get_errno() if libc.syscall(425, 1, None) < 0 else "allowed"
+# socket(AF_INET, SOCK_DGRAM) through the x32 ABI (x86-64 only): the filter's other-ABI branch.
+found["x32_socket"] = ctypes.get_errno() if libc.syscall(41 | 0x40000000, 2, 2, 0) < 0 else "allowed"
 try:
     with open(f"/proc/{os.getppid()}/environ", "rb") as environ:
         found["parent_environ"] = "read" if environ.read() is not None else "empty"
@@ -69,6 +72,11 @@ def test_a_child_cannot_open_a_network_socket_or_io_uring_and_gets_eacces(tmp_pa
         assert found[family] == 13, family  # EACCES
     assert found["AF_UNIX"] == "allowed"
     assert found["io_uring_setup"] == 13
+
+
+@pytest.mark.skipif(platform.machine() != "x86_64", reason="the x32 ABI exists on x86-64 only")
+def test_a_child_cannot_open_a_socket_through_the_x32_abi(tmp_path: Path) -> None:
+    assert probe(tmp_path)["x32_socket"] == 13  # EACCES from the filter, not ENOSYS from the kernel
 
 
 def test_a_child_gets_only_path_lang_and_home_its_folder_and_no_other_descriptor(

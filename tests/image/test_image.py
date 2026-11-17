@@ -110,10 +110,44 @@ def test_the_clean_child_runs_in_its_sandbox() -> None:
         assert sandbox.run_child(folder / "dial.py", [], folder=folder, cancel=threading.Event()).returncode == 13
 
 
+# The HEALTHCHECK's command in the Dockerfile, word for word: an emptied environment, so no secret of the worker's sits
+# in the environment of a process a parsing child could read.
+HEALTHCHECK = [
+    "/usr/bin/env",
+    "-i",
+    "PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin",
+    "PYTHONPATH=/app",
+    "PYTHONDONTWRITEBYTECODE=1",
+    "python",
+    "-m",
+    "gmshield_worker.health",
+]
+
+
+def test_the_health_check_works_with_an_emptied_environment() -> None:
+    from gmshield_worker import health
+
+    environment = subprocess.run(  # noqa: S603 - the HEALTHCHECK's own command, with a probe in place of the module
+        [*HEALTHCHECK[:5], "python", "-c", "import os; print(sorted(os.environ))"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "GMSHIELD_WORKER_CREDENTIAL": "secret-in-the-worker"},
+    )
+    assert "GMSHIELD" not in environment.stdout, environment.stdout
+    health.mark_healthy(health.HEALTH_FILE)
+    try:
+        assert subprocess.run(HEALTHCHECK, check=False).returncode == 0  # noqa: S603 - the HEALTHCHECK itself
+    finally:
+        health.mark_unhealthy(health.HEALTH_FILE)
+    assert subprocess.run(HEALTHCHECK, check=False).returncode == 1  # noqa: S603 - the HEALTHCHECK itself
+
+
 def main() -> int:
     failures = 0
     checks = (
         test_worker_folders_are_private_and_writable,
+        test_the_health_check_works_with_an_emptied_environment,
         test_the_clean_child_runs_in_its_sandbox,
         test_tesseract_lists_portuguese_and_english,
         test_docling_converts_offline,

@@ -67,6 +67,22 @@ def test_an_active_pdf_keeps_none_of_its_active_content_in_the_original_or_the_b
     }
 
 
+def test_a_uri_is_kept_only_for_http_https_or_mailto_and_an_odd_annots_entry_never_crashes(tmp_path: Path) -> None:
+    source = pdfs.uris(tmp_path / "uris.pdf")
+
+    assert run_clean(source, tmp_path / "out") == 0
+
+    with pikepdf.Pdf.open(tmp_path / "out" / "original.pdf") as pdf:
+        kept = [
+            str(annotation.A.URI)
+            for annotation in pdf.pages[0].obj.Annots
+            if isinstance(annotation, pikepdf.Dictionary) and "/A" in annotation
+        ]
+        assert sorted(kept) == sorted(pdfs.SAFE_URIS)
+        # The null and the integer are still there, untouched.
+        assert len(pdf.pages[0].obj.Annots) == len(pdfs.UNSAFE_URIS) + len(pdfs.SAFE_URIS) + 2
+
+
 def test_an_owner_password_pdf_opens_without_one_and_is_saved_unencrypted(tmp_path: Path) -> None:
     source = pdfs.encrypted(tmp_path / "owner.pdf", user="")
     with pikepdf.Pdf.open(source) as pdf:
