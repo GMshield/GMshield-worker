@@ -4,6 +4,7 @@ every time, and the outcome through a lane (`retry: false`, the result) under th
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import threading
@@ -16,11 +17,18 @@ import pytest
 
 from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome
 from gmshield_worker.backend.files import JobFiles
-from gmshield_worker.ingestion import PIPELINE_VERSION, sandbox, step
-from gmshield_worker.ingestion.errors import FILE_UNREADABLE, PASSWORD_REQUIRED, STAGE_UNKNOWN, STEP_FAILED, StepFailed
+from gmshield_worker.ingestion import PIPELINE_VERSION, layout, sandbox, step
+from gmshield_worker.ingestion.errors import (
+    FILE_UNREADABLE,
+    PASSWORD_REQUIRED,
+    PIPELINE_CHANGED,
+    STAGE_UNKNOWN,
+    STEP_FAILED,
+    StepFailed,
+)
 from gmshield_worker.log import new_trace_id
 from tests import pdfs
-from tests.conftest import StandIn, log_lines
+from tests.conftest import StandIn, StandInJob, ingestion_result_valid, log_lines
 from tests.test_lanes import lane, wait_for
 
 CREDENTIAL = "w" * 64
@@ -64,8 +72,12 @@ def test_a_pdf_with_active_content_is_cleaned_split_sent_back_and_reported(
     assert result is not None
     assert result["pipelineVersion"] == PIPELINE_VERSION
     assert result["pageTotal"] == 25
-    assert result["next"] == []
     assert [(batch["firstPage"], batch["lastPage"]) for batch in result["batches"]] == [(1, 20), (21, 25)]
+    # One triage step per batch, over that batch.
+    assert result["next"] == [
+        {"stage": "triage", "firstPage": batch["firstPage"], "lastPage": batch["lastPage"], "input": batch["fileId"]}
+        for batch in result["batches"]
+    ]
     files = [result["original"]["fileId"], *(batch["fileId"] for batch in result["batches"])]
     assert sorted(files) == sorted(stand_in.outputs)
     for file_id in files:
@@ -218,13 +230,256 @@ def test_the_stand_in_refuses_a_done_ingestion_result_the_backend_would_refuse(s
     job = claim(stand_in, b"%PDF-1.7\n")
     api = JobsApi(stand_in.url, CREDENTIAL)
     good = {"pipelineVersion": PIPELINE_VERSION, "pageTotal": 2, "batches": [], "next": []}
+    unknown = "0195a3c0-0000-7000-8000-000000000001"
     for bad in (
         {**good, "pipelineVersion": ""},
         {**good, "pageTotal": "2"},
-        {**good, "next": None},
-        {**good, "original": {"fileId": "0195a3c0-0000-7000-8000-000000000001"}},
-        {**good, "page_total": 2, "pageTotal": None},
-    ):
+        {**good, "next": "none"},
+        {**good, "original": {"fileId": unknown}},
+        {**good, "page_total": 2, "pageTotal": None, "layers": [{"firstPage": 1, "lastPage": 1, "layer": "text"}]},
+        {**good, "layers": [{"firstPage": 1, "lastPage": 3, "layer": "text"}]},
+        {**good, "layers": [{"firstPage": 1, "lastPage": 2, "layer": "text"}, {"firstPage": 2, "lastPage": 2,
+                                                                               "layer": "image"}]},
+        {**good, "pages": [{"firstPage": 1, "lastPage": 1, "outcome": "read"}]},
+        {**good, "pages": [{"firstPage": 1, "lastPage": 1, "outcome": "unreadable"}],
+         "texts": [{"fileId": unknown, "firstPage": 1, "lastPage": 1}]},
+        {**good, "next": [{"stage": "layout", "firstPage": 1, "lastPage": 1, "input": unknown}]},
+    ):  # fmt: skip
         answer = api.report(job, Outcome.done(bad))
         assert (answer.status, answer.code) == (400, "job.result_invalid"), bad
     assert stand_in.jobs[str(job.job_id)].state == "running"
+
+
+# --- Story 1.16: the pipeline check, triage, layout and text
+
+BATCH_ID = "0195a3c0-0000-7000-8000-0000000000b2"
+SENTENCE = "The party rests at the inn for the night"
+
+
+def step_input(stage: str, first: int, last: int, **extra: Any) -> dict[str, Any]:
+    """A later step's claim input: a batch holding pages 21 to 25 of a 25-page version."""
+    return {
+        "versionId": CLEAN_INPUT["versionId"],
+        "stage": stage,
+        "format": "pdf",
+        "input": "source",
+        "pageTotal": 25,
+        "pipelineVersion": PIPELINE_VERSION,
+        "firstPage": first,
+        "lastPage": last,
+        "inputFileId": BATCH_ID,
+        "inputFirstPage": 21,
+        "inputLastPage": 25,
+        **extra,
+    }
+
+
+def batch_pdf(tmp_path: Path) -> bytes:
+    """Pages 21 to 25: 22 is blank and 23 shows a page number only, as scans do."""
+    return made(tmp_path / "batch.pdf", lambda path: pdfs.with_text(path, [SENTENCE, "", "23", SENTENCE, SENTENCE]))
+
+
+def retried(job: ClaimedJob) -> ClaimedJob:
+    """The same claim seen as a second attempt."""
+    return dataclasses.replace(job, attempt=2)
+
+
+def test_a_step_of_a_chain_started_by_another_pipeline_fails_at_once_before_any_download(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    for stage in ("triage", "layout"):
+        job = claim(stand_in, b"%PDF-1.7\n", step_input(stage, 21, 25, pipelineVersion="1"))
+
+        outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
+
+        assert outcome == Outcome.failed(PIPELINE_CHANGED, retry=False)
+        assert not any("/inputs/" in request["path"] for request in stand_in.job_requests(str(job.job_id)))
+
+
+def test_a_malformed_claim_input_fails_at_once(stand_in: StandIn, tmp_path: Path) -> None:
+    for bad in (
+        step_input("triage", 21, 26),
+        step_input("triage", 20, 25),
+        step_input("triage", 21, 25, inputFileId="../x"),
+        step_input("triage", 21, 25, inputLastPage=None),
+        step_input("triage", 22, 21),
+        {key: value for key, value in step_input("layout", 21, 25).items() if key != "inputFileId"},
+        {key: value for key, value in step_input("triage", 21, 25).items() if key != "firstPage"},
+    ):
+        job = claim(stand_in, b"%PDF-1.7\n", bad)
+        assert handler(stand_in, tmp_path / "work")(job, threading.Event()) == Outcome.failed(STEP_FAILED, retry=False)
+
+
+def test_triage_marks_each_page_and_asks_a_layout_step_for_each_run_of_text_pages(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    job = claim(stand_in, batch_pdf(tmp_path), step_input("triage", 21, 25))
+    work = tmp_path / "work"
+
+    outcome = handler(stand_in, work)(job, threading.Event())
+
+    assert outcome.outcome == "done", outcome
+    assert outcome.result == {
+        "pipelineVersion": PIPELINE_VERSION,
+        "pageTotal": 25,
+        "layers": [
+            {"firstPage": 21, "lastPage": 21, "layer": "text"},
+            {"firstPage": 22, "lastPage": 23, "layer": "image"},
+            {"firstPage": 24, "lastPage": 25, "layer": "text"},
+        ],
+        "pages": [],
+        "next": [
+            {"stage": "layout", "firstPage": 21, "lastPage": 21, "input": BATCH_ID},
+            {"stage": "layout", "firstPage": 24, "lastPage": 25, "input": BATCH_ID},
+        ],
+    }
+    assert stand_in.jobs[str(job.job_id)].outcomes == []
+    assert list(work.iterdir()) == []
+
+
+def test_a_retried_triage_runs_one_child_per_page_and_a_page_whose_child_fails_is_unreadable(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    job = claim(stand_in, batch_pdf(tmp_path), step_input("triage", 22, 25))
+    calls: list[tuple[list[str], float]] = []
+
+    def failing_on_24(script: Path, arguments: list[str], **options: Any) -> sandbox.ChildResult:
+        calls.append((arguments, options["deadline_seconds"]))
+        if arguments[3] == "24":
+            return sandbox.ChildResult(returncode=-9, timed_out=True, cancelled=False, max_rss_kib=1, seconds=1.0)
+        return sandbox.run_child(script, arguments, **options)
+
+    outcome = handler(stand_in, tmp_path / "work", runner=failing_on_24, page_budget_seconds=40.0)(
+        retried(job), threading.Event()
+    )
+
+    assert [(arguments[3], arguments[4]) for arguments, _deadline in calls] == [(str(p), str(p)) for p in range(22, 26)]
+    assert {deadline for _arguments, deadline in calls} == {10.0}
+    assert outcome.result is not None
+    assert outcome.result["layers"] == [
+        {"firstPage": 22, "lastPage": 23, "layer": "image"},
+        {"firstPage": 25, "lastPage": 25, "layer": "text"},
+    ]
+    assert outcome.result["pages"] == [{"firstPage": 24, "lastPage": 24, "outcome": "unreadable"}]
+    assert outcome.result["next"] == [{"stage": "layout", "firstPage": 25, "lastPage": 25, "input": BATCH_ID}]
+
+
+def fake_layout(failing: set[int] | None = None, missing: set[int] | None = None) -> Any:
+    """A layout child that writes a page record for each page asked for, except those it fails on or leaves out."""
+    calls: list[list[str]] = []
+
+    def run(_script: Path, arguments: list[str], *, folder: Path, **_options: Any) -> sandbox.ChildResult:
+        calls.append(arguments)
+        first, last = int(arguments[3]), int(arguments[4])
+        if failing and first in failing:
+            return sandbox.ChildResult(returncode=1, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
+        out = folder / arguments[1]
+        out.mkdir()
+        written = [page for page in range(first, last + 1) if not missing or page not in missing]
+        for page in written:
+            record = {"page": page, "lines": [{"text": f"line {page}", "box": [0, 0, 1, 0.1]}],
+                      "blocks": [{"label": "text", "text": f"Page {page}.", "box": [0, 0, 1, 1], "headingLevel": None,
+                                  "rows": None}]}  # fmt: skip
+            (out / layout.page_file(page)).write_text(json.dumps(record), encoding="utf-8")
+        (out / layout.MANIFEST).write_text(json.dumps({"pages": written}), encoding="utf-8")
+        return sandbox.ChildResult(returncode=0, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
+
+    run.calls = calls  # type: ignore[attr-defined]
+    return run
+
+
+def test_layout_reads_its_run_into_one_json_file_and_reports_every_page_read_directly(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    job = claim(stand_in, batch_pdf(tmp_path), step_input("layout", 23, 25))
+    runner = fake_layout()
+    work = tmp_path / "work"
+
+    outcome = handler(stand_in, work, runner=runner, artifacts="/models")(job, threading.Event())
+
+    assert runner.calls == [["source.pdf", "out", "21", "23", "25", "/models", "2"]]
+    assert outcome.result is not None
+    assert outcome.result["pages"] == [{"firstPage": 23, "lastPage": 25, "outcome": "read_directly"}]
+    [text_file] = outcome.result["texts"]
+    assert (text_file["firstPage"], text_file["lastPage"]) == (23, 25)
+    sent = json.loads(stand_in.outputs[text_file["fileId"]])
+    assert [page["page"] for page in sent["pages"]] == [23, 24, 25]
+    assert sent["pages"][0]["blocks"][0]["text"] == "Page 23."
+    assert outcome.result["next"] == []
+    assert stand_in.jobs[str(job.job_id)].state == "running"
+    assert list(work.iterdir()) == []
+
+
+def test_a_first_layout_attempt_that_misses_a_page_fails_for_a_retry(stand_in: StandIn, tmp_path: Path) -> None:
+    for runner in (fake_layout(missing={24}), fake_layout(failing={23})):
+        job = claim(stand_in, batch_pdf(tmp_path), step_input("layout", 23, 25))
+        assert handler(stand_in, tmp_path / "work", runner=runner)(job, threading.Event()) == Outcome.failed(
+            STEP_FAILED
+        )
+    assert stand_in.outputs == {}
+
+
+def test_a_retried_layout_reads_page_by_page_and_leaves_the_failed_page_out_of_its_files(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    job = claim(stand_in, batch_pdf(tmp_path), step_input("layout", 21, 25))
+    runner = fake_layout(failing={23})
+
+    outcome = handler(stand_in, tmp_path / "work", runner=runner)(retried(job), threading.Event())
+
+    assert [call[3:5] for call in runner.calls] == [[str(p), str(p)] for p in range(21, 26)]
+    assert outcome.result is not None
+    assert outcome.result["pages"] == [
+        {"firstPage": 21, "lastPage": 22, "outcome": "read_directly"},
+        {"firstPage": 23, "lastPage": 23, "outcome": "unreadable"},
+        {"firstPage": 24, "lastPage": 25, "outcome": "read_directly"},
+    ]
+    assert [(item["firstPage"], item["lastPage"]) for item in outcome.result["texts"]] == [(21, 22), (24, 25)]
+    for item in outcome.result["texts"]:
+        pages = [page["page"] for page in json.loads(stand_in.outputs[item["fileId"]])["pages"]]
+        assert pages == list(range(item["firstPage"], item["lastPage"] + 1))
+    # The stand-in, like the backend, accepts it.
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
+
+
+TEXT_INPUT = {"versionId": CLEAN_INPUT["versionId"], "stage": "text", "format": "markdown", "input": "source"}
+
+
+def test_a_markdown_upload_comes_back_unchanged_with_its_pages_read_directly(stand_in: StandIn, tmp_path: Path) -> None:
+    content = ("# A\n\nUnder A.\n\n## B\n\n" + " ".join(["palavra"] * 875) + "\n").encode("utf-8")
+    job = claim(stand_in, content, TEXT_INPUT)
+    work = tmp_path / "work"
+
+    outcome = handler(stand_in, work)(job, threading.Event())
+
+    assert outcome.result is not None
+    result = outcome.result
+    assert result["pageTotal"] == 5
+    assert stand_in.outputs[result["original"]["fileId"]] == content
+    assert result["pages"] == [{"firstPage": 1, "lastPage": 5, "outcome": "read_directly"}]
+    [text_file] = result["texts"]
+    pages = json.loads(stand_in.outputs[text_file["fileId"]])["pages"]
+    assert [page["headingPath"] for page in pages] == [["A"], ["A", "B"], ["A", "B"], ["A", "B"], ["A", "B"]]
+    assert all(len(page["text"]) <= 3000 for page in pages)
+    assert list(work.iterdir()) == []
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
+
+
+def test_an_empty_text_upload_fails_at_once(stand_in: StandIn, tmp_path: Path) -> None:
+    job = claim(stand_in, b"", {**TEXT_INPUT, "format": "txt"})
+    assert handler(stand_in, tmp_path / "work")(job, threading.Event()) == Outcome.failed(FILE_UNREADABLE, retry=False)
+
+
+def test_the_stand_in_checks_texts_against_this_reports_outcomes_and_next_against_known_files() -> None:
+    job = StandInJob("j", "ingestion", {"pageTotal": 3, "inputFileId": BATCH_ID}, "t", output_ids={"f"})
+    good = {
+        "pipelineVersion": PIPELINE_VERSION,
+        "pages": [{"firstPage": 1, "lastPage": 2, "outcome": "read_directly"},
+                  {"firstPage": 3, "lastPage": 3, "outcome": "unreadable"}],
+        "texts": [{"fileId": "f", "firstPage": 1, "lastPage": 2}],
+        "next": [{"stage": "layout", "firstPage": 1, "lastPage": 3, "input": BATCH_ID}],
+    }  # fmt: skip
+    assert ingestion_result_valid(job, good)
+    assert not ingestion_result_valid(job, {**good, "texts": [{"fileId": "f", "firstPage": 1, "lastPage": 3}]})
+    assert not ingestion_result_valid(job, {**good, "pageTotal": 4})
+    assert not ingestion_result_valid(job, {**good, "next": [{"stage": "layout", "input": "other"}]})

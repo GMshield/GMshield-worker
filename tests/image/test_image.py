@@ -5,7 +5,9 @@
 Tesseract lists Portuguese and English, and Docling converts a small generated PDF with the
 layout and table models baked into the image (HF_HUB_OFFLINE=1, DOCLING_ARTIFACTS_PATH), with
 Tesseract as its OCR engine. Since Story 1.15 the clean stage's child runs in its sandbox
-(isolated, with pikepdf from the image's environment and no network socket). The file runs as a
+(isolated, with pikepdf from the image's environment and no network socket). Since Story 1.16 the
+triage child and the layout child run there too: Docling reads a generated two-column page with a
+table offline, with its models given on the command line (the child's environment is empty). The file runs as a
 plain script (the image has no pytest); pytest collects it too, but `pyproject.toml` leaves
 `tests/image` out of the ordinary test run.
 """
@@ -32,6 +34,11 @@ def sample_pdf() -> bytes:
         b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
+    return _pdf(objects)
+
+
+def _pdf(objects: list[bytes]) -> bytes:
+    """A PDF of `objects` (object 1 the catalog), with its cross-reference table."""
     out = bytearray(b"%PDF-1.4\n")
     offsets = []
     for number, body in enumerate(objects, start=1):
@@ -110,6 +117,109 @@ def test_the_clean_child_runs_in_its_sandbox() -> None:
         assert sandbox.run_child(folder / "dial.py", [], folder=folder, cancel=threading.Event()).returncode == 13
 
 
+def two_column_pdf() -> bytes:
+    """One page: a heading, two columns of text, a second heading and a ruled table of four rows, written by hand."""
+    operations = []
+
+    def text(x: int, y: int, words: str, size: int = 10, font: str = "F1") -> None:
+        operations.append(f"BT /{font} {size} Tf {x} {y} Td ({words}) Tj ET")
+
+    text(72, 740, "Chapter One: The Rules", 20, "F2")
+    for index, line in enumerate(LEFT_COLUMN):
+        text(72, 700 - index * 14, line)
+    for index, line in enumerate(RIGHT_COLUMN):
+        text(320, 700 - index * 14, line)
+    text(72, 590, "Equipment Costs", 14, "F2")
+    top = 570
+    for row_index, row in enumerate(TABLE_ROWS):
+        for column, cell in enumerate(row):
+            text(80 + column * 120, top - row_index * 20 - 14, cell, 10, "F2" if row_index == 0 else "F1")
+    for row_index in range(len(TABLE_ROWS) + 1):
+        operations.append(f"72 {top - row_index * 20} m 432 {top - row_index * 20} l S")
+    for column in range(4):
+        operations.append(f"{72 + column * 120} {top} m {72 + column * 120} {top - len(TABLE_ROWS) * 20} l S")
+    stream = "\n".join(operations).encode("ascii")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R"
+        b" /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+    ]
+    return _pdf(objects)
+
+
+LEFT_COLUMN = [
+    "Combat begins when the party meets",
+    "a band of goblins on the road. Each",
+    "creature rolls for initiative and acts",
+    "in order from highest to lowest.",
+    "Roll a twenty sided die and add your",
+    "Dexterity modifier to the result.",
+]
+RIGHT_COLUMN = [
+    "Spells require components, which are",
+    "listed in each spell description. A",
+    "caster must have a free hand for the",
+    "somatic components of a spell and a",
+    "focus or pouch for the material ones.",
+    "Some spells need concentration.",
+]
+TABLE_ROWS = [["Item", "Cost", "Weight"], ["Longsword", "15 gp", "3 lb"], ["Shield", "10 gp", "6 lb"],
+              ["Rope", "1 gp", "10 lb"]]  # fmt: skip
+
+
+def test_the_triage_and_layout_children_read_two_columns_and_a_table_offline_in_their_sandbox() -> None:
+    import json
+    import threading
+
+    from gmshield_worker.ingestion import layout, sandbox, triage
+
+    artifacts = os.environ.get("DOCLING_ARTIFACTS_PATH", "/opt/docling-models")
+    with tempfile.TemporaryDirectory(dir="/tmp") as name:
+        folder = Path(name)
+        (folder / "source.pdf").write_bytes(two_column_pdf())
+        # The page is page 7 of its version, in a batch that starts at page 7.
+        triaged = sandbox.run_child(
+            Path(triage.__file__), ["source.pdf", "triage", "7", "7", "7"], folder=folder, cancel=threading.Event()
+        )
+        assert triaged.returncode == 0, triaged
+        assert json.loads((folder / "triage" / "manifest.json").read_text(encoding="utf-8")) == {
+            "pages": [{"page": 7, "layer": "text"}]
+        }
+        result = sandbox.run_child(
+            Path(layout.__file__),
+            ["source.pdf", "out", "7", "7", "7", artifacts, "2"],
+            folder=folder,
+            cancel=threading.Event(),
+        )
+        assert result.returncode == 0, result
+        assert json.loads((folder / "out" / "manifest.json").read_text(encoding="utf-8")) == {"pages": [7]}
+        record = json.loads((folder / "out" / "page-0000007.json").read_text(encoding="utf-8"))
+    print(f"layout child: {result.seconds:.1f} s, peak {result.max_rss_kib // 1024} MiB")
+    assert record["page"] == 7
+    blocks = record["blocks"]
+    labels = [(block["label"], block["text"][:20]) for block in blocks]
+    assert [block["label"] for block in blocks] == ["section_header", "text", "text", "section_header", "table"], labels
+    heading, left, right, second, table = blocks
+    assert heading["text"] == "Chapter One: The Rules"
+    assert heading["headingLevel"] == 1
+    # Reading order: the whole left column, then the whole right one.
+    assert left["text"] == " ".join(LEFT_COLUMN)
+    assert right["text"] == " ".join(RIGHT_COLUMN)
+    assert left["box"][0] < 0.2 and right["box"][0] > 0.5
+    assert second["text"] == "Equipment Costs"
+    assert table["rows"] == TABLE_ROWS
+    for block in blocks:
+        left_edge, top_edge, right_edge, bottom_edge = block["box"]
+        assert 0 <= left_edge < right_edge <= 1 and 0 <= top_edge < bottom_edge <= 1, block
+    assert heading["box"][1] < left["box"][1] < second["box"][1] < table["box"][1]
+    assert record["lines"][0]["text"] == "Chapter One: The Rules"
+    assert {line["text"] for line in record["lines"]} >= set(LEFT_COLUMN) | set(RIGHT_COLUMN)
+
+
 # The HEALTHCHECK's command in the Dockerfile, word for word: an emptied environment, so no secret of the worker's sits
 # in the environment of a process a parsing child could read.
 HEALTHCHECK = [
@@ -149,6 +259,7 @@ def main() -> int:
         test_worker_folders_are_private_and_writable,
         test_the_health_check_works_with_an_emptied_environment,
         test_the_clean_child_runs_in_its_sandbox,
+        test_the_triage_and_layout_children_read_two_columns_and_a_table_offline_in_their_sandbox,
         test_tesseract_lists_portuguese_and_english,
         test_docling_converts_offline,
     )

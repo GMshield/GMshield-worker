@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import itertools
 import json
 import re
 import secrets
@@ -72,7 +73,7 @@ class StandInJob:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.2.0"
+    version: str = "1.3.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -208,27 +209,103 @@ def _page(value: object, total: int) -> bool:
     return type(value) is int and 1 <= value <= total
 
 
-def ingestion_result_valid(job: StandInJob, result: object) -> bool:
-    """The backend's rules for a done `ingestion` step (`IngestionSteps.Report.of`), as the clean stage uses them: a
-    pipeline version, an integer page total, an original and batches that are outputs of this job with pages within the
-    total, and `next` an array."""
-    if not isinstance(result, dict):
+STAGE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+LAYERS = ("text", "image")
+OUTCOMES = ("read_directly", "read_by_ocr", "unreadable")
+
+
+def _ranges(items: object, total: int, field_name: str | None, values: tuple[str, ...]) -> list[tuple[int, int]] | None:
+    """The ranges of a report's array, or None when one is not `{firstPage, lastPage[, field]}` within the total."""
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        return None
+    found = []
+    for item in items:
+        if (
+            not isinstance(item, dict)
+            or not _page(item.get("firstPage"), total)
+            or not _page(item.get("lastPage"), total)
+        ):
+            return None
+        if item["lastPage"] < item["firstPage"] or (field_name is not None and item.get(field_name) not in values):
+            return None
+        found.append((item["firstPage"], item["lastPage"]))
+    return found
+
+
+def _no_repeats(found: list[tuple[int, int]]) -> bool:
+    ordered = sorted(found)
+    return all(later[0] > earlier[1] for earlier, later in itertools.pairwise(ordered))
+
+
+def _next_valid(job: StandInJob, following: object, total: int) -> bool:
+    if following is None:
+        return True
+    if not isinstance(following, list):
         return False
-    version, total, original = result.get("pipelineVersion"), result.get("pageTotal"), result.get("original")
-    batches, following = result.get("batches", []), result.get("next")
+    known = job.output_ids | {job.input.get("inputFileId")}
+    for item in following:
+        if not isinstance(item, dict) or not isinstance(item.get("stage"), str) or not STAGE.fullmatch(item["stage"]):
+            return False
+        first, last = item.get("firstPage"), item.get("lastPage")
+        if (first is None) != (last is None) or item.get("input") not in known:
+            return False
+        if first is not None and not (_page(first, total) and _page(last, total) and first <= last):
+            return False
+    return True
+
+
+def _report_total(job: StandInJob, result: dict[str, Any]) -> int | None:
+    """The report's page total, or the chain's from the claim input (the same when both are given); 0 when neither is
+    known; None when the report's is not a page total or differs from the chain's."""
+    version = result.get("pipelineVersion")
     if not isinstance(version, str) or not PIPELINE_VERSION.fullmatch(version):
-        return False
-    if type(total) is not int or total < 1 or not isinstance(following, list) or not isinstance(batches, list):
-        return False
+        return None
+    reported, chain = result.get("pageTotal"), job.input.get("pageTotal")
+    if reported is not None and (not _page(reported, 1_000_000) or (chain is not None and reported != chain)):
+        return None
+    return int(reported) if reported is not None else int(chain) if type(chain) is int else 0
+
+
+def _files_valid(job: StandInJob, result: dict[str, Any]) -> bool:
+    original = result.get("original")
     if original is not None and (not isinstance(original, dict) or original.get("fileId") not in job.output_ids):
         return False
-    return all(
-        isinstance(batch, dict)
-        and batch.get("fileId") in job.output_ids
-        and _page(batch.get("firstPage"), total)
-        and _page(batch.get("lastPage"), total)
-        and batch["firstPage"] <= batch["lastPage"]
-        for batch in batches
+    files = [item for name in ("batches", "texts") for item in (result.get(name) or [])]
+    return all(isinstance(item, dict) and item.get("fileId") in job.output_ids for item in files)
+
+
+def _pages_valid(result: dict[str, Any], total: int) -> bool:
+    batches = _ranges(result.get("batches"), total, None, ())
+    layers = _ranges(result.get("layers"), total, "layer", LAYERS)
+    pages = _ranges(result.get("pages"), total, "outcome", OUTCOMES)
+    texts = _ranges(result.get("texts"), total, None, ())
+    if batches is None or layers is None or pages is None or texts is None:
+        return False
+    read = {
+        page
+        for item in result.get("pages") or []
+        if item["outcome"] != "unreadable"
+        for page in range(item["firstPage"], item["lastPage"] + 1)
+    }
+    covered = all(page in read for first, last in texts for page in range(first, last + 1))
+    return covered and _no_repeats(layers) and _no_repeats(pages)
+
+
+def ingestion_result_valid(job: StandInJob, result: object) -> bool:
+    """The backend's rules for a done `ingestion` step (`IngestionSteps.Report.of` and its range checks): a pipeline
+    version; the page total (the report's, or the chain's from the claim input, the same when both are given); an
+    original, batches and texts that are outputs of this job; layers and outcomes within the total, no page twice;
+    texts only over pages this report gives an outcome other than `unreadable`; next steps over a known file."""
+    if not isinstance(result, dict):
+        return False
+    total = _report_total(job, result)
+    return (
+        total is not None
+        and _files_valid(job, result)
+        and _pages_valid(result, total)
+        and _next_valid(job, result.get("next"), total)
     )
 
 
