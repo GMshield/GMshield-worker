@@ -232,14 +232,14 @@ OCR_WORDS = ("estalagem", "initiative")
 
 
 def scan_pdf(folder: Path, pages: int | None = None) -> Path:
-    """A scan of two paragraphs (Portuguese, then English): straight, turned 7 degrees, upside down and blank; or
-    `pages` pages straight, crooked and upside down in turn."""
+    """A scan of two paragraphs (Portuguese, then English): straight, turned 7 degrees, upside down, blank, and turned
+    90 degrees (a landscape picture of a portrait page); or `pages` pages straight, crooked and upside down in turn."""
     from tests import pdfs
 
     lines = [*pdfs.SCAN_LINES[:3], "", "", "", *pdfs.SCAN_LINES[3:]]
     if pages is None:
         pictures = [pdfs.raster_page(lines), pdfs.raster_page(lines, angle=7), pdfs.raster_page(lines, angle=180),
-                    pdfs.raster_page(blank=True)]  # fmt: skip
+                    pdfs.raster_page(blank=True), pdfs.raster_page(lines, angle=90)]  # fmt: skip
     else:
         pictures = [pdfs.raster_page(lines, angle=(0, 7, -4, 180)[index % 4]) for index in range(pages)]
     return pdfs.scanned(folder / "source.pdf", pictures)
@@ -271,19 +271,19 @@ def test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox() -> N
     with tempfile.TemporaryDirectory(dir="/tmp") as name:
         folder = Path(name)
         scan_pdf(folder)
-        result, manifest = run_ocr(folder, 1, 4)
-        assert manifest == {"pages": [1, 2, 3], "unreadable": [4]}, manifest
+        result, manifest = run_ocr(folder, 1, 5)
+        assert manifest == {"pages": [1, 2, 3, 5], "unreadable": [4]}, manifest
         records = [json.loads((folder / "out" / f"page-000000{page}.json").read_text(encoding="utf-8")) for page in
-                   (1, 2, 3)]  # fmt: skip
-        assert sorted(path.name for path in (folder / "out").iterdir()) == [
-            "manifest.json", "page-0000001.json", "page-0000002.json", "page-0000003.json"]  # fmt: skip
-    print(f"ocr child: 4 pages in {result.seconds:.1f} s, peak {result.max_rss_kib // 1024} MiB")
+                   (1, 2, 3, 5)]  # fmt: skip
+        written = sorted(path.name for path in (folder / "out").iterdir())
+        assert written == ["manifest.json", *(f"page-000000{page}.json" for page in (1, 2, 3, 5))], written
+    print(f"ocr child: 5 pages in {result.seconds:.1f} s, peak {result.max_rss_kib // 1024} MiB")
     for record in records:
         text = " ".join(block["text"] for block in record["blocks"])
         assert set(record) == {"page", "lines", "blocks"}, record.keys()
         for word in OCR_WORDS:
             assert word in text, (record["page"], text)
-        # Reading order: the Portuguese paragraph comes before the English one, also on the upside-down page.
+        # Reading order: the Portuguese paragraph comes before the English one, also upside down and sideways.
         assert text.index("estalagem") < text.index("initiative"), (record["page"], text)
         assert pdfs.SCAN_LINES[0].split()[0] in text, (record["page"], text)
         for item in [*record["lines"], *record["blocks"]]:

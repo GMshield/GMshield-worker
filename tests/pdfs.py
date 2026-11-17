@@ -248,7 +248,8 @@ def raster_page(
     lines: list[str] | None = None, *, angle: float = 0.0, blank: bool = False, size: tuple[float, float] = (612, 792)
 ) -> Image.Image:
     """A scanned page at `SCAN_DPI`: black lines of text on white (none when `blank`), turned by `angle` degrees
-    counter-clockwise with a white fill, as a page laid crooked on the scanner. `size` is the page in points."""
+    counter-clockwise with a white fill, as a page laid crooked on the scanner. `size` is the page in points. A
+    quarter turn (90 or 270) keeps the whole page: a portrait page scanned sideways becomes a landscape picture."""
     width, height = round(size[0] * SCAN_DPI / 72), round(size[1] * SCAN_DPI / 72)
     page = Image.new("L", (width, height), 255)
     if not blank:
@@ -257,7 +258,9 @@ def raster_page(
         top = round(height * 0.1)
         for index, line in enumerate(lines if lines is not None else SCAN_LINES):
             draw.text((round(width * 0.1), top + index * round(SCAN_DPI * 0.45)), line, fill=0, font=font)
-    if angle:
+    if angle % 360 in (90, 270):
+        page = page.rotate(angle, expand=True)
+    elif angle:
         page = page.rotate(angle, resample=Image.Resampling.BICUBIC, fillcolor=255)
     return page
 
@@ -267,12 +270,13 @@ def scanned(
     pictures: list[Image.Image],
     *,
     header: str = "",
-    size: tuple[float, float] = (612, 792),
+    size: tuple[float, float] | None = None,
     cover: float = 1.0,
 ) -> Path:
     """One page per picture, each a full-page image with no text layer, as a scanner writes them; `header` puts a
     digital running header in a text layer over each picture, as some scanning software does. With `cover` below 1,
-    the picture is drawn over that fraction of the page's width and height only (an illustration)."""
+    the picture is drawn over that fraction of the page's width and height only (an illustration). Each page is the
+    picture's own size at `SCAN_DPI` unless `size` (in points) is given."""
     pdf = Pdf.new()
     font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica))
     for picture in pictures:
@@ -282,12 +286,13 @@ def scanned(
         image.Type, image.Subtype, image.Filter = Name.XObject, Name.Image, Name.DCTDecode
         image.Width, image.Height = picture.width, picture.height
         image.ColorSpace, image.BitsPerComponent = Name.DeviceGray, 8
-        pdf.add_blank_page(page_size=size)
+        width, height = size or (picture.width * 72 / SCAN_DPI, picture.height * 72 / SCAN_DPI)
+        pdf.add_blank_page(page_size=(width, height))
         page = pdf.pages[-1]
         page.obj.Resources = Dictionary(XObject=Dictionary(Im0=image), Font=Dictionary(F1=font))
-        drawing = f"q {size[0] * cover} 0 0 {size[1] * cover} 0 0 cm /Im0 Do Q".encode("ascii")
+        drawing = f"q {width * cover} 0 0 {height * cover} 0 0 cm /Im0 Do Q".encode("ascii")
         if header:
-            drawing += f"\nBT /F1 9 Tf 36 {size[1] - 24} Td ({header}) Tj ET".encode("ascii")
+            drawing += f"\nBT /F1 9 Tf 36 {height - 24} Td ({header}) Tj ET".encode("ascii")
         page.obj.Contents = pdf.make_indirect(pikepdf.Stream(pdf, drawing))
     pdf.save(path)
     return path
