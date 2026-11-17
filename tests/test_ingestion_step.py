@@ -635,7 +635,6 @@ def test_a_retried_ocr_reads_page_by_page_with_a_share_of_the_budget_and_a_crash
     assert set(deadlines) == {108.0}
     assert outcome.result is not None
     assert [view["page"] for view in outcome.result["pageViews"]] == [1, 2, 4, 5]
-    assert outcome.result is not None
     assert outcome.result["pages"] == [
         {"firstPage": 1, "lastPage": 2, "outcome": "read_by_ocr"},
         {"firstPage": 3, "lastPage": 3, "outcome": "unreadable"},

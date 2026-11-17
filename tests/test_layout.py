@@ -18,7 +18,6 @@ from docling_core.types.doc.base import BoundingBox, CoordOrigin
 from PIL import Image
 
 from gmshield_worker.ingestion import layout
-from tests import pdfs
 
 WIDTH, HEIGHT = 600.0, 800.0
 
@@ -165,4 +164,3 @@ def test_a_picture_is_never_enlarged_and_shrinks_to_its_longer_side(tmp_path: Pa
     assert layout.write_webp(np.full((3000, 1000), 0, dtype=np.uint8), tmp_path / "tall.webp") == (667, 2000)
     assert layout.write_webp(np.full((1, 9000, 3), 0, dtype=np.uint8), tmp_path / "thin.webp") == (2000, 1)
     assert layout.picture_file(12) == "page-0000012.webp"
-    assert pdfs.SCAN_DPI > 0
