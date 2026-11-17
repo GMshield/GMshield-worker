@@ -266,6 +266,7 @@ def run_ocr(folder: Path, first: int, last: int) -> tuple[Any, dict[str, Any]]:
 def test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox() -> None:
     import json
 
+    from gmshield_worker.ingestion import layout
     from tests import pdfs
 
     with tempfile.TemporaryDirectory(dir="/tmp") as name:
@@ -273,10 +274,10 @@ def test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox() -> N
         scan_pdf(folder)
         result, manifest = run_ocr(folder, 1, 5)
         assert manifest == {"pages": [1, 2, 3, 5], "unreadable": [4]}, manifest
-        records = [json.loads((folder / "out" / f"page-000000{page}.json").read_text(encoding="utf-8")) for page in
+        records = [json.loads((folder / "out" / layout.page_file(page)).read_text(encoding="utf-8")) for page in
                    (1, 2, 3, 5)]  # fmt: skip
         written = sorted(path.name for path in (folder / "out").iterdir())
-        assert written == ["manifest.json", *(f"page-000000{page}.json" for page in (1, 2, 3, 5))], written
+        assert written == ["manifest.json", *(layout.page_file(page) for page in (1, 2, 3, 5))], written
     print(f"ocr child: 5 pages in {result.seconds:.1f} s, peak {result.max_rss_kib // 1024} MiB")
     for record in records:
         text = " ".join(block["text"] for block in record["blocks"])

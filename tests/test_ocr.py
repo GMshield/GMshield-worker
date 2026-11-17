@@ -12,6 +12,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import pikepdf
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
 import pytest
 from PIL import Image
@@ -173,3 +174,19 @@ def test_an_upside_down_page_reaches_docling_upright(tmp_path: Path, monkeypatch
     # Outside the image there is no Tesseract: no turn.
     monkeypatch.setenv("PATH", str(tmp_path))
     assert ocr.orientation(tmp_path / "missing.png") == 0
+
+
+def test_a_huge_page_is_rendered_with_its_longer_side_capped_and_written_at_216_dpi(tmp_path: Path) -> None:
+    # 14,400 x 7,200 points: at scale 3 that would be 43,200 x 21,600 pixels.
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(14_400, 7_200))
+    pdf.save(tmp_path / "huge.pdf")
+    document = pdfium.PdfDocument(tmp_path / "huge.pdf")
+    try:
+        picture = ocr.render(document, 0)
+    finally:
+        document.close()
+    assert picture.shape[:2] == (5000, ocr.MAX_SIDE)
+    ocr.write_picture(picture, tmp_path / "huge.png")
+    with Image.open(tmp_path / "huge.png") as written:
+        assert written.info["dpi"] == pytest.approx((ocr.DPI, ocr.DPI), abs=0.01)

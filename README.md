@@ -68,7 +68,7 @@ lockfile and the production image:
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
 | `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
 | `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind) and `probe.py` (test mode only) |
-| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15, 1.16): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `triage.py` (pypdfium2), `layout.py` (Docling) and `text.py` (standard library), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
+| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.17): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `triage.py` (pypdfium2), `layout.py` (Docling), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
 | `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
@@ -164,10 +164,11 @@ lockfile and the production image:
   - Logs carry the job's trace id, the sizes, counts and times, and the child's and the worker's
     peak RSS (`childMaxRssKib`, `workerMaxRssKib`). A generated 1 GiB PDF is cleaned with a child
     peak under 512 MiB (`tests/test_clean.py`).
-- **Reading pages (Story 1.16, `PIPELINE_VERSION` "2").** The clean report asks one `triage` step per
+- **Reading pages (Stories 1.16 and 1.17, `PIPELINE_VERSION` "3").** The clean report asks one `triage` step per
   batch. Triage (`triage.py`, pypdfium2) gives each page a layer: `text` when its text layer has at
-  least 16 characters other than whitespace, else `image`; its report gives the `layers` and one
-  `layout` step per run of text pages (image pages wait for OCR, Story 1.17). Layout (`layout.py`)
+  least 16 characters other than whitespace, unless it has fewer than 200 and one image covers at least
+  half of the page, else `image`; its report gives the `layers`, one `layout` step per run of text pages,
+  then one `ocr` step per run of image pages, cut to at most `OCR_PAGES` (10). Layout (`layout.py`)
   reads the run with Docling 2.145.0 (`do_ocr=False`, table structure on; the models' folder and 2
   threads on the command line, since the child's environment is empty) and sends one JSON file of
   its pages back as `texts`, each page `read_directly`: the page's lines (text and box) and its
@@ -176,9 +177,15 @@ lockfile and the production image:
   (UTF-8 without its BOM, else cp1252) and cut into pages of at most 3,000 code points at Markdown
   headings, then blank lines, line ends and whitespace, each with its heading path and code-point
   range; the file goes back unchanged as the `original`, with one `texts` file per 500 pages.
+  - OCR (`ocr.py`, Story 1.17) renders each image page at 216 DPI (smaller when its longer side would
+    pass 10,000 pixels), turns it upright with Tesseract's orientation detection (`--psm 0 -l osd`),
+    straightens a skew within ±20° with OpenCV (from 0.5°, white fill), and reads it with Docling and
+    Tesseract (`por`+`eng`, full page, tables and heading levels) into layout's page shape, its lines
+    being Tesseract's words. Each page is `read_by_ocr`, or `unreadable` when OCR finds fewer than 16
+    characters other than whitespace (a blank scan); the pages read go back as `texts`.
   - A step whose claim input names another `pipelineVersion` fails before any download with
     `ingestion.pipeline_changed` and `retry: false`; the backend restarts the chain.
-  - From the claim's second attempt on, triage and layout run one child per page, each with 540 s
+  - From the claim's second attempt on, triage, layout and OCR run one child per page, each with 540 s
     divided by the step's pages; a page whose child fails, crashes or runs out of time is reported
     `unreadable`.
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the

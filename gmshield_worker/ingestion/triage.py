@@ -50,7 +50,11 @@ def characters(text: str, limit: int = FEW_CHARACTERS) -> int:
 def layer_of(text: str, image_share: float = 0.0) -> str:
     """`text` when the page's text layer has at least `MIN_CHARACTERS` characters other than whitespace, unless it has
     fewer than `FEW_CHARACTERS` and an image covers at least `IMAGE_SHARE` of the page (`image_share`)."""
-    count = characters(text)
+    return layer_for(characters(text), image_share)
+
+
+def layer_for(count: int, image_share: float = 0.0) -> str:
+    """`layer_of` for a text layer of `count` characters other than whitespace (counted up to `FEW_CHARACTERS`)."""
     if count < MIN_CHARACTERS:
         return IMAGE
     if count < FEW_CHARACTERS and image_share >= IMAGE_SHARE:
@@ -101,7 +105,7 @@ def run(source: Path, out: Path, offset: int, first: int, last: int) -> int:
                 # Images are looked at only when the text alone would make it a text page with few characters.
                 count = characters(text)
                 image_share = largest_image_share(page) if MIN_CHARACTERS <= count < FEW_CHARACTERS else 0.0
-                pages.append({"page": number, "layer": layer_of(text, image_share)})
+                pages.append({"page": number, "layer": layer_for(count, image_share)})
             finally:
                 text_page.close()
                 page.close()

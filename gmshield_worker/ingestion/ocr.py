@@ -52,7 +52,12 @@ MANIFEST = "manifest.json"
 PICTURE = ".page.png"
 # 3 x 72 DPI: the resolution Docling's Tesseract reader works at, so the picture reaches it unscaled.
 SCALE = 3.0
+# The PNG's resolution, whatever scale rendered it: Docling reads the picture at 3 x its size in points, that is at
+# its own size in pixels, never scaled up. Boxes are fractions of the picture, so its size in points does not matter.
 DPI = 72.0 * SCALE
+# A page is rendered at `SCALE` unless its longer side would pass this many pixels (PDF pages reach 14,400 points):
+# then at the scale that keeps it there, so a huge page never takes gigabytes.
+MAX_SIDE = 10_000
 MIN_CHARACTERS = 16
 # The skew search: whole degrees within MAX_SKEW, then tenths around the best; smaller than MIN_SKEW is left alone.
 MAX_SKEW = 20.0
@@ -64,8 +69,10 @@ SKEW_SIDE = 1000
 # Less ink than this share of the copy (a blank scan) has no skew to estimate.
 MIN_INK = 0.001
 WHITE = (255, 255, 255)
-# Tesseract's orientation detection: how many degrees, counter-clockwise, turn the page upright.
-OSD_SECONDS = 60
+# How long Tesseract's orientation detection may take before the page is read as it lies: well under a page-by-page
+# retry's share of the step (540 s / 10 pages = 54 s).
+OSD_SECONDS = 20
+# The line of Tesseract's `--psm 0` report that says how many degrees, counter-clockwise, turn the page upright.
 _ORIENTATION = re.compile(r"^Orientation in degrees: *(0|90|180|270) *$", re.MULTILINE | re.ASCII)
 
 type Reader = Callable[[Path], Any]
@@ -174,10 +181,13 @@ def upright(picture: np.ndarray, degrees: int) -> np.ndarray:
 
 
 def render(document: Any, index: int) -> np.ndarray:
-    """Page `index` (from 0) of a pypdfium2 document as an RGB picture at `SCALE`."""
+    """Page `index` (from 0) of a pypdfium2 document as an RGB picture at `SCALE`, or smaller for a page whose longer
+    side would pass `MAX_SIDE` pixels."""
     page = document[index]
     try:
-        bitmap = page.render(scale=SCALE, rev_byteorder=True)
+        width, height = page.get_size()
+        scale = min(SCALE, MAX_SIDE / max(width, height, 1.0))
+        bitmap = page.render(scale=scale, rev_byteorder=True)
         try:
             return np.array(bitmap.to_numpy()[:, :, :3], dtype=np.uint8)
         finally:
