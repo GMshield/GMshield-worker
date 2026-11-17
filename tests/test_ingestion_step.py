@@ -287,8 +287,8 @@ def retried(job: ClaimedJob) -> ClaimedJob:
 def test_a_step_of_a_chain_started_by_another_pipeline_fails_at_once_before_any_download(
     stand_in: StandIn, tmp_path: Path
 ) -> None:
-    # "ocr" is a stage this worker does not run: under another pipeline it is still a pipeline change.
-    for stage in ("triage", "layout", "ocr"):
+    # "passages" is a stage this worker does not run: under another pipeline it is still a pipeline change.
+    for stage in ("triage", "layout", "ocr", "passages"):
         job = claim(stand_in, b"%PDF-1.7\n", step_input(stage, 21, 25, pipelineVersion="1"))
 
         outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
@@ -311,7 +311,7 @@ def test_a_malformed_claim_input_fails_at_once(stand_in: StandIn, tmp_path: Path
         assert handler(stand_in, tmp_path / "work")(job, threading.Event()) == Outcome.failed(STEP_FAILED, retry=False)
 
 
-def test_triage_marks_each_page_and_asks_a_layout_step_for_each_run_of_text_pages(
+def test_triage_marks_each_page_and_asks_layout_for_each_run_of_text_pages_then_ocr_for_each_run_of_image_pages(
     stand_in: StandIn, tmp_path: Path
 ) -> None:
     job = claim(stand_in, batch_pdf(tmp_path), step_input("triage", 21, 25))
@@ -332,6 +332,7 @@ def test_triage_marks_each_page_and_asks_a_layout_step_for_each_run_of_text_page
         "next": [
             {"stage": "layout", "firstPage": 21, "lastPage": 21, "input": BATCH_ID},
             {"stage": "layout", "firstPage": 24, "lastPage": 25, "input": BATCH_ID},
+            {"stage": "ocr", "firstPage": 22, "lastPage": 23, "input": BATCH_ID},
         ],
     }
     assert stand_in.jobs[str(job.job_id)].outcomes == []
@@ -362,7 +363,10 @@ def test_a_retried_triage_runs_one_child_per_page_and_a_page_whose_child_fails_i
         {"firstPage": 25, "lastPage": 25, "layer": "text"},
     ]
     assert outcome.result["pages"] == [{"firstPage": 24, "lastPage": 24, "outcome": "unreadable"}]
-    assert outcome.result["next"] == [{"stage": "layout", "firstPage": 25, "lastPage": 25, "input": BATCH_ID}]
+    assert outcome.result["next"] == [
+        {"stage": "layout", "firstPage": 25, "lastPage": 25, "input": BATCH_ID},
+        {"stage": "ocr", "firstPage": 22, "lastPage": 23, "input": BATCH_ID},
+    ]
 
 
 def fake_layout(failing: set[int] | None = None, missing: set[int] | None = None) -> Any:
@@ -484,3 +488,130 @@ def test_the_stand_in_checks_texts_against_this_reports_outcomes_and_next_agains
     assert not ingestion_result_valid(job, {**good, "texts": [{"fileId": "f", "firstPage": 1, "lastPage": 3}]})
     assert not ingestion_result_valid(job, {**good, "pageTotal": 4})
     assert not ingestion_result_valid(job, {**good, "next": [{"stage": "layout", "input": "other"}]})
+
+
+# --- Story 1.17: OCR
+
+
+def scan_input(stage: str, first: int, last: int) -> dict[str, Any]:
+    """A later step's claim input over the first batch (pages 1 to 20) of a 25-page scan."""
+    return step_input(stage, first, last, inputFirstPage=1, inputLastPage=20)
+
+
+def test_triage_of_a_scanned_batch_cuts_its_image_pages_into_ocr_steps_of_ten(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    content = made(tmp_path / "scan.pdf", lambda path: pdfs.with_text(path, [""] * 20))
+    job = claim(stand_in, content, scan_input("triage", 1, 20))
+
+    outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
+
+    assert outcome.result is not None
+    assert outcome.result["layers"] == [{"firstPage": 1, "lastPage": 20, "layer": "image"}]
+    assert outcome.result["next"] == [
+        {"stage": "ocr", "firstPage": 1, "lastPage": 10, "input": BATCH_ID},
+        {"stage": "ocr", "firstPage": 11, "lastPage": 20, "input": BATCH_ID},
+    ]
+    assert step.OCR_PAGES == 10
+    assert step.cut([(1, 25), (30, 30), (41, 50)], 10) == [(1, 10), (11, 20), (21, 25), (30, 30), (41, 50)]
+
+
+def fake_ocr(crashing: set[int] | None = None, blank: set[int] | None = None) -> Any:
+    """An OCR child that reads every page asked for, except the blank ones it lists unreadable and those it crashes on
+    (which, read one at a time, end with no manifest)."""
+    calls: list[list[str]] = []
+
+    def run(_script: Path, arguments: list[str], *, folder: Path, **_options: Any) -> sandbox.ChildResult:
+        calls.append(arguments)
+        first, last = int(arguments[3]), int(arguments[4])
+        if crashing and any(page in crashing for page in range(first, last + 1)):
+            return sandbox.ChildResult(returncode=-11, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
+        out = folder / arguments[1]
+        out.mkdir()
+        unreadable = [page for page in range(first, last + 1) if blank and page in blank]
+        written = [page for page in range(first, last + 1) if page not in unreadable]
+        for page in written:
+            record = {"page": page, "lines": [{"text": "Capitulo", "box": [0, 0, 1, 0.1]}],
+                      "blocks": [{"label": "text", "text": f"Scan {page}.", "box": [0, 0, 1, 1], "headingLevel": None,
+                                  "rows": None}]}  # fmt: skip
+            (out / layout.page_file(page)).write_text(json.dumps(record), encoding="utf-8")
+        manifest = {"pages": written, "unreadable": unreadable}
+        (out / layout.MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+        return sandbox.ChildResult(returncode=0, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
+
+    run.calls = calls  # type: ignore[attr-defined]
+    return run
+
+
+def test_ocr_reads_its_run_with_one_child_and_reports_pages_read_by_ocr_and_a_blank_one_unreadable(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    job = claim(stand_in, b"%PDF-1.7\n", scan_input("ocr", 1, 10))
+    runner = fake_ocr(blank={7})
+    work = tmp_path / "work"
+
+    outcome = handler(stand_in, work, runner=runner, artifacts="/models")(job, threading.Event())
+
+    assert runner.calls == [["source.pdf", "out", "1", "1", "10", "/models", "2"]]
+    assert outcome.result is not None
+    assert outcome.result["pages"] == [
+        {"firstPage": 1, "lastPage": 6, "outcome": "read_by_ocr"},
+        {"firstPage": 7, "lastPage": 7, "outcome": "unreadable"},
+        {"firstPage": 8, "lastPage": 10, "outcome": "read_by_ocr"},
+    ]
+    assert [(item["firstPage"], item["lastPage"]) for item in outcome.result["texts"]] == [(1, 6), (8, 10)]
+    sent = json.loads(stand_in.outputs[outcome.result["texts"][1]["fileId"]])
+    assert [page["page"] for page in sent["pages"]] == [8, 9, 10]
+    assert sent["pages"][0]["blocks"][0]["text"] == "Scan 8."
+    assert outcome.result["next"] == []
+    assert list(work.iterdir()) == []
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
+
+
+def test_a_first_ocr_attempt_that_crashes_or_misses_a_page_fails_for_a_retry(stand_in: StandIn, tmp_path: Path) -> None:
+    def missing(_script: Path, arguments: list[str], *, folder: Path, **_options: Any) -> sandbox.ChildResult:
+        out = folder / arguments[1]
+        out.mkdir()
+        (out / layout.MANIFEST).write_text(json.dumps({"pages": [], "unreadable": [1, 2]}), encoding="utf-8")
+        return sandbox.ChildResult(returncode=0, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
+
+    for runner in (fake_ocr(crashing={3}), missing):
+        job = claim(stand_in, b"%PDF-1.7\n", scan_input("ocr", 1, 3))
+        assert handler(stand_in, tmp_path / "work", runner=runner)(job, threading.Event()) == Outcome.failed(
+            STEP_FAILED
+        )
+    assert stand_in.outputs == {}
+
+
+def test_a_retried_ocr_reads_page_by_page_with_a_share_of_the_budget_and_a_crashing_page_is_unreadable(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    job = claim(stand_in, b"%PDF-1.7\n", scan_input("ocr", 1, 5))
+    runner = fake_ocr(crashing={3})
+    deadlines: list[float] = []
+
+    def timed(script: Path, arguments: list[str], **options: Any) -> sandbox.ChildResult:
+        deadlines.append(options["deadline_seconds"])
+        return runner(script, arguments, **options)  # type: ignore[no-any-return]
+
+    outcome = handler(stand_in, tmp_path / "work", runner=timed, page_budget_seconds=540.0)(
+        retried(job), threading.Event()
+    )
+
+    assert [call[3:5] for call in runner.calls] == [[str(p), str(p)] for p in range(1, 6)]
+    assert set(deadlines) == {108.0}
+    assert outcome.result is not None
+    assert outcome.result["pages"] == [
+        {"firstPage": 1, "lastPage": 2, "outcome": "read_by_ocr"},
+        {"firstPage": 3, "lastPage": 3, "outcome": "unreadable"},
+        {"firstPage": 4, "lastPage": 5, "outcome": "read_by_ocr"},
+    ]
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
+
+
+def test_a_manifest_that_lists_a_page_twice_or_not_as_a_number_is_refused(tmp_path: Path) -> None:
+    body: object
+    for body in ({"pages": [1], "unreadable": [1]}, {"pages": [1], "unreadable": ["2"]}, {"pages": "1"}, []):
+        (tmp_path / layout.MANIFEST).write_text(json.dumps(body), encoding="utf-8")
+        with pytest.raises(StepFailed):
+            step.read_pages(tmp_path, [1, 2])

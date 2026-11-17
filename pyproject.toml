@@ -15,6 +15,10 @@ dependencies = [
     "redis==8.1.0",  # the work streams (Story 1.12)
     "pikepdf==10.17.0",  # the clean stage (Story 1.15): qpdf, MPL-2.0; never PyMuPDF (AGPL)
     "pypdfium2==5.14.0",  # the triage stage (Story 1.16): PDFium, Apache-2.0 or BSD-3-Clause; already under Docling
+    # The OCR stage (Story 1.17) imports these directly; each is the version already in the lock under Docling.
+    "opencv-python-headless==5.0.0.93",  # deskew; Apache-2.0
+    "numpy==2.5.4",
+    "pillow==13.0.0",  # the straightened page picture at 216 DPI
 ]
 
 [dependency-groups]

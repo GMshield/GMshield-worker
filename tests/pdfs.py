@@ -1,13 +1,17 @@
 """PDFs built for the tests with pikepdf (Story 1.15): active content of every kind the clean stage removes, owner
 and user passwords, a file that is not a PDF inside, many linked pages, and a large image PDF written as a stream so
-that the test itself never holds it in memory."""
+that the test itself never holds it in memory. Since Story 1.17, scanned pages drawn with Pillow (straight, crooked,
+upside down or blank) and PDFs of them, with or without a digital running header. The production image's checks
+(`tests/image`) use them too."""
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, String
+from PIL import Image, ImageDraw, ImageFont
 
 # Markers the cleaned files must not hold anywhere, in any stream or string.
 JS_MARKER = "MARKER-JAVASCRIPT"
@@ -223,5 +227,67 @@ def with_text(path: Path, texts: list[str]) -> Path:
         page = pdf.pages[-1]
         page.obj.Resources = Dictionary(Font=Dictionary(F1=font))
         page.obj.Contents = pdf.make_indirect(_page_text(pdf, text) if text else pikepdf.Stream(pdf, b""))
+    pdf.save(path)
+    return path
+
+
+# --- Story 1.17: scanned pages
+
+SCAN_DPI = 150
+SCAN_LINES = [
+    "Capitulo Um: As Regras do Jogo",
+    "O grupo descansa na estalagem durante a noite.",
+    "Cada criatura rola a iniciativa e age em ordem.",
+    "The party rests at the inn for the night and",
+    "each creature rolls initiative and acts in turn.",
+    "Spells require components listed in each entry.",
+]
+
+
+def raster_page(
+    lines: list[str] | None = None, *, angle: float = 0.0, blank: bool = False, size: tuple[float, float] = (612, 792)
+) -> Image.Image:
+    """A scanned page at `SCAN_DPI`: black lines of text on white (none when `blank`), turned by `angle` degrees
+    counter-clockwise with a white fill, as a page laid crooked on the scanner. `size` is the page in points."""
+    width, height = round(size[0] * SCAN_DPI / 72), round(size[1] * SCAN_DPI / 72)
+    page = Image.new("L", (width, height), 255)
+    if not blank:
+        draw = ImageDraw.Draw(page)
+        font = ImageFont.load_default(size=round(SCAN_DPI * 0.22))
+        top = round(height * 0.1)
+        for index, line in enumerate(lines if lines is not None else SCAN_LINES):
+            draw.text((round(width * 0.1), top + index * round(SCAN_DPI * 0.45)), line, fill=0, font=font)
+    if angle:
+        page = page.rotate(angle, resample=Image.Resampling.BICUBIC, fillcolor=255)
+    return page
+
+
+def scanned(
+    path: Path,
+    pictures: list[Image.Image],
+    *,
+    header: str = "",
+    size: tuple[float, float] = (612, 792),
+    cover: float = 1.0,
+) -> Path:
+    """One page per picture, each a full-page image with no text layer, as a scanner writes them; `header` puts a
+    digital running header in a text layer over each picture, as some scanning software does. With `cover` below 1,
+    the picture is drawn over that fraction of the page's width and height only (an illustration)."""
+    pdf = Pdf.new()
+    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica))
+    for picture in pictures:
+        encoded = io.BytesIO()
+        picture.convert("L").save(encoded, format="JPEG", quality=90)
+        image = pikepdf.Stream(pdf, encoded.getvalue())
+        image.Type, image.Subtype, image.Filter = Name.XObject, Name.Image, Name.DCTDecode
+        image.Width, image.Height = picture.width, picture.height
+        image.ColorSpace, image.BitsPerComponent = Name.DeviceGray, 8
+        pdf.add_blank_page(page_size=size)
+        page = pdf.pages[-1]
+        page.obj.Resources = Dictionary(XObject=Dictionary(Im0=image), Font=Dictionary(F1=font))
+        drawing = f"q {size[0] * cover} 0 0 {size[1] * cover} 0 0 cm /Im0 Do Q".encode("ascii")
+        if header:
+            drawing += f"\nBT /F1 9 Tf 36 {size[1] - 24} Td ({header}) Tj ET".encode("ascii")
+        page.obj.Contents = pdf.make_indirect(pikepdf.Stream(pdf, drawing))
     pdf.save(path)
     return path

@@ -1,4 +1,4 @@
-"""One claimed step of the `ingestion` job kind (Stories 1.15 and 1.16): dispatch on the claim's stage.
+"""One claimed step of the `ingestion` job kind (Stories 1.15 to 1.17): dispatch on the claim's stage.
 
 Every stage works in the step's own folder (`workdir.step_folder`, erased however the step ends): it streams the step's
 input (`source`) from the backend, runs its child in the sandbox (no credential, no network, the folder as its working
@@ -7,16 +7,19 @@ size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in 
 
 - `clean` (a PDF; the raw upload, or the stored original on a restart): `clean.py` makes it safe and splits it into
   batches; the report gives `pageTotal`, the `original`, the `batches` and one `triage` step per batch.
-- `triage` (a batch): `triage.py` says which pages have a text layer; the report gives their `layers` and a `layout`
-  step for each run of text pages. Image pages get no next step until OCR (Story 1.17).
+- `triage` (a batch): `triage.py` says which pages have a text layer; the report gives their `layers`, a `layout`
+  step for each run of text pages, then an `ocr` step for each run of image pages, cut to at most `OCR_PAGES`.
 - `layout` (a run of text pages of a batch): `layout.py` reads them with Docling; the report gives each page
   `read_directly` and the pages' JSON as `texts` files.
+- `ocr` (a run of at most `OCR_PAGES` image pages of a batch): `ocr.py` straightens each page and reads it with Docling
+  and Tesseract; the report gives each page `read_by_ocr` or `unreadable` and the pages read as `texts` files, in
+  layout's shape.
 - `text` (a TXT or Markdown upload): `text.py` splits it into pages of bounded length; the report gives the file back
   unchanged as the `original`, `pageTotal`, one `read_directly` range and its `texts` files.
 
 Before anything is downloaded, a step whose input names the chain's `pipelineVersion` checks it against this worker's:
 another one fails the step with `ingestion.pipeline_changed` and `retry: false`, and the backend restarts the chain.
-From the claim's second attempt on, triage and layout run one child per page, each with an equal share of
+From the claim's second attempt on, triage, layout and OCR run one child per page, each with an equal share of
 `PAGE_BUDGET_SECONDS`; a page whose child fails, crashes or runs out of time is reported `unreadable`.
 
 A PDF that needs a password, or a file no stage can read, fails with `retry: false`; anything else that goes wrong
@@ -41,7 +44,7 @@ import httpx
 
 from gmshield_worker.backend.client import ClaimedJob, Outcome
 from gmshield_worker.backend.files import FileTransferError, StoredOutput
-from gmshield_worker.ingestion import PIPELINE_VERSION, clean, layout, sandbox, text, triage
+from gmshield_worker.ingestion import PIPELINE_VERSION, clean, layout, ocr, sandbox, text, triage
 from gmshield_worker.ingestion.errors import (
     FILE_UNREADABLE,
     PASSWORD_REQUIRED,
@@ -57,6 +60,7 @@ KIND = "ingestion"
 CLEAN = "clean"
 TRIAGE = "triage"
 LAYOUT = "layout"
+OCR = "ocr"
 TEXT = "text"
 PDF = "pdf"
 UNIT = "worker.ingestion"
@@ -66,15 +70,20 @@ OUT_DIR = "out"
 CLEAN_SCRIPT = Path(clean.__file__)
 TRIAGE_SCRIPT = Path(triage.__file__)
 LAYOUT_SCRIPT = Path(layout.__file__)
+OCR_SCRIPT = Path(ocr.__file__)
 TEXT_SCRIPT = Path(text.__file__)
 # The stages this worker runs, by stage and format.
-STAGES = frozenset({(CLEAN, PDF), (TRIAGE, PDF), (LAYOUT, PDF), (TEXT, "txt"), (TEXT, "markdown")})
+STAGES = frozenset({(CLEAN, PDF), (TRIAGE, PDF), (LAYOUT, PDF), (OCR, PDF), (TEXT, "txt"), (TEXT, "markdown")})
+# The most image pages one `ocr` step reads: the worker owns this size. Ten pages must stay well inside a step's
+# 10 minutes on roberto-server; lower it if the timing check there shows a step over 8 minutes.
+OCR_PAGES = 10
 # The time a page-by-page retry shares among its pages: each child gets this divided by the step's page count.
 PAGE_BUDGET_SECONDS = 540.0
 # Docling's models, baked into the image (the Dockerfile's DOCLING_ARTIFACTS_PATH), and its threads.
 DOCLING_ARTIFACTS = "/opt/docling-models"
 LAYOUT_THREADS = 2
 READ_DIRECTLY = "read_directly"
+READ_BY_OCR = "read_by_ocr"
 UNREADABLE = "unreadable"
 _INPUT_NAME = re.compile(r"[a-z][a-z0-9_.-]{0,63}", re.ASCII)
 _OUTPUT_FILE = re.compile(r"(original|batch-[0-9]{5})\.pdf", re.ASCII)
@@ -187,6 +196,11 @@ def read_text_manifest(out: Path) -> tuple[int, list[Batch]]:
     return total, files
 
 
+def cut(runs: list[tuple[int, int]], size: int) -> list[tuple[int, int]]:
+    """Each run as consecutive runs of at most `size` pages."""
+    return [(start, min(start + size - 1, last)) for first, last in runs for start in range(first, last + 1, size)]
+
+
 def ranges(pages: Iterable[int]) -> list[tuple[int, int]]:
     """Sorted pages as inclusive runs of consecutive pages."""
     runs: list[tuple[int, int]] = []
@@ -294,7 +308,9 @@ class IngestionStep:
             return Outcome.failed(failed.code, retry=None if failed.retry else False)
         started = time.monotonic()
         log.info("ingestion.step_started", jobId=job_id, stage=stage, attempt=job.attempt)
-        run = {CLEAN: self._clean, TRIAGE: self._triage, LAYOUT: self._layout, TEXT: self._text}[checked.stage]
+        run = {CLEAN: self._clean, TRIAGE: self._triage, LAYOUT: self._layout, OCR: self._ocr, TEXT: self._text}[
+            checked.stage
+        ]
         try:
             with step_folder(self.work_dir, job_id, job.trace_id) as folder:
                 result, counts = run(job, checked, cancel, folder, log)
@@ -405,6 +421,7 @@ class IngestionStep:
                 except StepFailed:
                     unreadable.append(page)
         text_pages = [page for page, layer in layers.items() if layer == triage.TEXT]
+        image_pages = [page for page, layer in layers.items() if layer == triage.IMAGE]
         layer_ranges = sorted(
             (first, last, layer)
             for layer in (triage.TEXT, triage.IMAGE)
@@ -417,20 +434,45 @@ class IngestionStep:
             "pages": [
                 {"firstPage": first, "lastPage": last, "outcome": UNREADABLE} for first, last in ranges(unreadable)
             ],
+            # Text first, then OCR: within one owner, steps are offered oldest first.
             "next": [
                 {"stage": LAYOUT, "firstPage": first, "lastPage": last, "input": file_id}
                 for first, last in ranges(text_pages)
+            ]
+            + [
+                {"stage": OCR, "firstPage": first, "lastPage": last, "input": file_id}
+                for first, last in cut(ranges(image_pages), OCR_PAGES)
             ],
         }
         return result, {
             "textPages": len(text_pages),
-            "imagePages": len(layers) - len(text_pages),
+            "imagePages": len(image_pages),
             "unreadablePages": len(unreadable),
         }
 
     def _layout(
         self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
     ) -> tuple[dict[str, Any], dict[str, int]]:
+        return self._read(job, checked, cancel, folder, log, script=LAYOUT_SCRIPT, outcome=READ_DIRECTLY)
+
+    def _ocr(
+        self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        return self._read(job, checked, cancel, folder, log, script=OCR_SCRIPT, outcome=READ_BY_OCR)
+
+    def _read(
+        self,
+        job: ClaimedJob,
+        checked: StepInput,
+        cancel: threading.Event,
+        folder: Path,
+        log: TraceLog,
+        *,
+        script: Path,
+        outcome: str,
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """Layout or OCR over the step's pages: one child, or from the second attempt one child per page. A page the
+        child calls unreadable (OCR's blank scans), or whose own child fails on a retry, is `unreadable`."""
         pages = checked.pages()
         _file_id, offset = checked.batch()
         self._download(job, checked, folder, target=SOURCE_FILE, log=log, cancel=cancel)
@@ -442,7 +484,7 @@ class IngestionStep:
         if job.attempt <= 1:
             child = self._child(
                 job,
-                LAYOUT_SCRIPT,
+                script,
                 arguments(pages[0], pages[-1], OUT_DIR),
                 folder=folder,
                 log=log,
@@ -457,7 +499,7 @@ class IngestionStep:
                 out = f"{OUT_DIR}-{page}"
                 child = self._child(
                     job,
-                    LAYOUT_SCRIPT,
+                    script,
                     arguments(page, page, out),
                     folder=folder,
                     log=log,
@@ -481,7 +523,7 @@ class IngestionStep:
             combined.unlink()
             texts.append({"fileId": str(stored.file_id), "firstPage": first, "lastPage": last})
         log.info("ingestion.outputs_stored", jobId=str(job.job_id), files=len(texts))
-        outcomes = [(first, last, READ_DIRECTLY) for first, last in ranges(read)]
+        outcomes = [(first, last, outcome) for first, last in ranges(read)]
         outcomes += [(first, last, UNREADABLE) for first, last in ranges(unreadable)]
         result = {
             "pipelineVersion": PIPELINE_VERSION,
@@ -583,17 +625,26 @@ def _stop_if_cancelled(cancel: threading.Event) -> None:
         raise StepFailed(STEP_FAILED)
 
 
+def _page_list(value: object) -> list[int]:
+    if not isinstance(value, list) or any(type(page) is not int for page in value):
+        raise StepFailed(STEP_FAILED)
+    return sorted(value)
+
+
 def read_pages(out: Path, pages: list[int]) -> dict[int, Path]:
-    """The layout child's pages, checked: its manifest lists exactly the pages asked for, and each page's file is a
-    plain file of its own that holds a JSON object for that page."""
+    """The layout or OCR child's pages, checked: its manifest lists exactly the pages asked for, as pages read or (the
+    OCR child's `unreadable`) pages it could not read, each once, and each page read has a plain file of its own that
+    holds a JSON object for that page."""
     try:
-        listed = json.loads((out / layout.MANIFEST).read_text(encoding="utf-8"))["pages"]
-    except (OSError, ValueError, KeyError, TypeError) as error:
+        body = json.loads((out / layout.MANIFEST).read_text(encoding="utf-8"))
+        listed = _page_list(body["pages"])
+        unreadable = _page_list(body.get("unreadable", []))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise StepFailed(STEP_FAILED) from error
-    if not isinstance(listed, list) or sorted(page for page in listed if type(page) is int) != pages:
+    if sorted(listed + unreadable) != pages:
         raise StepFailed(STEP_FAILED)
     found = {}
-    for page in pages:
+    for page in listed:
         path = _output(out, layout.page_file(page))
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
