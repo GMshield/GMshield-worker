@@ -52,11 +52,19 @@ SECCOMP_RET_ERRNO = 0x00050000
 SECCOMP_RET_KILL_PROCESS = 0x80000000
 AF_UNIX = 1
 
-# Classic BPF
-BPF_LD_W_ABS = 0x00 | 0x00 | 0x20
-BPF_JMP_JEQ_K = 0x05 | 0x10 | 0x00
-BPF_JMP_JGE_K = 0x05 | 0x30 | 0x00
-BPF_RET_K = 0x06 | 0x00
+# Classic BPF (linux/bpf_common.h): instruction classes, sizes, modes and sources
+BPF_LD = 0x00
+BPF_JMP = 0x05
+BPF_RET = 0x06
+BPF_W = 0x00
+BPF_ABS = 0x20
+BPF_JEQ = 0x10
+BPF_JGE = 0x30
+BPF_K = 0x00
+BPF_LD_W_ABS = BPF_LD | BPF_W | BPF_ABS
+BPF_JMP_JEQ_K = BPF_JMP | BPF_JEQ | BPF_K
+BPF_JMP_JGE_K = BPF_JMP | BPF_JGE | BPF_K
+BPF_RET_K = BPF_RET | BPF_K
 # struct seccomp_data: int nr; __u32 arch; __u64 instruction_pointer; __u64 args[6] (little-endian low words).
 OFFSET_NR = 0
 OFFSET_ARCH = 4
