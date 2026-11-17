@@ -23,9 +23,12 @@ It imports Docling, OpenCV, numpy, Pillow, pypdfium2 and the standard library, a
 (never `gmshield_worker`: the isolated child has no path to it). It holds no credential, reaches no network, and
 writes only under OUT_DIR: one `page-NNNNNNN.json` per page read, in exactly `layout.py`'s shape (its boxes are
 fractions of the straightened picture, and its lines are the words Tesseract read), the picture of the page being
-read while Docling reads it, and `manifest.json`, `{"pages": [N, ...], "unreadable": [N, ...]}`. A page whose OCR
-yields fewer than `MIN_CHARACTERS` characters other than whitespace (a blank scan) is listed `unreadable` and gets no
-page file. Exit status 0 means done; anything else is a crash, which the parent reports. Nothing is printed.
+read while Docling reads it, and `manifest.json`, `{"pages": [N, ...], "unreadable": [N, ...], "pictures": [{"page",
+"width", "height"}]}`. A page whose OCR yields fewer than `MIN_CHARACTERS` characters other than whitespace (a blank
+scan) is listed `unreadable` and gets no page file. Every page read, unreadable ones included, also keeps its
+straightened picture as `page-NNNNNNN.webp` (Story 1.19), shrunk to layout's `PICTURE_SIDE` and written by
+`layout.write_webp`: its boxes are fractions of that same picture. Exit status 0 means done; anything else is a crash,
+which the parent reports. Nothing is printed.
 """
 
 from __future__ import annotations
@@ -246,23 +249,39 @@ def reader(artifacts: Path, threads: int) -> Reader:  # pragma: no cover - runs 
     return read
 
 
+type PageRead = tuple[dict[str, Any] | None, tuple[int, int] | None]
+
+
 def read_page(
-    document: Any, index: int, number: int, picture: Path, read: Reader, *, orient: Orienter = orientation
-) -> dict[str, Any] | None:
-    """Page `index` of the batch, set upright, straightened and read, as page `number` of the version; None when
-    unreadable."""
+    document: Any,
+    index: int,
+    number: int,
+    picture: Path,
+    read: Reader,
+    *,
+    orient: Orienter = orientation,
+    view: Path | None = None,
+) -> PageRead:
+    """Page `index` of the batch, set upright, straightened and read, as page `number` of the version: its record, or
+    None when unreadable; and, when `view` is given, the size of the straightened picture written there as WebP."""
+    size: tuple[int, int] | None = None
     try:
         rendered = render(document, index)
         write_picture(rendered, picture)
-        write_picture(straighten(upright(rendered, orient(picture)))[0], picture)
+        straight = straighten(upright(rendered, orient(picture)))[0]
+        del rendered
+        write_picture(straight, picture)
+        if view is not None:
+            size = layout.write_webp(straight, view)
+        del straight
         result = read(picture)
     finally:
         picture.unlink(missing_ok=True)
     records = layout.page_records(result, number)
     if len(records) != 1:
-        return None
+        return None, size
     record: dict[str, Any] = records[0]
-    return record if characters(record) >= MIN_CHARACTERS else None
+    return (record if characters(record) >= MIN_CHARACTERS else None), size
 
 
 def run(
@@ -287,8 +306,19 @@ def run(
         out.mkdir(exist_ok=True)
         written: list[int] = []
         unreadable: list[int] = []
+        pictures: list[dict[str, int]] = []
         for number in range(first, last + 1):
-            record = read_page(document, number - offset, number, out / PICTURE, read, orient=orient)
+            record, size = read_page(
+                document,
+                number - offset,
+                number,
+                out / PICTURE,
+                read,
+                orient=orient,
+                view=out / layout.picture_file(number),
+            )
+            if size is not None:
+                pictures.append({"page": number, "width": size[0], "height": size[1]})
             if record is None:
                 unreadable.append(number)
                 continue
@@ -296,7 +326,8 @@ def run(
             written.append(number)
     finally:
         document.close()
-    (out / MANIFEST).write_text(json.dumps({"pages": written, "unreadable": unreadable}), encoding="utf-8")
+    manifest = {"pages": written, "unreadable": unreadable, "pictures": pictures}
+    (out / MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
     return 0
 
 

@@ -1,4 +1,4 @@
-"""One claimed step of the `ingestion` job kind (Stories 1.15 to 1.18): dispatch on the claim's stage.
+"""One claimed step of the `ingestion` job kind (Stories 1.15 to 1.19): dispatch on the claim's stage.
 
 Every stage works in the step's own folder (`workdir.step_folder`, erased however the step ends): it streams the step's
 input (`source`) from the backend, runs its child in the sandbox (no credential, no network, the folder as its working
@@ -10,13 +10,16 @@ size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in 
   `passages` step over every text file (`input: "texts"`), which the backend holds until every page has an outcome.
 - `triage` (a batch): `triage.py` says which pages have a text layer; the report gives their `layers`, a `layout`
   step for each run of text pages, then an `ocr` step for each run of image pages, cut to at most `OCR_PAGES`.
-- `layout` (a run of text pages of a batch): `layout.py` reads them with Docling; the report gives each page
-  `read_directly` and the pages' JSON as `texts` files.
+- `layout` (a run of text pages of a batch): `layout.py` reads them with Docling and renders each one; the report
+  gives each page `read_directly`, the pages' JSON as `texts` files and, from Story 1.19, a `pageViews` entry per
+  page: its WebP picture (sent back as an output) with its size, and its text lines with their boxes.
 - `ocr` (a run of at most `OCR_PAGES` image pages of a batch): `ocr.py` straightens each page and reads it with Docling
-  and Tesseract; the report gives each page `read_by_ocr` or `unreadable` and the pages read as `texts` files, in
-  layout's shape.
+  and Tesseract; the report gives each page `read_by_ocr` or `unreadable`, the pages read as `texts` files, in
+  layout's shape, and a page view per page whose child read it (a blank scan, `unreadable`, has its picture and no
+  lines).
 - `text` (a TXT or Markdown upload): `text.py` splits it into pages of bounded length; the report gives the file back
-  unchanged as the `original`, `pageTotal`, one `read_directly` range, its `texts` files and the `passages` step.
+  unchanged as the `original`, `pageTotal`, one `read_directly` range, its `texts` files, a page view `{page, text}`
+  per page (no picture) and the `passages` step.
 - `passages` (Story 1.18; every text file of the version, named in the claim input's `texts` in page order): runs
   in-process, with no child, since it reads only our own JSON. It downloads one text file at a time and feeds its
   page records to `passages.py`, which carries the heading stack across files; the report gives the `passages`
@@ -25,7 +28,8 @@ size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in 
 Before anything is downloaded, a step whose input names the chain's `pipelineVersion` checks it against this worker's:
 another one fails the step with `ingestion.pipeline_changed` and `retry: false`, and the backend restarts the chain.
 From the claim's second attempt on, triage, layout and OCR run one child per page, each with an equal share of
-`PAGE_BUDGET_SECONDS`; a page whose child fails, crashes or runs out of time is reported `unreadable`.
+`PAGE_BUDGET_SECONDS`; a page whose child fails, crashes or runs out of time is reported `unreadable`, with no page
+view.
 
 A PDF that needs a password, or a file no stage can read, fails with `retry: false`; anything else that goes wrong
 fails with `ingestion.step_failed`, and the backend retries while attempts remain. Every line is written under the
@@ -112,6 +116,12 @@ _TEXT_FILE = re.compile(r"text-[0-9]{5}\.json", re.ASCII)
 _UUID = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", re.ASCII)
 _TEXT_INPUT = re.compile(r"text-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.ASCII)
 MAX_PAGES = 1_000_000
+# The backend's limits on a page view (Story 1.19): a picture's side in pixels, its lines and each line's code points,
+# and a text page's code points. Lines past them are dropped or cut here, so a page never fails its version.
+MAX_PICTURE_SIDE = 10_000
+MAX_LINES = 10_000
+MAX_LINE = 4_096
+MAX_PAGE_TEXT = 16_384
 
 
 class FileRoutes(Protocol):
@@ -542,6 +552,7 @@ class IngestionStep:
             return [SOURCE_FILE, out, str(offset), str(first), str(last), self.artifacts, str(LAYOUT_THREADS)]
 
         read: dict[int, Path] = {}
+        pictures: dict[int, Picture] = {}
         if job.attempt <= 1:
             child = self._child(
                 job,
@@ -555,6 +566,7 @@ class IngestionStep:
             if not _succeeded(child):
                 raise StepFailed(STEP_FAILED)
             read = read_pages(folder / OUT_DIR, pages)
+            pictures = read_pictures(folder / OUT_DIR, pages)
         else:
             for page in pages:
                 out = f"{OUT_DIR}-{page}"
@@ -572,9 +584,12 @@ class IngestionStep:
                 try:
                     if not _succeeded(child):
                         raise StepFailed(STEP_FAILED)
-                    read.update(read_pages(folder / out, [page]))
+                    page_read = read_pages(folder / out, [page])
+                    page_picture = read_pictures(folder / out, [page])
                 except StepFailed:
                     continue
+                read.update(page_read)
+                pictures.update(page_picture)
         unreadable = [page for page in pages if page not in read]
         texts = []
         for first, last in ranges(read):
@@ -583,7 +598,18 @@ class IngestionStep:
             stored = self.files.upload(job, combined)
             combined.unlink()
             texts.append({"fileId": str(stored.file_id), "firstPage": first, "lastPage": last})
-        log.info("ingestion.outputs_stored", jobId=str(job.job_id), files=len(texts))
+        views = []
+        for page, picture in sorted(pictures.items()):
+            stored = self.files.upload(job, picture.path)
+            picture.path.unlink()
+            views.append(
+                {
+                    "page": page,
+                    "picture": {"fileId": str(stored.file_id), "width": picture.width, "height": picture.height},
+                    "lines": page_lines(read[page]) if page in read else [],
+                }
+            )
+        log.info("ingestion.outputs_stored", jobId=str(job.job_id), files=len(texts) + len(views))
         outcomes = [(first, last, outcome) for first, last in ranges(read)]
         outcomes += [(first, last, UNREADABLE) for first, last in ranges(unreadable)]
         result = {
@@ -593,9 +619,10 @@ class IngestionStep:
                 {"firstPage": first, "lastPage": last, "outcome": outcome} for first, last, outcome in sorted(outcomes)
             ],
             "texts": texts,
+            "pageViews": views,
             "next": [],
         }
-        return result, {"readPages": len(read), "unreadablePages": len(unreadable)}
+        return result, {"readPages": len(read), "unreadablePages": len(unreadable), "pictures": len(views)}
 
     def _text(
         self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
@@ -619,7 +646,9 @@ class IngestionStep:
         original = self.files.upload(job, source)
         source.unlink()
         texts = []
+        views: list[dict[str, Any]] = []
         for item in files:
+            views += text_views(_output(out, item.file), item.first_page, item.last_page)
             stored = self._send(job, out, item.file)
             texts.append({"fileId": str(stored.file_id), "firstPage": item.first_page, "lastPage": item.last_page})
         log.info("ingestion.outputs_stored", jobId=str(job.job_id), files=1 + len(texts))
@@ -629,6 +658,7 @@ class IngestionStep:
             "original": {"fileId": str(original.file_id)},
             "pages": [{"firstPage": 1, "lastPage": total, "outcome": READ_DIRECTLY}],
             "texts": texts,
+            "pageViews": views,
             # Every page has its outcome in this report: the backend gives the passages step its job at once.
             "next": [passages_step(total)],
         }
@@ -760,3 +790,74 @@ def write_text_file(target: Path, pages: list[Path]) -> None:
                 combined.write(", ")
             combined.write(json.dumps(json.loads(page.read_text(encoding="utf-8")), ensure_ascii=False))
         combined.write("]}")
+
+
+@dataclass(frozen=True)
+class Picture:
+    """A page's picture the layout or OCR child wrote (Story 1.19): its file and its size in pixels."""
+
+    path: Path
+    width: int
+    height: int
+
+
+def _side(value: object) -> bool:
+    return type(value) is int and 1 <= value <= MAX_PICTURE_SIDE
+
+
+def read_pictures(out: Path, pages: list[int]) -> dict[int, Picture]:
+    """The pictures the layout or OCR child listed, checked: pages asked for, each once, each with a plain WebP file of
+    its own and a size the backend takes. A manifest without pictures lists none."""
+    try:
+        body = json.loads((out / layout.MANIFEST).read_text(encoding="utf-8"))
+        items = [(item["page"], item["width"], item["height"]) for item in body.get("pictures", [])]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise StepFailed(STEP_FAILED) from error
+    found: dict[int, Picture] = {}
+    for page, width, height in items:
+        if type(page) is not int or page not in pages or page in found or not _side(width) or not _side(height):
+            raise StepFailed(STEP_FAILED)
+        found[page] = Picture(_output(out, layout.picture_file(page)), width, height)
+    return found
+
+
+def _box(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 4
+        and all(type(side) in (int, float) and 0 <= side <= 1 for side in value)
+    )
+
+
+def page_lines(path: Path) -> list[dict[str, Any]]:
+    """A page record's text lines as a page view shows them: those with text and a box of four fractions, each cut to
+    `MAX_LINE` code points, at most `MAX_LINES`."""
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise StepFailed(STEP_FAILED) from error
+    lines: list[dict[str, Any]] = []
+    for line in record.get("lines") or []:
+        if not isinstance(line, dict):
+            continue
+        text_value, box = line.get("text"), line.get("box")
+        if isinstance(text_value, str) and text_value and _box(box):
+            lines.append({"text": text_value[:MAX_LINE], "box": box})
+            if len(lines) == MAX_LINES:
+                break
+    return lines
+
+
+def text_views(path: Path, first: int, last: int) -> list[dict[str, Any]]:
+    """A text file's pages as page views, `{page, text}`, checked: exactly its pages, in order, each text within
+    `MAX_PAGE_TEXT` code points."""
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))["pages"]
+        views = [{"page": record["page"], "text": record["text"]} for record in records]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise StepFailed(STEP_FAILED) from error
+    if [view["page"] for view in views] != list(range(first, last + 1)) or any(
+        not isinstance(view["text"], str) or len(view["text"]) > MAX_PAGE_TEXT for view in views
+    ):
+        raise StepFailed(STEP_FAILED)
+    return views

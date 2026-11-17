@@ -1,7 +1,9 @@
 """The OCR child (Story 1.17) with Docling replaced by a fake: Docling and Tesseract run only in the production image
 (`tests/image`). Each page is rendered at 216 DPI, straightened when it lies at least half a degree off (within 20),
 handed over as a picture whose size Docling reads as the page's, and written in layout's shape, numbered as in the
-version; a page whose OCR yields fewer than 16 characters other than whitespace is listed unreadable and not written."""
+version; a page whose OCR yields fewer than 16 characters other than whitespace is listed unreadable and not written.
+Every page read, the blank one too, keeps its straightened picture as WebP with a longer side of 2,000 pixels (Story
+1.19), so its boxes lie over it."""
 
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import pypdfium2 as pdfium  # type: ignore[import-untyped]
 import pytest
 from PIL import Image
 
-from gmshield_worker.ingestion import ocr
+from gmshield_worker.ingestion import layout, ocr
 from tests import pdfs
 from tests.test_layout import bottom_left, cell, item, page, provenance, result
 
@@ -101,8 +103,24 @@ def test_the_child_straightens_reads_and_writes_each_page_and_lists_a_blank_one_
     )
 
     assert status == 0
-    assert json.loads((out / ocr.MANIFEST).read_text(encoding="utf-8")) == {"pages": [11, 12], "unreadable": [13]}
-    assert sorted(path.name for path in out.iterdir()) == ["manifest.json", "page-0000011.json", "page-0000012.json"]
+    manifest = json.loads((out / ocr.MANIFEST).read_text(encoding="utf-8"))
+    assert {key: manifest[key] for key in ("pages", "unreadable")} == {"pages": [11, 12], "unreadable": [13]}
+    assert sorted(path.name for path in out.iterdir()) == ["manifest.json", "page-0000011.json", "page-0000011.webp",
+                                                          "page-0000012.json", "page-0000012.webp",
+                                                          "page-0000013.webp"]  # fmt: skip
+    # Matrix rows "Scanned page" and "Blank scan" (Story 1.19): the straightened picture Docling read, shrunk to a
+    # longer side of 2,000 pixels with its shape kept, so the boxes (fractions of it) lie over its lines.
+    sizes = {item["page"]: (item["width"], item["height"]) for item in manifest["pictures"]}
+    assert sorted(sizes) == [11, 12, 13]
+    assert sizes[11] == (1545, 2000)
+    for number, (size, _dpi) in zip((11, 12, 13), seen, strict=True):
+        assert max(sizes[number]) == layout.PICTURE_SIDE
+        assert sizes[number][0] / sizes[number][1] == pytest.approx(size[0] / size[1], abs=0.001)
+        with Image.open(out / layout.picture_file(number)) as written:
+            assert written.format == "WEBP"
+            assert written.size == sizes[number]
+    # The crooked page's picture is the larger straightened canvas: wider for its height than a straight page's.
+    assert sizes[12][0] > sizes[11][0]
     # Rendered at 216 DPI (a US Letter page: 1836 x 2376 pixels); the crooked page on a larger canvas.
     assert seen[0][0] == (1836, 2376)
     assert seen[0][1] == pytest.approx((216.0, 216.0), abs=0.01)
@@ -131,11 +149,12 @@ def test_a_reader_that_finds_no_page_leaves_the_page_unreadable(tmp_path: Path) 
     pdfs.scanned(tmp_path / "source.pdf", [pdfs.raster_page()])
     document = pdfium.PdfDocument(tmp_path / "source.pdf")
     try:
-        nothing = ocr.read_page(document, 0, 1, tmp_path / ocr.PICTURE, lambda _picture: SimpleNamespace(
+        nothing, size = ocr.read_page(document, 0, 1, tmp_path / ocr.PICTURE, lambda _picture: SimpleNamespace(
             document=SimpleNamespace(iterate_items=list), pages=[]))  # fmt: skip
     finally:
         document.close()
     assert nothing is None
+    assert size is None
     assert not (tmp_path / ocr.PICTURE).exists()
 
 
@@ -163,14 +182,21 @@ def test_an_upside_down_page_reaches_docling_upright(tmp_path: Path, monkeypatch
 
     document = pdfium.PdfDocument(tmp_path / "source.pdf")
     try:
-        record = ocr.read_page(document, 0, 4, tmp_path / ocr.PICTURE, read, orient=lambda _picture: 180)
-        assert ocr.read_page(document, 0, 4, tmp_path / ocr.PICTURE, read, orient=lambda _picture: 0) is not None
+        record, size = ocr.read_page(
+            document, 0, 4, tmp_path / ocr.PICTURE, read, orient=lambda _picture: 180, view=tmp_path / "view.webp"
+        )
+        assert ocr.read_page(document, 0, 4, tmp_path / ocr.PICTURE, read, orient=lambda _picture: 0)[0] is not None
     finally:
         document.close()
     assert record is not None and record["page"] == 4
     # Upright, the first line is near the top; left upside down, the first ink is in the lower half.
     assert tops[0] < 0.2
     assert tops[1] > 0.5
+    # The page view's picture is the upright one: its first ink near the top too.
+    with Image.open(tmp_path / "view.webp") as view:
+        assert view.size == size
+        ink = np.nonzero(np.array(view.convert("L")).min(axis=1) < 128)[0]
+        assert ink[0] / view.height < 0.2
     # Outside the image there is no Tesseract: no turn.
     monkeypatch.setenv("PATH", str(tmp_path))
     assert ocr.orientation(tmp_path / "missing.png") == 0
@@ -190,3 +216,7 @@ def test_a_huge_page_is_rendered_with_its_longer_side_capped_and_written_at_216_
     ocr.write_picture(picture, tmp_path / "huge.png")
     with Image.open(tmp_path / "huge.png") as written:
         assert written.info["dpi"] == pytest.approx((ocr.DPI, ocr.DPI), abs=0.01)
+
+
+def test_the_picture_scale_is_the_layout_stages_and_never_above_the_ocr_scale() -> None:
+    assert layout.MAX_PICTURE_SCALE == ocr.SCALE

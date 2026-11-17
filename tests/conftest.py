@@ -14,7 +14,8 @@ in `outputs` under a new id and answers `{fileId, size, sha256}`; both need the 
 A failed outcome with `retry: false` ends the job at once, as the backend does. A done `ingestion`
 outcome is checked against the backend's rules for a step report (`ingestion_result_valid`) and
 answered 400 `job.result_invalid` otherwise, so a renamed field fails the worker's tests. Since Story 1.18 that
-includes a next step over every text file (`input: "texts"`), and the passages and outline a report carries.
+includes a next step over every text file (`input: "texts"`), and the passages and outline a report carries; since
+Story 1.19, the page views (`pageViews`), each picture an output of this job.
 
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
@@ -74,7 +75,7 @@ class StandInJob:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.4.0"
+    version: str = "1.5.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -275,7 +276,14 @@ def _files_valid(job: StandInJob, result: dict[str, Any]) -> bool:
     if original is not None and (not isinstance(original, dict) or original.get("fileId") not in job.output_ids):
         return False
     files = [item for name in ("batches", "texts") for item in (result.get(name) or [])]
-    return all(isinstance(item, dict) and item.get("fileId") in job.output_ids for item in files)
+    views = result.get("pageViews") or []
+    pictures = [view["picture"] for view in views if isinstance(view, dict) and view.get("picture") is not None]
+    named = [item.get("fileId") for item in [*files, *pictures] if isinstance(item, dict)]
+    return (
+        all(isinstance(item, dict) for item in [*files, *pictures])
+        and all(file_id in job.output_ids for file_id in named)
+        and len(named) == len(set(named))
+    )
 
 
 def _pages_valid(result: dict[str, Any], total: int) -> bool:
@@ -352,12 +360,63 @@ def _passages_valid(result: dict[str, Any], total: int) -> bool:
     )
 
 
+MAX_SIDE = 10_000
+MAX_LINES = 10_000
+MAX_LINE = 4_096
+MAX_PAGE_TEXT = 16_384
+
+
+def _box(box: object) -> bool:
+    return (
+        isinstance(box, list) and len(box) == 4 and all(type(side) in (int, float) and 0 <= side <= 1 for side in box)
+    )
+
+
+def _view_valid(view: object, read: set[int], seen: set[int]) -> bool:
+    """A page view on a page this report gives an outcome, once: a picture (1 to 10,000 pixels a side) with at most
+    10,000 lines of 1 to 4,096 code points and a box of four fractions, or a text page's text of at most 16,384."""
+    if not isinstance(view, dict) or type(view.get("page")) is not int or view["page"] not in read:
+        return False
+    if view["page"] in seen or (view.get("picture") is None) == (view.get("text") is None):
+        return False
+    seen.add(view["page"])
+    if view.get("text") is not None:
+        return isinstance(view["text"], str) and len(view["text"]) <= MAX_PAGE_TEXT and view.get("lines") is None
+    picture, lines = view["picture"], view.get("lines")
+    sides = [picture.get("width"), picture.get("height")] if isinstance(picture, dict) else [None]
+    return (
+        all(type(side) is int and 1 <= side <= MAX_SIDE for side in sides)
+        and isinstance(lines, list)
+        and len(lines) <= MAX_LINES
+        and all(
+            isinstance(line, dict)
+            and isinstance(line.get("text"), str)
+            and 1 <= len(line["text"]) <= MAX_LINE
+            and _box(line.get("box"))
+            for line in lines
+        )
+    )
+
+
+def _page_views_valid(result: dict[str, Any]) -> bool:
+    """The report's page views (Story 1.19), each on a page of this report's `pages`."""
+    views = result.get("pageViews")
+    if views is None:
+        return True
+    if not isinstance(views, list):
+        return False
+    read = {page for item in result.get("pages") or [] for page in range(item["firstPage"], item["lastPage"] + 1)}
+    seen: set[int] = set()
+    return all(_view_valid(view, read, seen) for view in views)
+
+
 def ingestion_result_valid(job: StandInJob, result: object) -> bool:
     """The backend's rules for a done `ingestion` step (`IngestionSteps.Report.of` and its range checks): a pipeline
     version; the page total (the report's, or the chain's from the claim input, the same when both are given); an
     original, batches and texts that are outputs of this job; layers and outcomes within the total, no page twice;
     texts only over pages this report gives an outcome other than `unreadable`; next steps over a known file or every
-    text file; passages and an outline within the backend's limits."""
+    text file; passages and an outline within the backend's limits; page views on this report's pages, each picture
+    an output of this job."""
     if not isinstance(result, dict):
         return False
     total = _report_total(job, result)
@@ -367,6 +426,7 @@ def ingestion_result_valid(job: StandInJob, result: object) -> bool:
         and _pages_valid(result, total)
         and _next_valid(job, result.get("next"), total)
         and _passages_valid(result, total)
+        and _page_views_valid(result)
     )
 
 
