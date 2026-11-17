@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -206,3 +207,23 @@ def test_a_line_held_for_a_setext_underline_never_grows_past_a_page(tmp_path: Pa
     assert pages[0]["headingPath"] == []
     assert pages[1]["headingPath"] == [title]
     assert pages[1]["text"].startswith(title + "\n===\n")
+
+
+def test_a_heading_drops_its_closing_hashes_only_after_whitespace() -> None:
+    assert text._heading_title("Title ##  ") == "Title"
+    assert text._heading_title("C# notes") == "C# notes"
+    assert text._heading_title("Title#") == "Title#"
+    assert text._heading_title("###") == ""
+    assert text._heading_title("  ") == ""
+
+
+def test_a_crafted_heading_line_is_matched_in_linear_time() -> None:
+    # A marker, a long run of blanks and a line end before more text: the old pattern (lazy title, optional closing
+    # run, optional blanks) took about 13 s on this line and 105 s on twice as many blanks.
+    line = "# " + " " * 1500 + "\nx"
+    started = time.monotonic()
+    assert text._HEADING.fullmatch(line) is None
+    assert time.monotonic() - started < 0.5
+    heading = text._HEADING.fullmatch("# Title ##\r\n")
+    assert heading is not None
+    assert text._heading_title(heading[2]) == "Title"

@@ -39,11 +39,25 @@ READ_BYTES = 1 << 20
 MARKDOWN = "markdown"
 FORMATS = frozenset({"txt", MARKDOWN})
 
-_HEADING = re.compile(r" {0,3}(#{1,6})(?:[ \t]+(.*?))??(?:[ \t]+#+)?[ \t]*\r?\n?")
+# An ATX heading line: its marker, then the rest of the line, which `_heading_title` trims. Linear: no part of the
+# line can be matched two ways, so a crafted line never backtracks.
+_HEADING = re.compile(r" {0,3}(#{1,6})(?:[ \t]([^\n]*))?\r?\n?")
 _FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
 _UNDERLINE = re.compile(r" {0,3}(=+|-+)[ \t]*\r?\n?")
 _INDENT = re.compile(r" {0,3}\S")
 _BLANK_LINE = re.compile(r"\n[ \t\r\f\v]*\n")
+
+
+def _heading_title(rest: str) -> str:
+    """An ATX heading's title: the rest of its line, trimmed, without a closing run of `#` that follows whitespace (or
+    is all there is)."""
+    title = rest.strip()
+    unclosed = title.rstrip("#")
+    if not unclosed:
+        return ""
+    if unclosed != title and unclosed[-1] in " \t":
+        return unclosed.rstrip()
+    return title
 
 
 def text_file(index: int) -> str:
@@ -238,7 +252,7 @@ def paginate(chunks: Iterator[str], markdown: bool, pager: Pager) -> int:
             elif opened:
                 fence = opened[1]
             elif heading := _HEADING.fullmatch(piece):
-                pager.heading(len(heading[1]), (heading[2] or "").strip())
+                pager.heading(len(heading[1]), _heading_title(heading[2] or ""))
             elif _title(piece, at_start, pager.limit):
                 held = piece
                 continue
