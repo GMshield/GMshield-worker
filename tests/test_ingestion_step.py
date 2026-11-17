@@ -1,6 +1,7 @@
 """One ingestion step end to end (Story 1.15), against the stand-in backend and the real sandbox: the clean stage of a
 PDF with active content, a password, a broken file, a crash, the deadline and a bad manifest, the step folder erased
-every time, and the outcome through a lane (`retry: false`, the result) under the job's trace id."""
+every time, and the outcome through a lane (`retry: false`, the result) under the job's trace id. Then triage, layout
+and text (Story 1.16), OCR (Story 1.17), and the passages stage over every text file (Story 1.18)."""
 
 from __future__ import annotations
 
@@ -73,11 +74,12 @@ def test_a_pdf_with_active_content_is_cleaned_split_sent_back_and_reported(
     assert result["pipelineVersion"] == PIPELINE_VERSION
     assert result["pageTotal"] == 25
     assert [(batch["firstPage"], batch["lastPage"]) for batch in result["batches"]] == [(1, 20), (21, 25)]
-    # One triage step per batch, over that batch.
+    # One triage step per batch, over that batch, then the passages step over every text file (held by the backend).
     assert result["next"] == [
         {"stage": "triage", "firstPage": batch["firstPage"], "lastPage": batch["lastPage"], "input": batch["fileId"]}
         for batch in result["batches"]
-    ]
+    ] + [{"stage": "passages", "firstPage": 1, "lastPage": 25, "input": "texts"}]
+    assert ingestion_result_valid(stand_in.jobs[str(job.job_id)], result)
     files = [result["original"]["fileId"], *(batch["fileId"] for batch in result["batches"])]
     assert sorted(files) == sorted(stand_in.outputs)
     for file_id in files:
@@ -287,8 +289,8 @@ def retried(job: ClaimedJob) -> ClaimedJob:
 def test_a_step_of_a_chain_started_by_another_pipeline_fails_at_once_before_any_download(
     stand_in: StandIn, tmp_path: Path
 ) -> None:
-    # "passages" is a stage this worker does not run: under another pipeline it is still a pipeline change.
-    for stage in ("triage", "layout", "ocr", "passages"):
+    # "pictures" is a stage this worker does not run: under another pipeline it is still a pipeline change.
+    for stage in ("triage", "layout", "ocr", "passages", "pictures"):
         job = claim(stand_in, b"%PDF-1.7\n", step_input(stage, 21, 25, pipelineVersion="1"))
 
         outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
@@ -466,6 +468,7 @@ def test_a_markdown_upload_comes_back_unchanged_with_its_pages_read_directly(sta
     pages = json.loads(stand_in.outputs[text_file["fileId"]])["pages"]
     assert [page["headingPath"] for page in pages] == [["A"], ["A", "B"], ["A", "B"], ["A", "B"], ["A", "B"]]
     assert all(len(page["text"]) <= 3000 for page in pages)
+    assert result["next"] == [{"stage": "passages", "firstPage": 1, "lastPage": 5, "input": "texts"}]
     assert list(work.iterdir()) == []
     assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
 
@@ -615,3 +618,182 @@ def test_a_manifest_that_lists_a_page_twice_or_not_as_a_number_is_refused(tmp_pa
         (tmp_path / layout.MANIFEST).write_text(json.dumps(body), encoding="utf-8")
         with pytest.raises(StepFailed):
             step.read_pages(tmp_path, [1, 2])
+
+
+# --- Story 1.18: passages
+
+
+def passages_input(texts: list[tuple[str, int, int]], fmt: str = "pdf", total: int = 25) -> dict[str, Any]:
+    """A passages step's claim input: every text file of the version, in page order."""
+    return {
+        "versionId": CLEAN_INPUT["versionId"],
+        "stage": "passages",
+        "format": fmt,
+        "input": "texts",
+        "attempt": 1,
+        "pageTotal": total,
+        "pipelineVersion": PIPELINE_VERSION,
+        "firstPage": 1,
+        "lastPage": total,
+        "texts": [{"name": name, "firstPage": first, "lastPage": last} for name, first, last in texts],
+    }
+
+
+def text_name(index: int) -> str:
+    return f"text-0195a3c0-0000-7000-8000-{index:012d}"
+
+
+def claim_passages(stand_in: StandIn, job_input: dict[str, Any], files: dict[str, bytes]) -> ClaimedJob:
+    stand_in.credential = CREDENTIAL
+    job_id = stand_in.offer("ingestion", job_input, trace_id=new_trace_id(), inputs=files)
+    answer = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(job_id), new_trace_id())
+    assert answer.job is not None
+    return answer.job
+
+
+def pdf_records(*pages: tuple[int, list[dict[str, Any]]]) -> bytes:
+    return json.dumps({"pages": [{"page": page, "lines": [], "blocks": blocks} for page, blocks in pages]}).encode()
+
+
+def heading(content: str, level: int) -> dict[str, Any]:
+    return {"label": "section_header", "text": content, "box": [0, 0, 1, 0.1], "headingLevel": level, "rows": None}
+
+
+def para(content: str) -> dict[str, Any]:
+    return {"label": "text", "text": content, "box": [0, 0.2, 1, 0.4], "headingLevel": None, "rows": None}
+
+
+def test_passages_read_every_text_file_in_page_order_and_carry_the_path_across_them(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Matrix row "Path across batches": "Magic Items" on page 19 (first batch), "Vorpal Sword" on page 21 (second).
+    first = pdf_records((19, [heading("Magic Items", 1), para("Wondrous things.")]), (20, [para("More.")]))
+    second = pdf_records((21, [heading("Vorpal Sword", 2), para("A legendary blade.")]), (22, []))
+    job = claim_passages(
+        stand_in,
+        passages_input([(text_name(1), 19, 20), (text_name(2), 21, 22)]),
+        {text_name(1): first, text_name(2): second},
+    )
+    work = tmp_path / "work"
+
+    outcome = handler(stand_in, work)(job, threading.Event())
+
+    assert outcome.outcome == "done", outcome
+    result = outcome.result
+    assert result is not None
+    assert result["pipelineVersion"] == PIPELINE_VERSION
+    assert result["pageTotal"] == 25
+    assert result["next"] == []
+    assert [(item["page"], item["sectionPath"], item["text"]) for item in result["passages"]] == [
+        (19, ["Magic Items"], "Magic Items\nWondrous things."),
+        (20, ["Magic Items"], "Magic Items\nMore."),
+        (21, ["Magic Items", "Vorpal Sword"], "Vorpal Sword\nA legendary blade."),
+    ]
+    assert result["passages"][0]["boxes"] == [[0, 0, 1, 0.1], [0, 0.2, 1, 0.4]]
+    assert result["outline"] == [
+        {"level": 1, "title": "Magic Items", "page": 19},
+        {"level": 2, "title": "Vorpal Sword", "page": 21},
+    ]
+    # No child: two downloads, in page order, then the report.
+    paths = [request["path"] for request in stand_in.job_requests(str(job.job_id)) if "/inputs/" in request["path"]]
+    assert [path.rsplit("/", 1)[1] for path in paths] == [text_name(1), text_name(2)]
+    assert list(work.iterdir()) == []
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
+    lines = [line for line in log_lines(capsys.readouterr().out) if line.get("jobId") == str(job.job_id)]
+    assert [line["event"] for line in lines] == ["ingestion.step_started", "ingestion.input_downloaded",
+                                                 "ingestion.input_downloaded", "ingestion.step_done"]  # fmt: skip
+    assert lines[-1]["passages"] == 3
+    assert lines[-1]["sections"] == 2
+    assert "Vorpal" not in json.dumps(lines)
+
+
+def test_a_version_with_no_text_file_reports_no_passages(stand_in: StandIn, tmp_path: Path) -> None:
+    # Matrix row "All unreadable": no text file; the step runs and reports none.
+    job = claim_passages(stand_in, passages_input([]), {})
+
+    outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
+
+    assert outcome == Outcome.done(
+        {"pipelineVersion": PIPELINE_VERSION, "pageTotal": 25, "passages": [], "outline": [], "next": []}
+    )
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
+
+
+def test_a_markdown_upload_goes_through_the_text_stage_then_the_passages_stage(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    # Matrix row "Markdown": `# A` / `## B`; the text stage's own files feed the passages stage.
+    content = b"# A\n\nUnder A.\n\n## B\n\nUnder B.\n"
+    text_job = claim(stand_in, content, TEXT_INPUT)
+    text_outcome = handler(stand_in, tmp_path / "work")(text_job, threading.Event())
+    assert text_outcome.result is not None
+    [text_file] = text_outcome.result["texts"]
+    name = "text-" + text_file["fileId"]
+    job = claim_passages(
+        stand_in,
+        passages_input([(name, 1, 2)], fmt="markdown", total=2),
+        {name: stand_in.outputs[text_file["fileId"]]},
+    )
+
+    outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
+
+    assert outcome.result is not None
+    assert outcome.result["passages"] == [
+        {"page": 1, "sectionPath": ["A"], "text": "# A\n\nUnder A.", "range": [0, 13]},
+        {"page": 2, "sectionPath": ["A", "B"], "text": "## B\n\nUnder B.", "range": [0, 14]},
+    ]
+    assert outcome.result["outline"] == [{"level": 1, "title": "A", "page": 1}, {"level": 2, "title": "B", "page": 2}]
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
+
+
+def test_a_malformed_texts_input_or_text_file_fails_the_passages_step_at_once(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    good = passages_input([(text_name(1), 1, 20), (text_name(2), 21, 25)])
+    for bad in (
+        {**good, "texts": "all"},
+        {**good, "texts": [{"name": "source", "firstPage": 1, "lastPage": 20}]},
+        {**good, "texts": [{"name": text_name(1), "firstPage": 1, "lastPage": 26}]},
+        {**good, "texts": [{"name": text_name(1), "firstPage": 5, "lastPage": 4}]},
+        {**good, "texts": [{"name": text_name(2), "firstPage": 21, "lastPage": 25},
+                           {"name": text_name(1), "firstPage": 1, "lastPage": 20}]},
+        {key: value for key, value in good.items() if key != "pageTotal"},
+    ):  # fmt: skip
+        job = claim_passages(stand_in, bad, {})
+        assert handler(stand_in, tmp_path / "work")(job, threading.Event()) == Outcome.failed(STEP_FAILED, retry=False)
+
+    files = {text_name(1): pdf_records((3, [])), text_name(2): b"{}"}
+    job = claim_passages(stand_in, good, files)
+    work = tmp_path / "work"
+    assert handler(stand_in, work)(job, threading.Event()) == Outcome.failed(STEP_FAILED, retry=False)
+    assert list(work.iterdir()) == []
+
+
+def test_a_passages_step_whose_text_file_cannot_be_downloaded_fails_for_a_retry(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    job = claim_passages(stand_in, passages_input([(text_name(1), 1, 25)]), {})
+    assert handler(stand_in, tmp_path / "work")(job, threading.Event()) == Outcome.failed(STEP_FAILED)
+
+
+def test_the_stand_in_refuses_passages_the_backend_would_refuse(stand_in: StandIn) -> None:
+    job = claim(stand_in, b"%PDF-1.7\n", passages_input([]))
+    api = JobsApi(stand_in.url, CREDENTIAL)
+    passage = {"page": 1, "sectionPath": ["A"], "text": "a", "boxes": [[0, 0, 1, 1]]}
+    good = {"pipelineVersion": PIPELINE_VERSION, "passages": [passage], "outline": [], "next": []}
+    assert ingestion_result_valid(stand_in.jobs[str(job.job_id)], good)
+    for bad in (
+        {**good, "passages": [{**passage, "page": 0}]},
+        {**good, "passages": [{**passage, "page": 26}]},
+        {**good, "passages": [{**passage, "text": ""}]},
+        {**good, "passages": [{**passage, "text": "a" * 16_385}]},
+        {**good, "passages": [{**passage, "sectionPath": ["x"] * 33}]},
+        {**good, "passages": [{**passage, "sectionPath": ["x" * 1001]}]},
+        {**good, "passages": [{**passage, "range": [0, 1]}]},
+        {**good, "passages": [{key: value for key, value in passage.items() if key != "boxes"}]},
+        {**good, "outline": [{"level": 1, "title": "", "page": 1}]},
+        {**good, "outline": [{"level": 1, "title": "A", "page": 26}]},
+    ):
+        answer = api.report(job, Outcome.done(bad))
+        assert (answer.status, answer.code) == (400, "job.result_invalid"), bad
+    assert stand_in.jobs[str(job.job_id)].state == "running"

@@ -13,7 +13,8 @@ in `outputs` under a new id and answers `{fileId, size, sha256}`; both need the 
 `output_status` forces the output's answer, and `wrong_sha256` makes the answer's hash wrong.
 A failed outcome with `retry: false` ends the job at once, as the backend does. A done `ingestion`
 outcome is checked against the backend's rules for a step report (`ingestion_result_valid`) and
-answered 400 `job.result_invalid` otherwise, so a renamed field fails the worker's tests.
+answered 400 `job.result_invalid` otherwise, so a renamed field fails the worker's tests. Since Story 1.18 that
+includes a next step over every text file (`input: "texts"`), and the passages and outline a report carries.
 
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
@@ -73,7 +74,7 @@ class StandInJob:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.3.0"
+    version: str = "1.4.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -249,7 +250,8 @@ def _next_valid(job: StandInJob, following: object, total: int) -> bool:
         if not isinstance(item, dict) or not isinstance(item.get("stage"), str) or not STAGE.fullmatch(item["stage"]):
             return False
         first, last = item.get("firstPage"), item.get("lastPage")
-        if (first is None) != (last is None) or item.get("input") not in known:
+        texts = item.get("input") == "texts"
+        if (first is None) != (last is None) or (not texts and item.get("input") not in known):
             return False
         if first is not None and not (_page(first, total) and _page(last, total) and first <= last):
             return False
@@ -293,11 +295,69 @@ def _pages_valid(result: dict[str, Any], total: int) -> bool:
     return covered and _no_repeats(layers) and _no_repeats(pages)
 
 
+MAX_PASSAGE = 16_384
+MAX_DEPTH = 32
+MAX_TITLE = 1000
+
+
+def _title(value: object) -> bool:
+    return isinstance(value, str) and 1 <= len(value) <= MAX_TITLE
+
+
+def _place_valid(item: dict[str, Any]) -> bool:
+    """Boxes (each four fractions) or a range (`[start, end)`, not empty), never both nor neither."""
+    boxes, span = item.get("boxes"), item.get("range")
+    if (boxes is None) == (span is None):
+        return False
+    if boxes is not None:
+        return isinstance(boxes, list) and all(
+            isinstance(box, list)
+            and len(box) == 4
+            and all(type(side) in (int, float) and 0 <= side <= 1 for side in box)
+            for box in boxes
+        )
+    return (
+        isinstance(span, list) and len(span) == 2 and all(type(end) is int for end in span) and 0 <= span[0] < span[1]
+    )
+
+
+def _passages_valid(result: dict[str, Any], total: int) -> bool:
+    """Passages (page, text of 1 to 16,384 code points, a path of at most 32 titles, a place) and outline entries
+    (level, title of 1 to 1,000 code points, page), every page within the total."""
+    passages, outline = result.get("passages"), result.get("outline")
+    if passages is None and outline is None:
+        return True
+    passages, outline = passages or [], outline or []
+    if not isinstance(passages, list) or not isinstance(outline, list):
+        return False
+    for item in passages:
+        if (
+            not isinstance(item, dict)
+            or not _page(item.get("page"), total)
+            or not isinstance(item.get("text"), str)
+            or not 1 <= len(item["text"]) <= MAX_PASSAGE
+            or not isinstance(item.get("sectionPath"), list)
+            or len(item["sectionPath"]) > MAX_DEPTH
+            or not all(_title(name) for name in item["sectionPath"])
+            or not _place_valid(item)
+        ):
+            return False
+    return all(
+        isinstance(entry, dict)
+        and type(entry.get("level")) is int
+        and 0 <= entry["level"] <= 1000
+        and _title(entry.get("title"))
+        and _page(entry.get("page"), total)
+        for entry in outline
+    )
+
+
 def ingestion_result_valid(job: StandInJob, result: object) -> bool:
     """The backend's rules for a done `ingestion` step (`IngestionSteps.Report.of` and its range checks): a pipeline
     version; the page total (the report's, or the chain's from the claim input, the same when both are given); an
     original, batches and texts that are outputs of this job; layers and outcomes within the total, no page twice;
-    texts only over pages this report gives an outcome other than `unreadable`; next steps over a known file."""
+    texts only over pages this report gives an outcome other than `unreadable`; next steps over a known file or every
+    text file; passages and an outline within the backend's limits."""
     if not isinstance(result, dict):
         return False
     total = _report_total(job, result)
@@ -306,6 +366,7 @@ def ingestion_result_valid(job: StandInJob, result: object) -> bool:
         and _files_valid(job, result)
         and _pages_valid(result, total)
         and _next_valid(job, result.get("next"), total)
+        and _passages_valid(result, total)
     )
 
 

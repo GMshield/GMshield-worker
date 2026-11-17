@@ -1,4 +1,4 @@
-"""One claimed step of the `ingestion` job kind (Stories 1.15 to 1.17): dispatch on the claim's stage.
+"""One claimed step of the `ingestion` job kind (Stories 1.15 to 1.18): dispatch on the claim's stage.
 
 Every stage works in the step's own folder (`workdir.step_folder`, erased however the step ends): it streams the step's
 input (`source`) from the backend, runs its child in the sandbox (no credential, no network, the folder as its working
@@ -6,7 +6,8 @@ directory, killed at its deadline or when the claim ends), streams its files bac
 size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in the version.
 
 - `clean` (a PDF; the raw upload, or the stored original on a restart): `clean.py` makes it safe and splits it into
-  batches; the report gives `pageTotal`, the `original`, the `batches` and one `triage` step per batch.
+  batches; the report gives `pageTotal`, the `original`, the `batches`, one `triage` step per batch and, last, the
+  `passages` step over every text file (`input: "texts"`), which the backend holds until every page has an outcome.
 - `triage` (a batch): `triage.py` says which pages have a text layer; the report gives their `layers`, a `layout`
   step for each run of text pages, then an `ocr` step for each run of image pages, cut to at most `OCR_PAGES`.
 - `layout` (a run of text pages of a batch): `layout.py` reads them with Docling; the report gives each page
@@ -15,7 +16,11 @@ size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in 
   and Tesseract; the report gives each page `read_by_ocr` or `unreadable` and the pages read as `texts` files, in
   layout's shape.
 - `text` (a TXT or Markdown upload): `text.py` splits it into pages of bounded length; the report gives the file back
-  unchanged as the `original`, `pageTotal`, one `read_directly` range and its `texts` files.
+  unchanged as the `original`, `pageTotal`, one `read_directly` range, its `texts` files and the `passages` step.
+- `passages` (Story 1.18; every text file of the version, named in the claim input's `texts` in page order): runs
+  in-process, with no child, since it reads only our own JSON. It downloads one text file at a time and feeds its
+  page records to `passages.py`, which carries the heading stack across files; the report gives the `passages`
+  (page, section path, text, boxes or range) and the `outline`.
 
 Before anything is downloaded, a step whose input names the chain's `pipelineVersion` checks it against this worker's:
 another one fails the step with `ingestion.pipeline_changed` and `retry: false`, and the backend restarts the chain.
@@ -44,7 +49,7 @@ import httpx
 
 from gmshield_worker.backend.client import ClaimedJob, Outcome
 from gmshield_worker.backend.files import FileTransferError, StoredOutput
-from gmshield_worker.ingestion import PIPELINE_VERSION, clean, layout, ocr, sandbox, text, triage
+from gmshield_worker.ingestion import PIPELINE_VERSION, clean, layout, ocr, passages, sandbox, text, triage
 from gmshield_worker.ingestion.errors import (
     FILE_UNREADABLE,
     PASSWORD_REQUIRED,
@@ -62,7 +67,11 @@ TRIAGE = "triage"
 LAYOUT = "layout"
 OCR = "ocr"
 TEXT = "text"
+PASSAGES = "passages"
 PDF = "pdf"
+# The input of a step over every text file of the version (Story 1.18), and the one file a passages step holds.
+TEXTS = "texts"
+TEXTS_FILE = "texts.json"
 UNIT = "worker.ingestion"
 SOURCE_FILE = "source.pdf"
 SOURCE_TEXT = "source.txt"
@@ -73,7 +82,19 @@ LAYOUT_SCRIPT = Path(layout.__file__)
 OCR_SCRIPT = Path(ocr.__file__)
 TEXT_SCRIPT = Path(text.__file__)
 # The stages this worker runs, by stage and format.
-STAGES = frozenset({(CLEAN, PDF), (TRIAGE, PDF), (LAYOUT, PDF), (OCR, PDF), (TEXT, "txt"), (TEXT, "markdown")})
+STAGES = frozenset(
+    {
+        (CLEAN, PDF),
+        (TRIAGE, PDF),
+        (LAYOUT, PDF),
+        (OCR, PDF),
+        (TEXT, "txt"),
+        (TEXT, "markdown"),
+        (PASSAGES, PDF),
+        (PASSAGES, "txt"),
+        (PASSAGES, "markdown"),
+    }
+)
 # The most image pages one `ocr` step reads: the worker owns this size. Ten pages must stay well inside a step's
 # 10 minutes on roberto-server; lower it if the timing check there shows a step over 8 minutes.
 OCR_PAGES = 10
@@ -89,6 +110,7 @@ _INPUT_NAME = re.compile(r"[a-z][a-z0-9_.-]{0,63}", re.ASCII)
 _OUTPUT_FILE = re.compile(r"(original|batch-[0-9]{5})\.pdf", re.ASCII)
 _TEXT_FILE = re.compile(r"text-[0-9]{5}\.json", re.ASCII)
 _UUID = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", re.ASCII)
+_TEXT_INPUT = re.compile(r"text-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.ASCII)
 MAX_PAGES = 1_000_000
 
 
@@ -221,8 +243,18 @@ def _output(out: Path, name: str) -> Path:
 
 
 @dataclass(frozen=True)
+class TextInput:
+    """One text file a passages step reads: its input name and the pages it holds."""
+
+    name: str
+    first_page: int
+    last_page: int
+
+
+@dataclass(frozen=True)
 class StepInput:
-    """What the claim's input says about the step, checked: the stage's pages and the input file's."""
+    """What the claim's input says about the step, checked: the stage's pages and the input file's; for a step over
+    every text file, those files in page order."""
 
     stage: str
     name: str
@@ -231,6 +263,7 @@ class StepInput:
     last_page: int | None
     input_file_id: str | None
     input_first_page: int | None
+    texts: tuple[TextInput, ...] = ()
 
     def pages(self) -> list[int]:
         if self.first_page is None or self.last_page is None:
@@ -275,7 +308,28 @@ def step_input(values: dict[str, Any]) -> StepInput:
             raise StepFailed(STEP_FAILED, retry=False)
         if first is not None and last is not None and not input_first <= first <= last <= input_last:
             raise StepFailed(STEP_FAILED, retry=False)
-    return StepInput(str(values.get("stage")), name, total, first, last, file_id, input_first)
+    texts = _texts(values.get("texts"), total) if name == TEXTS else ()
+    return StepInput(str(values.get("stage")), name, total, first, last, file_id, input_first, texts)
+
+
+def _texts(value: object, total: int | None) -> tuple[TextInput, ...]:
+    """The text files of a step over every text file: names of their own kind, page ranges within the total, in
+    page order and never overlapping."""
+    if not isinstance(value, list) or total is None:
+        raise StepFailed(STEP_FAILED, retry=False)
+    found: list[TextInput] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise StepFailed(STEP_FAILED, retry=False)
+        name, first, last = item.get("name"), item.get("firstPage"), item.get("lastPage")
+        if not isinstance(name, str) or not _TEXT_INPUT.fullmatch(name):
+            raise StepFailed(STEP_FAILED, retry=False)
+        if type(first) is not int or type(last) is not int or not 1 <= first <= last <= total:
+            raise StepFailed(STEP_FAILED, retry=False)
+        if found and first <= found[-1].last_page:
+            raise StepFailed(STEP_FAILED, retry=False)
+        found.append(TextInput(name, first, last))
+    return tuple(found)
 
 
 @dataclass
@@ -308,9 +362,14 @@ class IngestionStep:
             return Outcome.failed(failed.code, retry=None if failed.retry else False)
         started = time.monotonic()
         log.info("ingestion.step_started", jobId=job_id, stage=stage, attempt=job.attempt)
-        run = {CLEAN: self._clean, TRIAGE: self._triage, LAYOUT: self._layout, OCR: self._ocr, TEXT: self._text}[
-            checked.stage
-        ]
+        run = {
+            CLEAN: self._clean,
+            TRIAGE: self._triage,
+            LAYOUT: self._layout,
+            OCR: self._ocr,
+            TEXT: self._text,
+            PASSAGES: self._passages,
+        }[checked.stage]
         try:
             with step_folder(self.work_dir, job_id, job.trace_id) as folder:
                 result, counts = run(job, checked, cancel, folder, log)
@@ -368,10 +427,12 @@ class IngestionStep:
             "pageTotal": manifest.page_total,
             "original": {"fileId": str(original.file_id)},
             "batches": batches,
+            # Each batch's triage, then the passages step over every text file, held until every page has an outcome.
             "next": [
                 {"stage": TRIAGE, "firstPage": first, "lastPage": last, "input": file_id}
                 for file_id, first, last in stored_batches
-            ],
+            ]
+            + [passages_step(manifest.page_total)],
         }
         return result, {"pageTotal": manifest.page_total, "batches": len(batches)}
 
@@ -568,9 +629,38 @@ class IngestionStep:
             "original": {"fileId": str(original.file_id)},
             "pages": [{"firstPage": 1, "lastPage": total, "outcome": READ_DIRECTLY}],
             "texts": texts,
-            "next": [],
+            # Every page has its outcome in this report: the backend gives the passages step its job at once.
+            "next": [passages_step(total)],
         }
         return result, {"pageTotal": total, "texts": len(texts)}
+
+    def _passages(
+        self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """Every text file of the version, one at a time, through one cutter: the heading stack crosses files."""
+        pdf = job.input.get("format") == PDF
+        cutter = passages.cutter(pdf)
+        path = folder / TEXTS_FILE
+        for item in checked.texts:
+            size = self.files.download(job, item.name, path)
+            log.info("ingestion.input_downloaded", jobId=str(job.job_id), size=size)
+            _stop_if_cancelled(cancel)
+            try:
+                records = passages.read_records(path, item.first_page, item.last_page, pdf=pdf)
+            except passages.RecordsInvalid as error:
+                raise StepFailed(STEP_FAILED, retry=False) from error
+            path.unlink()
+            for record in records:
+                cutter.page(record)
+        found, outline = cutter.finish()
+        result = {
+            "pipelineVersion": PIPELINE_VERSION,
+            "pageTotal": checked.page_total,
+            "passages": found,
+            "outline": outline,
+            "next": [],
+        }
+        return result, {"texts": len(checked.texts), "passages": len(found), "sections": len(outline)}
 
     # --- shared
 
@@ -614,6 +704,11 @@ class IngestionStep:
         stored = self.files.upload(job, path)
         path.unlink()
         return stored
+
+
+def passages_step(total: int) -> dict[str, Any]:
+    """The next step over every text file of the version (Story 1.18): its pages are all of them."""
+    return {"stage": PASSAGES, "firstPage": 1, "lastPage": total, "input": TEXTS}
 
 
 def _succeeded(child: sandbox.ChildResult) -> bool:
