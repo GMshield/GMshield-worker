@@ -7,9 +7,13 @@ layout and table models baked into the image (HF_HUB_OFFLINE=1, DOCLING_ARTIFACT
 Tesseract as its OCR engine. Since Story 1.15 the clean stage's child runs in its sandbox
 (isolated, with pikepdf from the image's environment and no network socket). Since Story 1.16 the
 triage child and the layout child run there too: Docling reads a generated two-column page with a
-table offline, with its models given on the command line (the child's environment is empty). The file runs as a
-plain script (the image has no pytest); pytest collects it too, but `pyproject.toml` leaves
-`tests/image` out of the ordinary test run.
+table offline, with its models given on the command line (the child's environment is empty). Since Story 1.17 the
+OCR child reads generated scans there (straight, turned 7 degrees, upside down, and blank) with Docling and Tesseract;
+the scans come from `tests/pdfs.py`, which the image carries for these checks. The file runs as a plain script (the
+image has no pytest); pytest collects it too, but `pyproject.toml` leaves `tests/image` out of the ordinary test run.
+
+`python /app/tests/image/test_image.py --ocr-timing PAGES` instead times the OCR child alone on a generated scan of
+PAGES pages (Story 1.17's timing check on roberto-server) and prints its time and peak memory.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 SAMPLE_TEXT = "GMshield sample page"
 
@@ -222,6 +227,88 @@ def test_the_triage_and_layout_children_read_two_columns_and_a_table_offline_in_
     assert {line["text"] for line in record["lines"]} >= set(LEFT_COLUMN) | set(RIGHT_COLUMN)
 
 
+# Words the OCR check looks for: one Portuguese and one English line of `pdfs.SCAN_LINES`, by their longest words.
+OCR_WORDS = ("estalagem", "initiative")
+
+
+def scan_pdf(folder: Path, pages: int | None = None) -> Path:
+    """A scan of two paragraphs (Portuguese, then English): straight, turned 7 degrees, upside down, blank, and turned
+    90 degrees (a landscape picture of a portrait page); or `pages` pages straight, crooked and upside down in turn."""
+    from tests import pdfs
+
+    lines = [*pdfs.SCAN_LINES[:3], "", "", "", *pdfs.SCAN_LINES[3:]]
+    if pages is None:
+        pictures = [pdfs.raster_page(lines), pdfs.raster_page(lines, angle=7), pdfs.raster_page(lines, angle=180),
+                    pdfs.raster_page(blank=True), pdfs.raster_page(lines, angle=90)]  # fmt: skip
+    else:
+        pictures = [pdfs.raster_page(lines, angle=(0, 7, -4, 180)[index % 4]) for index in range(pages)]
+    return pdfs.scanned(folder / "source.pdf", pictures)
+
+
+def run_ocr(folder: Path, first: int, last: int) -> tuple[Any, dict[str, Any]]:
+    import json
+    import threading
+
+    from gmshield_worker.ingestion import ocr, sandbox
+
+    artifacts = os.environ.get("DOCLING_ARTIFACTS_PATH", "/opt/docling-models")
+    result = sandbox.run_child(
+        Path(ocr.__file__),
+        ["source.pdf", "out", "1", str(first), str(last), artifacts, "2"],
+        folder=folder,
+        cancel=threading.Event(),
+    )
+    assert result.returncode == 0, result
+    manifest = json.loads((folder / "out" / "manifest.json").read_text(encoding="utf-8"))
+    return result, manifest
+
+
+def test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox() -> None:
+    import json
+
+    from gmshield_worker.ingestion import layout
+    from tests import pdfs
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as name:
+        folder = Path(name)
+        scan_pdf(folder)
+        result, manifest = run_ocr(folder, 1, 5)
+        assert manifest == {"pages": [1, 2, 3, 5], "unreadable": [4]}, manifest
+        records = [json.loads((folder / "out" / layout.page_file(page)).read_text(encoding="utf-8")) for page in
+                   (1, 2, 3, 5)]  # fmt: skip
+        written = sorted(path.name for path in (folder / "out").iterdir())
+        assert written == ["manifest.json", *(layout.page_file(page) for page in (1, 2, 3, 5))], written
+    print(f"ocr child: 5 pages in {result.seconds:.1f} s, peak {result.max_rss_kib // 1024} MiB")
+    for record in records:
+        text = " ".join(block["text"] for block in record["blocks"])
+        assert set(record) == {"page", "lines", "blocks"}, record.keys()
+        for word in OCR_WORDS:
+            assert word in text, (record["page"], text)
+        # Reading order: the Portuguese paragraph comes before the English one, also upside down and sideways.
+        assert text.index("estalagem") < text.index("initiative"), (record["page"], text)
+        assert pdfs.SCAN_LINES[0].split()[0] in text, (record["page"], text)
+        for item in [*record["lines"], *record["blocks"]]:
+            left, top, right, bottom = item["box"]
+            assert 0 <= left <= right <= 1 and 0 <= top <= bottom <= 1, item
+        # The first line sits near the top of the straightened picture.
+        first = min(record["blocks"], key=lambda block: block["box"][1])
+        assert first["box"][1] < 0.3, (record["page"], first)
+
+
+def ocr_timing(pages: int) -> int:
+    """The OCR child alone over a generated scan of `pages` pages: its time, peak memory and outcome."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as name:
+        folder = Path(name)
+        scan_pdf(folder, pages)
+        result, manifest = run_ocr(folder, 1, pages)
+    print(
+        f"ocr timing: {pages} pages in {result.seconds:.1f} s ({result.seconds / pages:.1f} s per page), "
+        f"peak {result.max_rss_kib // 1024} MiB; read {len(manifest['pages'])}, "
+        f"unreadable {len(manifest['unreadable'])}"
+    )
+    return 0 if len(manifest["pages"]) == pages else 1
+
+
 # The HEALTHCHECK's command in the Dockerfile, word for word: an emptied environment, so no secret of the worker's sits
 # in the environment of a process a parsing child could read.
 HEALTHCHECK = [
@@ -262,6 +349,7 @@ def main() -> int:
         test_the_health_check_works_with_an_emptied_environment,
         test_the_clean_child_runs_in_its_sandbox,
         test_the_triage_and_layout_children_read_two_columns_and_a_table_offline_in_their_sandbox,
+        test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox,
         test_tesseract_lists_portuguese_and_english,
         test_docling_converts_offline,
     )
@@ -277,4 +365,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--ocr-timing":
+        sys.exit(ocr_timing(int(sys.argv[2])))
     sys.exit(main())

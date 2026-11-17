@@ -1,6 +1,7 @@
-"""The triage child (Story 1.16) in its sandbox: a page with at least 16 characters other than whitespace in its text
-layer has one; any other page (a scan, a blank page, a caption alone) is an image page. Pages are numbered as in the
-version, read from a batch that starts at OFFSET."""
+"""The triage child (Stories 1.16 and 1.17) in its sandbox: a page with at least 16 characters other than whitespace in
+its text layer has one, unless it has fewer than 200 and one image covers at least half of it (a scan under a digital
+running header); any other page (a scan, a blank page, a caption alone) is an image page. Pages are numbered as in
+the version, read from a batch that starts at OFFSET."""
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ import json
 import threading
 from pathlib import Path
 
+import pikepdf
 import pytest
 
 from gmshield_worker.ingestion import sandbox, triage
@@ -84,3 +86,60 @@ def test_a_file_that_is_not_a_pdf_crashes_the_child(tmp_path: Path) -> None:
     )
     assert result.returncode != 0
     assert not (tmp_path / "out").exists()
+
+
+# --- Story 1.17: few characters over a big image
+
+
+@pytest.mark.parametrize(
+    ("text", "image_share", "layer"),
+    [
+        ("H" * 30, 1.0, "image"),  # a running header over a full-page scan
+        ("H" * 199, 0.5, "image"),
+        ("H" * 199, 0.49, "text"),  # a small illustration beside a short text
+        ("H" * 200, 1.0, "text"),  # a full text layer over a scan (a scan already read by OCR) is never OCRed again
+        ("H" * 15, 0.0, "image"),
+    ],
+)
+def test_few_characters_over_half_a_page_of_image_make_an_image_page(text: str, image_share: float, layer: str) -> None:
+    assert triage.layer_of(text, image_share) == layer
+
+
+def test_an_image_share_is_its_bounds_clipped_to_the_page() -> None:
+    page = (0.0, 0.0, 100.0, 200.0)
+    assert triage.share((0, 0, 100, 200), page) == 1.0
+    assert triage.share((-50, -50, 150, 250), page) == 1.0
+    assert triage.share((0, 0, 50, 200), page) == 0.5
+    assert triage.share((200, 0, 300, 200), page) == 0.0
+    assert triage.share((0, 0, 1, 1), (0, 0, 0, 0)) == 0.0
+
+
+HEADER = "Livro do Jogador - Capitulo 3"  # 30 characters, 26 other than whitespace
+
+
+def test_a_scan_under_a_digital_running_header_is_an_image_page_and_a_full_text_layer_over_a_scan_is_text(
+    tmp_path: Path,
+) -> None:
+    blank = pdfs.raster_page(blank=True)
+    pdfs.scanned(tmp_path / "header.pdf", [blank], header=HEADER)
+    pdfs.scanned(tmp_path / "long.pdf", [blank], header=SENTENCE * 8)  # 248 characters other than whitespace
+    pdfs.scanned(tmp_path / "caption.pdf", [blank], header=HEADER, cover=0.5)  # an image over a quarter of the page
+    joined = pikepdf.Pdf.new()
+    for name in ("header.pdf", "long.pdf", "caption.pdf"):
+        with pikepdf.Pdf.open(tmp_path / name) as part:
+            joined.pages.extend(part.pages)
+    joined.save(tmp_path / "source.pdf")
+
+    result = sandbox.run_child(
+        Path(triage.__file__), ["source.pdf", "out", "1", "1", "3"], folder=tmp_path, cancel=threading.Event()
+    )
+
+    assert result.returncode == 0, result
+    assert json.loads((tmp_path / "out" / triage.MANIFEST).read_text(encoding="utf-8")) == {
+        "pages": [{"page": 1, "layer": "image"}, {"page": 2, "layer": "text"}, {"page": 3, "layer": "text"}]
+    }
+    # The same in this process, so coverage sees it.
+    assert triage.main(["triage.py", str(tmp_path / "source.pdf"), str(tmp_path / "here"), "1", "1", "3"]) == 0
+    assert (tmp_path / "here" / triage.MANIFEST).read_text(encoding="utf-8") == (
+        tmp_path / "out" / triage.MANIFEST
+    ).read_text(encoding="utf-8")

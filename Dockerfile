@@ -79,6 +79,8 @@ COPY --from=build /opt/docling-models /opt/docling-models
 # The application comes from the test stage, so the image exists only when the tests passed.
 COPY --from=test /workspace/gmshield_worker /app/gmshield_worker
 COPY --from=test /workspace/tests/image /app/tests/image
+# The scanned pages the image checks read by OCR (Story 1.17) are drawn by the tests' own helper.
+COPY --from=test /workspace/tests/__init__.py /workspace/tests/pdfs.py /app/tests/
 RUN python -m compileall -q /app/gmshield_worker
 WORKDIR /app
 ENV PATH=/opt/venv/bin:$PATH \
