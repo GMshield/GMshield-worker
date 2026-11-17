@@ -5,6 +5,8 @@
 - `STEP_FAILED`: anything else (the child crashed or ran past its deadline, a transfer failed): the backend retries
   while attempts remain.
 - `STAGE_UNKNOWN`: a stage or format this worker does not run (`retry: false`).
+- `PIPELINE_CHANGED` (Story 1.16): the chain was started by another pipeline version than this worker's
+  (`retry: false`); the backend restarts the chain from the cleaned original.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ PASSWORD_REQUIRED = "ingestion.password_required"  # noqa: S105 - a failure code
 FILE_UNREADABLE = "ingestion.file_unreadable"
 STEP_FAILED = "ingestion.step_failed"
 STAGE_UNKNOWN = "ingestion.stage_unknown"
+PIPELINE_CHANGED = "ingestion.pipeline_changed"
 
 
 class StepFailed(Exception):

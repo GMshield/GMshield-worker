@@ -211,3 +211,17 @@ def everything(path: Path) -> bytes:
                     found.append(item.read_raw_bytes())
             found.append(repr(item).encode("utf-8", "replace"))
     return b"\n".join(found)
+
+
+def with_text(path: Path, texts: list[str]) -> Path:
+    """One page per entry of `texts`, each drawing that text (an empty one draws nothing: a page with no text layer,
+    as a scan has)."""
+    pdf = Pdf.new()
+    font = pdf.make_indirect(Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica))
+    for text in texts:
+        pdf.add_blank_page(page_size=(300, 300))
+        page = pdf.pages[-1]
+        page.obj.Resources = Dictionary(Font=Dictionary(F1=font))
+        page.obj.Contents = pdf.make_indirect(_page_text(pdf, text) if text else pikepdf.Stream(pdf, b""))
+    pdf.save(path)
+    return path
