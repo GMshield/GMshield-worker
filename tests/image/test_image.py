@@ -206,6 +206,8 @@ def test_the_triage_and_layout_children_read_two_columns_and_a_table_offline_in_
     heading, left, right, second, table = blocks
     assert heading["text"] == "Chapter One: The Rules"
     assert heading["headingLevel"] == 1
+    # The 14-point sub-heading sits under the 20-point heading: Docling infers its level from the font size.
+    assert second["headingLevel"] > heading["headingLevel"], (heading, second)
     # Reading order: the whole left column, then the whole right one.
     assert left["text"] == " ".join(LEFT_COLUMN)
     assert right["text"] == " ".join(RIGHT_COLUMN)

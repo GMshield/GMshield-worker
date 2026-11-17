@@ -287,7 +287,8 @@ def retried(job: ClaimedJob) -> ClaimedJob:
 def test_a_step_of_a_chain_started_by_another_pipeline_fails_at_once_before_any_download(
     stand_in: StandIn, tmp_path: Path
 ) -> None:
-    for stage in ("triage", "layout"):
+    # "ocr" is a stage this worker does not run: under another pipeline it is still a pipeline change.
+    for stage in ("triage", "layout", "ocr"):
         job = claim(stand_in, b"%PDF-1.7\n", step_input(stage, 21, 25, pipelineVersion="1"))
 
         outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())

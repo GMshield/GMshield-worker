@@ -7,7 +7,8 @@ Run only through the sandbox (`sandbox.py`), as a script in isolated mode, insid
 SOURCE is a page batch whose first page is page OFFSET of the version; FIRST to LAST (inclusive, numbered as in the
 version) are the pages to read. The child's environment is empty, so everything Docling needs comes on the command
 line: ARTIFACTS is the folder of its layout and table models (baked into the image: nothing is downloaded) and THREADS
-the number of threads torch and Docling may use. Docling runs without OCR (`do_ocr=False`) and with table structure.
+the number of threads torch and Docling may use. Docling runs without OCR (`do_ocr=False`), with table structure, and
+infers heading levels (from the PDF's bookmarks, numbering and font style).
 
 It imports Docling, torch and the standard library only (never `gmshield_worker`), holds no credential, reaches no
 network, and writes only under OUT_DIR: one `page-NNNNNNN.json` per page read, and `manifest.json` listing them,
@@ -124,7 +125,7 @@ def convert(source: Path, first: int, last: int, artifacts: Path, threads: int) 
     torch.set_num_threads(threads)
     from docling.datamodel.accelerator_options import AcceleratorOptions  # noqa: PLC0415
     from docling.datamodel.base_models import InputFormat  # noqa: PLC0415
-    from docling.datamodel.pipeline_options import PdfPipelineOptions  # noqa: PLC0415
+    from docling.datamodel.pipeline_options import HeadingHierarchyOptions, PdfPipelineOptions  # noqa: PLC0415
     from docling.document_converter import DocumentConverter, PdfFormatOption  # noqa: PLC0415
 
     options = PdfPipelineOptions(
@@ -132,6 +133,8 @@ def convert(source: Path, first: int, last: int, artifacts: Path, threads: int) 
         do_ocr=False,
         do_table_structure=True,
         generate_parsed_pages=True,
+        # Heading levels from the bookmarks, numbering and font style: off by default, every heading is level 1.
+        heading_hierarchy_options=HeadingHierarchyOptions(enabled=True),
         accelerator_options=AcceleratorOptions(num_threads=threads, device="cpu"),
     )
     converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)})

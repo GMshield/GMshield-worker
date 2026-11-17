@@ -279,13 +279,14 @@ class IngestionStep:
         log = TraceLog(UNIT, job.trace_id)
         job_id = str(job.job_id)
         stage = job.input.get("stage")
+        # The chain's pipeline first: another pipeline's stage is a pipeline change (a restart), not an unknown stage.
+        chain = job.input.get("pipelineVersion")
+        if chain is not None and chain != PIPELINE_VERSION:
+            log.warn("ingestion.pipeline_changed", jobId=job_id)
+            return Outcome.failed(PIPELINE_CHANGED, retry=False)
         if (stage, job.input.get("format")) not in STAGES:
             log.warn("ingestion.stage_unknown", jobId=job_id)
             return Outcome.failed(STAGE_UNKNOWN, retry=False)
-        chain = job.input.get("pipelineVersion")
-        if chain is not None and chain != PIPELINE_VERSION:
-            log.warn("ingestion.pipeline_changed", jobId=job_id, stage=stage)
-            return Outcome.failed(PIPELINE_CHANGED, retry=False)
         try:
             checked = step_input(job.input)
         except StepFailed as failed:

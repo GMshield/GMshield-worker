@@ -166,3 +166,43 @@ def test_the_child_runs_in_its_sandbox(tmp_path: Path) -> None:
     assert result.returncode == 0, result
     manifest = json.loads((tmp_path / "out" / text.MANIFEST).read_text(encoding="utf-8"))
     assert manifest["pageTotal"] == 3
+
+
+def test_setext_headings_start_a_page_with_their_title_under_the_new_path(tmp_path: Path) -> None:
+    document = (
+        "Intro.\n\nPart One\n========\n\nText one.\n\nSection A\n---------\nText A.\n\nSection B\n  ---\nText B.\n"
+    )
+
+    status, _manifest, pages = run(tmp_path, document.encode("utf-8"))
+
+    assert status == 0
+    assert whole(pages) == document
+    assert [(page["headingPath"], page["text"].splitlines()[0]) for page in pages] == [
+        ([], "Intro."),
+        (["Part One"], "Part One"),
+        (["Part One", "Section A"], "Section A"),
+        (["Part One", "Section B"], "Section B"),
+    ]
+
+
+def test_a_dash_line_after_a_blank_line_or_in_code_is_no_heading(tmp_path: Path) -> None:
+    document = "# Top\n\nText.\n\n---\n\n```\nNot a title\n---\n```\n----\n---\n    Indented\n---\nEnd\n"
+
+    status, _manifest, pages = run(tmp_path, document.encode("utf-8"))
+
+    assert status == 0
+    assert whole(pages) == document
+    assert [page["headingPath"] for page in pages] == [["Top"]]
+
+
+def test_a_line_held_for_a_setext_underline_never_grows_past_a_page(tmp_path: Path) -> None:
+    title = "t" * 2500
+    document = "x" * 2900 + "\n" + title + "\n===\n" + "y" * 5000 + "\n"
+
+    status, _manifest, pages = run(tmp_path, document.encode("ascii"))
+
+    assert status == 0
+    assert whole(pages) == document
+    assert pages[0]["headingPath"] == []
+    assert pages[1]["headingPath"] == [title]
+    assert pages[1]["text"].startswith(title + "\n===\n")

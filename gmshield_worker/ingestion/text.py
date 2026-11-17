@@ -8,8 +8,9 @@ FORMAT is `txt` or `markdown`. The file is streamed, never held whole: it is dec
 mark dropped) or, when its bytes are not valid UTF-8, as cp1252 (the five bytes cp1252 leaves undefined become
 U+FFFD). Its text is cut into pages of at most `PAGE_LIMIT` code points:
 
-- in Markdown, every ATX heading (`#` to `######`, outside fenced code) starts a page, and each page carries its
-  heading path (the titles of the headings it sits under, outermost first); plain text has no headings;
+- in Markdown, every heading outside fenced code starts a page: ATX (`#` to `######`) and setext (a paragraph line
+  underlined with `=` for level 1 or `-` for level 2); each page carries its heading path (the titles of the headings
+  it sits under, outermost first); plain text has no headings;
 - a section longer than the limit is cut at its last blank line that fits, else at its last line end, else at its last
   whitespace, else at the limit itself.
 
@@ -40,6 +41,8 @@ FORMATS = frozenset({"txt", MARKDOWN})
 
 _HEADING = re.compile(r" {0,3}(#{1,6})(?:[ \t]+(.*?))??(?:[ \t]+#+)?[ \t]*\r?\n?")
 _FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+_UNDERLINE = re.compile(r" {0,3}(=+|-+)[ \t]*\r?\n?")
+_INDENT = re.compile(r" {0,3}\S")
 _BLANK_LINE = re.compile(r"\n[ \t\r\f\v]*\n")
 
 
@@ -196,14 +199,37 @@ def _closes(piece: str, opened: re.Match[str], fence: str) -> bool:
     return opened[1][0] == fence[0] and len(opened[1]) >= len(fence) and not piece[opened.end() :].strip()
 
 
+def _title(piece: str, at_start: bool, limit: int) -> bool:
+    """Whether a piece is a whole line that could be the title of a setext heading: a paragraph line, not blank,
+    indented at most 3 spaces, not itself a line of `=` or `-` (the caller has ruled out fences and ATX headings)."""
+    whole = piece.endswith("\n") or len(piece) < limit
+    return at_start and whole and _INDENT.match(piece) is not None and _UNDERLINE.fullmatch(piece) is None
+
+
 def paginate(chunks: Iterator[str], markdown: bool, pager: Pager) -> int:
-    """Feeds the text to `pager`, starting a page at each Markdown heading; returns the page count."""
+    """Feeds the text to `pager`, starting a page at each Markdown heading; returns the page count.
+
+    ATX headings (`# Title`) start a page at once. For setext headings (a paragraph line, then a line of only `=` for
+    level 1 or `-` for level 2), each paragraph line is held back until the next line shows whether it is a title, so
+    the title starts its page under the new path; at most one line is held. A `---` line after a blank line (or after
+    anything not held) stays a thematic break."""
     if not markdown:
         for piece in pieces(chunks, pager.limit):
             pager.add(piece)
         return pager.close()
     fence: str | None = None
+    held: str | None = None
     for piece, at_start in lines(chunks, pager.limit):
+        if held is not None:
+            underline = _UNDERLINE.fullmatch(piece) if at_start else None
+            if underline:
+                pager.heading(1 if underline[1][0] == "=" else 2, held.strip())
+                pager.add(held)
+                pager.add(piece)
+                held = None
+                continue
+            pager.add(held)
+            held = None
         if at_start:
             opened = _FENCE.match(piece)
             if fence is not None:
@@ -213,7 +239,12 @@ def paginate(chunks: Iterator[str], markdown: bool, pager: Pager) -> int:
                 fence = opened[1]
             elif heading := _HEADING.fullmatch(piece):
                 pager.heading(len(heading[1]), (heading[2] or "").strip())
+            elif _title(piece, at_start, pager.limit):
+                held = piece
+                continue
         pager.add(piece)
+    if held is not None:
+        pager.add(held)
     return pager.close()
 
 
