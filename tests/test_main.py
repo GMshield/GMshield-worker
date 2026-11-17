@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import signal
 import socket
@@ -138,7 +139,7 @@ def test_old_backend(stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFi
     incompatible = [line for line in lines if line["event"] == "backend.incompatible"]
     assert len(incompatible) == 1
     assert incompatible[0]["backendContractVersion"] == "0.9.0"
-    assert incompatible[0]["minimumContractVersion"] == "1.1.0"
+    assert incompatible[0]["minimumContractVersion"] == "1.2.0"
     assert not any(line["event"] == "worker.ready" for line in lines)
 
 
@@ -147,7 +148,7 @@ def test_an_old_backend_that_is_upgraded_becomes_healthy(stand_in: StandIn, tmp_
     health_file = tmp_path / "healthy"
     with running(mode_env(stand_in, tmp_path), health_file):
         wait_for(lambda: len(stand_in.requests) >= 2)
-        stand_in.version = "1.1.0"
+        stand_in.version = "1.2.0"
         wait_for(lambda: health.is_healthy(health_file))
         stand_in.version = "0.9.0"
         wait_for(lambda: not health_file.exists())
@@ -390,7 +391,7 @@ def test_the_lanes_start_after_the_first_compatible_answer_and_stop_at_the_end(
     with running(mode_env(stand_in, tmp_path), health_file, lanes=lanes):
         wait_for(lambda: len(stand_in.requests) >= 3)
         assert lanes.events == []  # an older backend: nothing is claimed from it
-        stand_in.version = "1.1.0"
+        stand_in.version = "1.2.0"
         wait_for(lambda: health.is_healthy(health_file))
         wait_for(lambda: len(stand_in.requests) >= 6)  # re-checked, never started twice
         assert lanes.events == ["start"]
@@ -419,3 +420,51 @@ def test_a_wrong_credential_is_an_unexpected_answer_and_never_logged(
     assert unexpected
     assert unexpected[0]["status"] == 401
     assert "not-a-secret" not in output
+
+
+# ---- Story 1.15: non-dumpable, and the work folder's sweep
+
+
+class FakeSweep:
+    def __init__(self, events: list[str], work_dir: str) -> None:
+        self.events = events
+        events.append(f"sweep:{work_dir}")
+
+    def start(self) -> None:
+        self.events.append("sweep.start")
+
+    def stop(self) -> None:
+        self.events.append("sweep.stop")
+
+
+def test_the_worker_makes_itself_non_dumpable_before_anything_else_and_runs_the_sweep(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    events: list[str] = []
+    health_file = tmp_path / "healthy"
+    with running(
+        mode_env(stand_in, tmp_path),
+        health_file,
+        sweep_factory=lambda work_dir, _trace: FakeSweep(events, work_dir),
+    ):
+        wait_for(lambda: health.is_healthy(health_file))
+        assert libc.prctl(3, 0, 0, 0, 0) == 0  # PR_GET_DUMPABLE: no longer dumpable
+    assert events == [f"sweep:{tmp_path / 'work'}", "sweep.start", "sweep.stop"]
+
+
+def test_a_worker_that_cannot_become_non_dumpable_refuses_to_start(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def refused() -> None:
+        raise OSError(1, "refused")
+
+    status = main.run(
+        {"GMSHIELD_MODE": "test"},
+        threading.Event(),
+        health_file=tmp_path / "healthy",
+        lanes_factory=no_lanes,
+        non_dumpable=refused,
+    )
+    assert status == 78
+    assert log_lines(capsys.readouterr().err)[-1]["reason"] == "process.dumpable"

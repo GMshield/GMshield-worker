@@ -1,4 +1,4 @@
-"""Story 1.12 against a real Redis (test mode: `redis:6379`, or `GMSHIELD_REDIS_HOST` and
+"""Stories 1.12 and 1.15 against a real Redis (test mode: `redis:6379`, or `GMSHIELD_REDIS_HOST` and
 `GMSHIELD_REDIS_PORT`), with the stand-in internal API in process. The worker connects as an
 account with exactly the production ACL (GMshield-pipeline `deploy/data-credentials.sh`), so any
 other command it sent would fail here. The test itself plays the backend's part in Redis: it
@@ -14,18 +14,23 @@ import os
 import secrets
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 import redis
 
 from gmshield_worker.backend.client import JobsApi
+from gmshield_worker.backend.files import JobFiles
+from gmshield_worker.ingestion import step
 from gmshield_worker.lanes import ingestion, interactive, probe
 from gmshield_worker.lanes.consumer import Lane
+from gmshield_worker.lanes.handlers import Handler
 from gmshield_worker.lanes.streams import GROUP, RedisWorkStream, connect
 from gmshield_worker.log import new_trace_id
 from gmshield_worker.settings import RedisSettings
+from tests import pdfs
 from tests.conftest import StandIn, log_lines
 
 HOST = os.environ.get("GMSHIELD_REDIS_HOST") or "redis"
@@ -78,14 +83,18 @@ def wait_for(condition: Callable[[], bool], timeout: float = 10.0) -> None:
 
 @contextmanager
 def lane(
-    client: redis.Redis, stand_in: StandIn, stream: str = interactive.STREAM, take_over_after_ms: int = 120_000
+    client: redis.Redis,
+    stand_in: StandIn,
+    stream: str = interactive.STREAM,
+    take_over_after_ms: int = 120_000,
+    handlers: Mapping[str, Handler] | None = None,
 ) -> Iterator[Lane]:
     running = Lane(
         "interactive" if stream == interactive.STREAM else "ingestion",
         RedisWorkStream(client, stream),
         capacity=2,
         api=JobsApi(stand_in.url, "w" * 64),
-        handlers={probe.KIND: probe.run},
+        handlers=handlers or {probe.KIND: probe.run},
         consumer=f"it-{secrets.token_hex(4)}",
         trace_id=new_trace_id(),
         stop=threading.Event(),
@@ -182,3 +191,30 @@ def test_the_workers_account_cannot_add_trim_or_create_groups(admin: redis.Redis
         with pytest.raises(redis.exceptions.NoPermissionError):
             command()
     assert worker_redis.ping()
+
+
+def test_an_ingestion_step_offered_on_its_stream_is_cleaned_in_the_sandbox_and_reported(
+    admin: redis.Redis, worker_redis: redis.Redis, stand_in: StandIn, tmp_path: Path
+) -> None:
+    create_groups(admin)
+    stand_in.credential = "w" * 64
+    source = pdfs.active(tmp_path / "active.pdf", page_count=21)
+    job_id = stand_in.offer(
+        step.KIND,
+        {"stage": "clean", "format": "pdf", "input": "source"},
+        new_trace_id(),
+        {"source": source.read_bytes()},
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    handler = step.IngestionStep(JobFiles(stand_in.url, "w" * 64), str(work))
+    with lane(worker_redis, stand_in, stream=ingestion.STREAM, handlers={step.KIND: handler}):
+        admin.xadd(ingestion.STREAM, {"job": job_id})
+        wait_for(lambda: stand_in.jobs[job_id].state == "done", 60)
+        wait_for(lambda: pending(admin, ingestion.STREAM) == 0)
+    result = stand_in.jobs[job_id].outcomes[0]["result"]
+    assert result["pageTotal"] == 21
+    assert [(batch["firstPage"], batch["lastPage"]) for batch in result["batches"]] == [(1, 20), (21, 21)]
+    assert len(stand_in.outputs) == 3
+    assert all(pdfs.EMBEDDED_MARKER not in sent for sent in stand_in.outputs.values())
+    assert list(work.iterdir()) == []

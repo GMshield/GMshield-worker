@@ -1,6 +1,9 @@
 """The worker's supervisor: `python -m gmshield_worker.main`.
 
 Start-up order:
+  0. Make the process non-dumpable (`PR_SET_DUMPABLE 0`, Story 1.15): no child it starts can read
+     its memory or `/proc/<pid>/environ`, which holds the worker's credential. Refused, the start
+     stops with exit status 78.
   1. Check the settings. Outside test mode a missing secret or setting stops the start with exit
      status 78 and one `startup.refused` line that names the settings, never a value.
   2. Empty the work folder (its contents, never the folder; links are not followed). A folder
@@ -10,6 +13,9 @@ Start-up order:
      with exponential backoff (1 s up to 30 s, with jitter, 2 s per attempt) until it answers.
   4. After the first compatible answer, start both work lanes (Story 1.12): the interactive lane,
      then the ingestion lane (`gmshield_worker.lanes`).
+
+From step 2 on, a sweep thread removes, every 2 minutes, what no running step holds in the work
+folder and was last changed more than 10 minutes ago (`workdir.WorkDirSweep`).
 
 The worker is healthy only after a compatible answer, and re-checks every 30 s. Against an older
 backend it logs both versions once, stays up, unhealthy, and keeps checking. SIGTERM (or SIGINT)
@@ -36,11 +42,12 @@ from typing import Any, Protocol
 from gmshield_worker import health
 from gmshield_worker.backend.client import VersionAnswer, fetch_contract_version
 from gmshield_worker.backend.contract import MINIMUM_BACKEND_CONTRACT_VERSION, meets_minimum, parse_version
+from gmshield_worker.ingestion.sandbox import SandboxUnavailable, make_non_dumpable
 from gmshield_worker.lanes import build_lanes
 from gmshield_worker.log import log_event, new_trace_id
 from gmshield_worker.models import select_model_client
 from gmshield_worker.settings import WORK_DIR, Settings, SettingsRefused, check_settings
-from gmshield_worker.workdir import WorkDirUnusable, empty_work_dir
+from gmshield_worker.workdir import WorkDirSweep, WorkDirUnusable, empty_work_dir
 
 UNIT = "worker.supervisor"
 # Exit status of a refused start (EX_CONFIG), the same as the backend's and the frontend's.
@@ -62,6 +69,7 @@ class Startable(Protocol):
 
 
 type LanesFactory = Callable[[Settings, str], Startable]
+type SweepFactory = Callable[[str, str], Startable]
 
 
 class Stop(Protocol):
@@ -204,9 +212,16 @@ def run(
     backoff_initial: float = BACKOFF_INITIAL_SECONDS,
     recheck_seconds: float = RECHECK_SECONDS,
     lanes_factory: LanesFactory = build_lanes,
+    sweep_factory: SweepFactory = WorkDirSweep,
+    non_dumpable: Callable[[], None] = make_non_dumpable,
 ) -> int:
     """Runs the worker until `stop` is set. Returns the exit status."""
     trace_id = new_trace_id()
+    try:
+        non_dumpable()
+    except SandboxUnavailable, OSError:
+        log_event("ERROR", UNIT, "startup.refused", trace_id, reason="process.dumpable", settings=[])
+        return REFUSED_EXIT_STATUS
     health.mark_unhealthy(health_file)
     try:
         settings = check_settings(environment)
@@ -232,6 +247,8 @@ def run(
         log_event("ERROR", UNIT, "startup.refused", trace_id, reason="workdir.unusable", settings=[WORK_DIR])
         return REFUSED_EXIT_STATUS
 
+    sweep = sweep_factory(settings.work_dir, trace_id)
+    sweep.start()
     lanes = lanes_factory(settings, trace_id)
     try:
         Supervisor(
@@ -247,6 +264,7 @@ def run(
         ).run()
     finally:
         lanes.stop()
+        sweep.stop()
     log_event("INFO", UNIT, "worker.stopped", trace_id)
     return 0
 

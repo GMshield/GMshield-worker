@@ -4,8 +4,10 @@
 
 Tesseract lists Portuguese and English, and Docling converts a small generated PDF with the
 layout and table models baked into the image (HF_HUB_OFFLINE=1, DOCLING_ARTIFACTS_PATH), with
-Tesseract as its OCR engine. The file runs as a plain script (the image has no pytest); pytest
-collects it too, but `pyproject.toml` leaves `tests/image` out of the ordinary test run.
+Tesseract as its OCR engine. Since Story 1.15 the clean stage's child runs in its sandbox
+(isolated, with pikepdf from the image's environment and no network socket). The file runs as a
+plain script (the image has no pytest); pytest collects it too, but `pyproject.toml` leaves
+`tests/image` out of the ordinary test run.
 """
 
 from __future__ import annotations
@@ -88,10 +90,31 @@ def test_worker_folders_are_private_and_writable() -> None:
         probe.unlink()
 
 
+def test_the_clean_child_runs_in_its_sandbox() -> None:
+    import json
+    import threading
+
+    from gmshield_worker.ingestion import clean, sandbox
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as name:
+        folder = Path(name)
+        (folder / "source.pdf").write_bytes(sample_pdf())
+        result = sandbox.run_child(Path(clean.__file__), ["source.pdf", "out"], folder=folder, cancel=threading.Event())
+        assert result.returncode == 0, result
+        assert json.loads((folder / "out" / "manifest.json").read_text(encoding="utf-8"))["pageTotal"] == 1
+        (folder / "dial.py").write_text(
+            "import socket\ntry:\n    socket.socket(socket.AF_INET, socket.SOCK_STREAM)\nexcept PermissionError:\n"
+            "    raise SystemExit(13)\n",
+            encoding="ascii",
+        )
+        assert sandbox.run_child(folder / "dial.py", [], folder=folder, cancel=threading.Event()).returncode == 13
+
+
 def main() -> int:
     failures = 0
     checks = (
         test_worker_folders_are_private_and_writable,
+        test_the_clean_child_runs_in_its_sandbox,
         test_tesseract_lists_portuguese_and_english,
         test_docling_converts_offline,
     )

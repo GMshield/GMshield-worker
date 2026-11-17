@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -140,3 +141,77 @@ def test_a_removal_error_is_logged_and_the_rest_continues(
     assert failure["errorType"] == "PermissionError"
     assert "stuck.txt" not in output
     assert "secret content" not in output
+
+
+# ---- Story 1.15: a step's own folder and the sweep
+
+
+def test_a_step_folder_is_private_and_erased_when_the_step_ends(tmp_path: Path) -> None:
+    with workdir.step_folder(str(tmp_path), "job-1", TRACE) as folder:
+        assert folder == tmp_path / "job-1"
+        assert folder.stat().st_mode & 0o777 == 0o700
+        (folder / "out").mkdir()
+        (folder / "out" / "batch.pdf").write_bytes(b"%PDF")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_step_folder_is_erased_when_the_step_fails_and_what_an_earlier_attempt_left_goes_first(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "job-1").mkdir()
+    (tmp_path / "job-1" / "stale.pdf").write_bytes(b"left by a crash")
+    with pytest.raises(RuntimeError, match="boom"), workdir.step_folder(str(tmp_path), "job-1", TRACE) as folder:
+        assert list(folder.iterdir()) == []
+        (folder / "source.pdf").write_bytes(b"%PDF")
+        raise RuntimeError("boom")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_step_folder_is_one_plain_name_used_once_at_a_time(tmp_path: Path) -> None:
+    for bad in ("", "a/b", "..", "."):
+        with pytest.raises(ValueError, match="plain name"), workdir.step_folder(str(tmp_path), bad, TRACE):
+            pass
+    with workdir.step_folder(str(tmp_path), "job-1", TRACE):
+        with pytest.raises(RuntimeError, match="in use"), workdir.step_folder(str(tmp_path), "job-1", TRACE):
+            pass
+        assert (tmp_path / "job-1").is_dir()
+    assert not (tmp_path / "job-1").exists()
+
+
+def test_the_sweep_removes_old_entries_but_never_a_running_step_or_a_recent_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    old = time.time() - 601
+    for name in ("old-folder", "old-file", "running", "recent"):
+        path = tmp_path / name
+        if name.endswith("file"):
+            path.write_bytes(b"x")
+        else:
+            path.mkdir()
+            (path / "inner.pdf").write_bytes(b"x")
+        if name != "recent":
+            os.utime(path, (old, old))
+    (tmp_path / "old-link").symlink_to(tmp_path / "recent")
+    os.utime(tmp_path / "old-link", (old, old), follow_symlinks=False)
+
+    with workdir.step_folder(str(tmp_path), "running", TRACE) as running:
+        os.utime(running, (old, old))
+        assert workdir.sweep_once(str(tmp_path), TRACE) == 3
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["recent", "running"]
+    assert (tmp_path / "recent" / "inner.pdf").exists()
+    assert log_lines(capsys.readouterr().out)[-1]["event"] == "workdir.swept"
+    assert workdir.sweep_once(str(tmp_path / "missing"), TRACE) == 0
+
+
+def test_the_sweep_thread_runs_on_its_interval_and_stops(tmp_path: Path) -> None:
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    sweep = workdir.WorkDirSweep(str(tmp_path), TRACE, every=0.05, older_than=0)
+    sweep.start()
+    deadline = time.monotonic() + 5
+    while stale.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    sweep.stop()
+    assert not stale.exists()
+    assert workdir.SWEEP_EVERY_SECONDS == 120
+    assert workdir.SWEEP_OLDER_THAN_SECONDS == 600

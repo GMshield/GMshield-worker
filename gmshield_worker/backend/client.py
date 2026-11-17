@@ -126,19 +126,21 @@ class Answer:
 
 @dataclass(frozen=True)
 class Outcome:
-    """How an attempt ended: `done` with an optional result, or `failed` with an optional code."""
+    """How an attempt ended: `done` with an optional result, or `failed` with an optional code and, since contract
+    1.2.0, `retry=False` for a failure no other attempt can change (the backend then ends the job at once)."""
 
     outcome: Literal["done", "failed"]
     code: str | None = None
     result: dict[str, Any] | None = None
+    retry: bool | None = None
 
     @staticmethod
     def done(result: dict[str, Any] | None = None) -> Outcome:
         return Outcome("done", None, result)
 
     @staticmethod
-    def failed(code: str) -> Outcome:
-        return Outcome("failed", code, None)
+    def failed(code: str, *, retry: bool | None = None) -> Outcome:
+        return Outcome("failed", code, None, retry)
 
 
 def _code(parsed: object) -> str | None:
@@ -193,6 +195,8 @@ class JobsApi:
             body.code = outcome.code
         if outcome.result is not None:
             body.result = JobOutcomeResult.from_dict(outcome.result)
+        if outcome.retry is not None:
+            body.retry = outcome.retry
         with self._client(job.trace_id) as client:
             response = report_job_outcome.sync_detailed(
                 job.job_id, job.claim_id, client=client, body=body, x_job_grant=job.grant

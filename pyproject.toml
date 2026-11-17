@@ -13,6 +13,7 @@ dependencies = [
     "httpx==0.28.1",
     "attrs==26.1.0",  # imported by the generated client
     "redis==8.1.0",  # the work streams (Story 1.12)
+    "pikepdf==10.17.0",  # the clean stage (Story 1.15): qpdf, MPL-2.0; never PyMuPDF (AGPL)
 ]
 
 [dependency-groups]
