@@ -132,18 +132,15 @@ def removal_input(raw: dict[str, Any]) -> tuple[str, str]:
 
 def read_passages(body: bytes) -> list[Passage]:
     """The run's JSON Lines, each `{id, ordinal, page, title, text}`, in order with no id twice; `InputInvalid`
-    otherwise."""
-    try:
-        lines = body.decode("utf-8").splitlines()
-    except UnicodeDecodeError as error:
-        raise InputInvalid from error
+    otherwise. Lines end at `\n` only: a text may hold U+2028, U+0085 and other Unicode line breaks, which JSON
+    writes unescaped."""
     found: list[Passage] = []
-    for line in lines:
+    for line in body.split(b"\n"):
         if not line.strip():
             continue
         try:
-            item = json.loads(line)
-        except ValueError as error:
+            item = json.loads(line.decode("utf-8"))
+        except ValueError as error:  # UnicodeDecodeError is a ValueError
             raise InputInvalid from error
         if not isinstance(item, dict):
             raise InputInvalid

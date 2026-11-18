@@ -456,6 +456,19 @@ def test_passages_that_are_not_the_backends_are_refused(body: bytes) -> None:
         indexing.read_passages(body)
 
 
+def test_a_passage_holding_unicode_line_breaks_is_one_line() -> None:
+    text = "Primeira linha\u2028segunda\u0085terceira\u2029fim\r"
+    body = json.dumps(
+        {"id": "0195a3c0-0000-7000-8000-000000000001", "ordinal": 0, "page": 1, "title": "T\u2028x", "text": text},
+        ensure_ascii=False,
+    ).encode()
+    assert "\u2028".encode() in body
+
+    found = indexing.read_passages(body + b"\n")
+
+    assert [(passage.text, passage.title) for passage in found] == [(text, "T\u2028x")]
+
+
 def test_a_cancelled_change_stops_before_its_next_batch(stand_in: StandIn) -> None:
     fake = FakeOllama()
     cancel = threading.Event()
