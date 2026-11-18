@@ -113,7 +113,7 @@ class Embedder:
             return found
 
     def _parts(self, client: httpx.Client, title: str, text: str, *, depth: int) -> list[Vector]:
-        """The vectors of the passage's parts: itself when it fits, else its halves' parts, at most `MAX_SPLITS` deep."""
+        """The vectors of the passage's parts: itself when it fits, else its halves' parts, `MAX_SPLITS` deep."""
         try:
             return self._call(client, [embedding_input(title, text)])
         except _TooLong:
