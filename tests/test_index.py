@@ -169,6 +169,13 @@ def test_a_passage_still_refused_after_four_splits_fails_without_a_retry() -> No
     assert 1 < len(fake.calls) <= 1 + 31
 
 
+def test_a_vector_with_no_length_is_refused_as_retryable_unavailability() -> None:
+    for vector in ([0.0] * embedding.DIMENSIONS, [math.inf] + [0.0] * (embedding.DIMENSIONS - 1)):
+        with pytest.raises(embedding.EmbeddingFailed) as refused:
+            embedding.normalized(vector)
+        assert (refused.value.code, refused.value.retry) == (embedding.EMBEDDING_UNAVAILABLE, True)
+
+
 @pytest.mark.parametrize(
     "fake",
     [FakeOllama(status=500), FakeOllama(status=404), FakeOllama(status=400), FakeOllama(dimensions=3)],
