@@ -1,17 +1,34 @@
 # GMshield pipeline contract (see GMshield-pipeline/templates/pipeline.toml for every option).
-# Inactive until a Dockerfile exists; until then only the source checks run.
 
 [service]
 name = "worker"
-port = 0                    # the worker consumes jobs from Redis and serves no HTTP (no DAST)
-health_path = "/"
+port = 0                    # the worker opens no listening port: no staging, no DAST
+health_path = "/"           # unused without a port; health is the image's HEALTHCHECK
 
 [build]
 test_target = "test"         # Dockerfile stage that runs the unit tests
 
 [dast]
 path = "/"
-openapi = ""                 # set to the OpenAPI path once it exists, for a ZAP API scan
+openapi = ""                 # no HTTP surface to scan
 
 [deploy]
-host_port = 0               # 127.0.0.1:<host_port> on roberto-server (0 = not published)
+host_port = 0               # the worker opens no port
+# Story 1.6 (AD-14): gmshield-work (the backend at http://gmshield-backend:8080, Redis, later Qdrant),
+# gmshield-model (Ollama on the network's gateway), gmshield-outbound (the model provider).
+networks = ["gmshield-work", "gmshield-model", "gmshield-outbound"]
+certs = true                # ~/gmshield-ci/certs/worker/ca.crt at /run/gmshield/certs: TLS to Redis (Qdrant later)
+read_only = true
+user = "10001:10001"
+cap_drop = ["ALL"]
+tmpfs = ["/tmp"]
+# Decrypted material lives only in the work folder (AD-21): a named volume, gmshield-worker-work,
+# in Docker's data on the encrypted volume (AD-24). The worker empties it at start.
+mounts = [{ name = "work", target = "/var/lib/gmshield-worker/work" }]
+
+[test]
+# Story 1.12: the integration tests (the lanes on the work streams, as the worker's production Redis account,
+# with the internal API stood in) run from the Dockerfile's `integration` stage with GMSHIELD_MODE=test, beside a
+# throwaway Redis at the test-mode host (redis:6379); exit 0 passes.
+target = "integration"
+services = ["redis"]

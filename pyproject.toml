@@ -1,0 +1,90 @@
+# GMshield worker. Every direct dependency is pinned exactly; uv.lock holds every transitive one.
+# Versions: the newest release at least two weeks old on 2026-11-13 (released by 2026-10-30).
+[project]
+name = "gmshield-worker"
+version = "0.1.0"
+description = "GMshield worker: ingestion, OCR, retrieval and model calls"
+requires-python = "==3.14.*"
+dependencies = [
+    "docling==2.145.0",
+    "torch==2.15.0",
+    "torchvision==0.29.2",
+    "anthropic==2.3.0",
+    "httpx==0.28.1",
+    "attrs==26.1.0",  # imported by the generated client
+    "redis==8.1.0",  # the work streams (Story 1.12)
+    "pikepdf==10.17.0",  # the clean stage (Story 1.15): qpdf, MPL-2.0; never PyMuPDF (AGPL)
+    "pypdfium2==5.14.0",  # the triage stage (Story 1.16): PDFium, Apache-2.0 or BSD-3-Clause; already under Docling
+    # The OCR stage (Story 1.17) imports these directly; each is the version already in the lock under Docling.
+    "opencv-python-headless==5.0.0.93",  # deskew; Apache-2.0
+    "numpy==2.5.4",
+    "pillow==13.0.0",  # the straightened page picture at 216 DPI
+    # The images stage (Story 1.21) decodes HEIC with it. BSD-3-Clause binding; its wheel bundles libheif and libde265
+    # (LGPL-3.0, decode only, no x265). Never pillow-heif, whose wheel bundles x265 (GPL).
+    "pi-heif==1.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "openapi-python-client==0.29.1",
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.13.6"
+# Every package, transitive ones included, was released on or before 2026-10-30.
+exclude-newer = "2026-10-31T00:00:00Z"
+# Security exception (Dalton, 2026-11-13): soupsieve 4.0.1 (released 2026-11-04) fixes
+# CVE-2026-126190 (HIGH) and is newer than the two-week rule allows. Remove this line once the
+# global date passes 2026-11-04.
+exclude-newer-package = { soupsieve = "2026-11-05T00:00:00Z" }
+
+# torch and torchvision come from the PyTorch CPU index: no CUDA wheels.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+extend-exclude = ["gmshield_worker/backend/generated"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PL"]
+ignore = ["PLR2004", "PLR0913"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S108", "PLC0415"]
+"tools/**" = ["S603"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+files = ["gmshield_worker", "tests", "tools"]
+exclude = ["gmshield_worker/backend/generated/"]
+
+[[tool.mypy.overrides]]
+module = ["gmshield_worker.backend.generated.*"]
+follow_imports = "silent"
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/image runs inside the production image, tests/integration beside a Redis (the Dockerfile's
+# `integration` stage, which overrides these options).
+addopts = "--strict-markers --ignore=tests/image --ignore=tests/integration"
+markers = ["image: runs only inside the production image"]
+
+[tool.coverage.run]
+source = ["gmshield_worker"]
+omit = ["gmshield_worker/backend/generated/*"]
+branch = true

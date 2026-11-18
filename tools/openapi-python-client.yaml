@@ -1,0 +1,7 @@
+# Settings of openapi-python-client for tools/generate_client.py.
+# The post hooks tidy the generated code with ruff (a development dependency). They run inside the
+# generated folder, which pyproject.toml excludes from lint, so ruff runs with --isolated here.
+literal_enums: true
+post_hooks:
+  - "ruff check . --isolated --fix-only --quiet --no-cache --select I,F401,UP"
+  - "ruff format . --isolated --quiet --no-cache"
