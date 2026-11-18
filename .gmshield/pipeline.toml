@@ -25,8 +25,10 @@ tmpfs = ["/tmp"]
 # Story 1.22 (measured on roberto-server 2026-11-18; docs/INFRASTRUCTURE.md, "Measured ingestion"):
 # memory = the largest peak outside page cache, 3,257 MiB (the SRD layout child's 3,103 MiB `childMaxRssKib`
 # plus the worker's 154 MiB `workerMaxRssKib`), x 1.3, rounded up to 256m. The container's memory.peak
-# (3,930 MiB) also counts page cache, which the kernel frees under a cap (Dalton, 2026-11-18). With Ollama
-# (about 0.7 GB) it fits ai.slice's 5,093 MiB limit.
+# (3,930 MiB) also counts page cache, which the kernel frees under a cap (Dalton, 2026-11-18). With Ollama's
+# anonymous memory (about 0.7 GB) the cap comes to 5,069 of ai.slice's 5,093 MiB: a thin margin, but the measured
+# worst case is about 3.9 GB, and at the slice's limit the kernel kills the worker before Ollama (OOMScoreAdjust
+# -500), as the cap would. Revisit when Ollama grows (Epic 2 embeddings).
 # cpus = 2, ai.slice's two threads: layout and OCR run 2 threads each (layout reached 3 CPUs uncapped).
 memory = "4352m"
 cpus = 2
