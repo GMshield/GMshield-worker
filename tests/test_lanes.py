@@ -396,7 +396,8 @@ def test_the_probe_stops_when_cancelled_and_refuses_bad_input() -> None:
 
 
 def test_ingestion_runs_in_every_mode_and_the_probe_in_test_mode_only() -> None:
-    assert set(handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))) == {"ingestion", "probe"}
+    index = {"index.change", "index.removal"}
+    assert set(handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))) == {"ingestion", "probe", *index}
     production = check_settings(
         {
             "GMSHIELD_BACKEND_URL": "http://b:8080",
@@ -405,9 +406,12 @@ def test_ingestion_runs_in_every_mode_and_the_probe_in_test_mode_only() -> None:
             "GMSHIELD_REDIS_HOST": "redis",
             "GMSHIELD_REDIS_USERNAME": "worker",
             "GMSHIELD_REDIS_PASSWORD": "p",
+            "GMSHIELD_OLLAMA_URL": "http://172.30.5.1:11434",
+            "GMSHIELD_QDRANT_URL": "https://qdrant:6333",
+            "GMSHIELD_QDRANT_API_KEY": "q",
         }
     )
-    assert set(handlers.handlers_for(production)) == {"ingestion"}
+    assert set(handlers.handlers_for(production)) == {"ingestion", *index}
 
 
 def test_both_lanes_start_interactive_first_and_stop_together() -> None:
@@ -459,4 +463,4 @@ def test_build_lanes_puts_the_interactive_lane_first_with_its_capacity() -> None
     assert second.stream.name == "gmshield:work:ingestion"
     assert first.consumer == second.consumer
     assert first.stop_event is second.stop_event is built.stop_event
-    assert set(first.handlers) == {"ingestion", "probe"}
+    assert set(first.handlers) == {"ingestion", "probe", "index.change", "index.removal"}

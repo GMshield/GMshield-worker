@@ -22,6 +22,9 @@ dependencies = [
     # The images stage (Story 1.21) decodes HEIC with it. BSD-3-Clause binding; its wheel bundles libheif and libde265
     # (LGPL-3.0, decode only, no x265). Never pillow-heif, whose wheel bundles x265 (GPL).
     "pi-heif==1.4.0",
+    # The index (Story 2.1): Apache-2.0, released 2026-10-22, the Qdrant server's own version. REST only: its gRPC and
+    # protobuf dependencies come along unused.
+    "qdrant-client==1.20.0",
 ]
 
 [dependency-groups]

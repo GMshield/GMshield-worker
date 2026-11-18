@@ -3,20 +3,24 @@ claims, renews and reports. `cancel` is set when the work must stop (the claim w
 lapsed, or the worker is stopping): a handler checks it and returns early, and the lane then
 reports nothing.
 
-`ingestion` (Story 1.15, `gmshield_worker.ingestion.step`) runs in every mode; `probe` in test
-mode only.
+`ingestion` (Story 1.15, `gmshield_worker.ingestion.step`), `index.change` and `index.removal` (Story 2.1,
+`gmshield_worker.retrieval.indexing`) run in every mode; `probe` in test mode only. The index handlers
+open a Qdrant client of their own for each job.
 """
 
 from __future__ import annotations
 
 import threading
 from collections.abc import Mapping
+from functools import partial
 from typing import Protocol
 
 from gmshield_worker.backend.client import ClaimedJob, Outcome
 from gmshield_worker.backend.files import JobFiles
 from gmshield_worker.ingestion import step
 from gmshield_worker.lanes import probe
+from gmshield_worker.retrieval import indexing, store
+from gmshield_worker.retrieval.embedding import Embedder
 from gmshield_worker.settings import Settings
 
 
@@ -25,9 +29,13 @@ class Handler(Protocol):
 
 
 def handlers_for(settings: Settings) -> Mapping[str, Handler]:
-    """The handlers this worker runs: ingestion steps always, the probe in test mode only."""
+    """The handlers this worker runs: ingestion steps and the index always, the probe in test mode only."""
+    files = JobFiles(settings.backend_url, settings.worker_credential)
+    stores = partial(store.passage_store, settings.index)
     found: dict[str, Handler] = {
-        step.KIND: step.IngestionStep(JobFiles(settings.backend_url, settings.worker_credential), settings.work_dir)
+        step.KIND: step.IngestionStep(files, settings.work_dir),
+        indexing.CHANGE: indexing.IndexChange(files, Embedder(settings.index.ollama_url), stores),
+        indexing.REMOVAL: indexing.IndexRemoval(stores),
     }
     if settings.test_mode:
         found[probe.KIND] = probe.run

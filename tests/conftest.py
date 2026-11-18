@@ -15,7 +15,10 @@ A failed outcome with `retry: false` ends the job at once, as the backend does. 
 outcome is checked against the backend's rules for a step report (`ingestion_result_valid`) and
 answered 400 `job.result_invalid` otherwise, so a renamed field fails the worker's tests. Since Story 1.18 that
 includes a next step over every text file (`input: "texts"`), and the passages and outline a report carries; since
-Story 1.19, the page views (`pageViews`), each picture an output of this job.
+Story 1.19, the page views (`pageViews`), each picture an output of this job. Since Story 2.1 a claim's body, when
+it has one, must state a recipe as the backend reads it (else 400), and each one is kept in `stated_recipes`; a done
+`index.change` outcome must report `indexRecipe` (`index_result_valid`). An index change's passages are an input like
+any other (`offer(inputs={"passages": ...})`).
 
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
@@ -75,7 +78,7 @@ class StandInJob:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.6.0"
+    version: str = "1.7.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -92,6 +95,7 @@ class StandIn:
     outputs: dict[str, bytes] = field(default_factory=dict)
     output_status: int | None = None
     wrong_sha256: bool = False
+    stated_recipes: list[str | None] = field(default_factory=list)
 
     def offer(
         self,
@@ -128,7 +132,14 @@ def problem(status: int, code: str) -> tuple[int, dict[str, Any]]:
     }
 
 
-def _claim(state: StandIn, job_id: str) -> tuple[int, dict[str, Any]]:
+RECIPE = re.compile(r"[A-Za-z0-9._-]{1,32}")
+
+
+def _claim(state: StandIn, job_id: str, body: bytes) -> tuple[int, dict[str, Any]]:
+    stated = json.loads(body).get("indexRecipe") if body else None
+    if stated is not None and (not isinstance(stated, str) or not RECIPE.fullmatch(stated)):
+        return problem(400, "request.invalid")
+    state.stated_recipes.append(stated)
     if state.claim_status is not None:
         return problem(state.claim_status, "server.unavailable")
     job = state.jobs.get(job_id)
@@ -185,7 +196,7 @@ def _input(state: StandIn, route: re.Match[str], headers: dict[str, str]) -> tup
 def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tuple[int, Any]:
     claims = CLAIMS.fullmatch(path)
     if claims:
-        return _claim(state, claims[1])
+        return _claim(state, claims[1], body)
     route = CLAIM_ROUTE.fullmatch(path)
     if route is None:
         return problem(404, "request.not_found")
@@ -430,13 +441,21 @@ def ingestion_result_valid(job: StandInJob, result: object) -> bool:
     )
 
 
+def index_result_valid(result: object) -> bool:
+    """The backend's rule for a done `index.change` (`IndexChanges.completed`): the recipe it was indexed with."""
+    return (
+        isinstance(result, dict)
+        and isinstance(result.get("indexRecipe"), str)
+        and bool(RECIPE.fullmatch(result["indexRecipe"]))
+    )
+
+
 def _outcome(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     outcome = json.loads(body)
-    if (
-        outcome["outcome"] == "done"
-        and job.kind == "ingestion"
-        and not ingestion_result_valid(job, outcome.get("result"))
-    ):
+    done = outcome["outcome"] == "done"
+    if done and job.kind == "ingestion" and not ingestion_result_valid(job, outcome.get("result")):
+        return problem(400, "job.result_invalid")
+    if done and job.kind == "index.change" and not index_result_valid(outcome.get("result")):
         return problem(400, "job.result_invalid")
     job.outcomes.append(outcome)
     if outcome["outcome"] == "failed":
