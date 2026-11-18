@@ -17,8 +17,8 @@ then layout per run of text pages; or one text step. "3" (Story 1.17): triage al
 characters under a half-page image to OCR, and asks an `ocr` step for each run of at most 10 image pages. "4"
 (Story 1.18): clean and text also ask the `passages` step over every text file, which the backend holds until every
 page has an outcome. "5" (Story 1.19): layout, OCR and text also report `pageViews` (layout and OCR send each page's
-WebP picture back). "6" (Story 1.21): the `images` stage assembles an image set into one PDF, one page per image,
-and asks triage over the pages that decoded.
+WebP picture back). "6" (Story 1.21): the `images` stage assembles an image set into one PDF, one page per image
+(a blank page for one that does not decode, which OCR reports unreadable), and asks triage over every batch.
 """
 
 PIPELINE_VERSION = "6"

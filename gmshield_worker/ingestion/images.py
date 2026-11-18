@@ -165,6 +165,10 @@ def pages(source: Path) -> Iterator[Page]:
         for index in range(count):
             try:
                 image.seek(index)
+                if image.width * image.height > MAX_DECODED_PIXELS:
+                    # Pillow checks a decompression bomb when it opens a file, never at a TIFF's later frames.
+                    yield UNREADABLE
+                    continue
                 if image.width * image.height > MAX_PIXELS:
                     # A JPEG decodes straight to a smaller size (1/2, 1/4 or 1/8); others decode whole.
                     image.draft(None, capped(image.width, image.height))
@@ -197,9 +201,14 @@ class Assembler:
         self._first = 1
         self._done: list[Path] = []
 
+    @property
+    def full(self) -> bool:
+        """Whether `MAX_PAGES` are written: nothing more is added."""
+        return self.total >= MAX_PAGES
+
     def add(self, page: Page, done: Path | None = None) -> bool:
         """Adds one page; False once `MAX_PAGES` are written (it is left out). `done` is removed with its batch."""
-        if self.total >= MAX_PAGES:
+        if self.full:
             return False
         pikepdf = self._pikepdf
         if self._current is None:
@@ -279,6 +288,8 @@ def run(out: Path, sources: Iterable[Path]) -> int:
     """Every image's pages, in order, into the PDF; the exit status."""
     assembler = Assembler(out)
     for source in sources:
+        if assembler.full:
+            break
         for page in pages(source):
             if not assembler.add(page):
                 break
@@ -336,6 +347,8 @@ def assemble(out: Path, folders: Iterable[Path]) -> int:
     """The PDF from decoding children's folders, in order; the exit status."""
     assembler = Assembler(out)
     for folder in folders:
+        if assembler.full:
+            break
         for page, path in decoded(folder):
             if not assembler.add(page, path):
                 break

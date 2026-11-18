@@ -123,6 +123,9 @@ STAGES = frozenset(
 OCR_PAGES = 10
 # The time a page-by-page retry shares among its pages: each child gets this divided by the step's page count.
 PAGE_BUDGET_SECONDS = 540.0
+# A retried images step (Story 1.21): the time kept for its assembling child, and the least an image's decoding gets.
+ASSEMBLE_RESERVE_SECONDS = 60.0
+IMAGE_FLOOR_SECONDS = 2.0
 # Docling's models, baked into the image (the Dockerfile's DOCLING_ARTIFACTS_PATH), and its threads.
 DOCLING_ARTIFACTS = "/opt/docling-models"
 LAYOUT_THREADS = 2
@@ -408,6 +411,7 @@ class IngestionStep:
     deadline_seconds: float = sandbox.DEADLINE_SECONDS
     page_budget_seconds: float = PAGE_BUDGET_SECONDS
     runner: Runner = field(default=sandbox.run_child)
+    clock: Callable[[], float] = field(default=time.monotonic)
     artifacts: str = field(default_factory=lambda: os.environ.get("DOCLING_ARTIFACTS_PATH", DOCLING_ARTIFACTS))
 
     def __call__(self, job: ClaimedJob, cancel: threading.Event, /) -> Outcome:
@@ -511,6 +515,7 @@ class IngestionStep:
         this stage assembled before: it is cleaned and split again, as clean does."""
         if checked.name != IMAGES:
             return self._clean(job, checked, cancel, folder, log)
+        started = self.clock()
         sources: list[str] = []
         for index, item in enumerate(checked.images, start=1):
             target = f"image-{index:05d}"
@@ -518,30 +523,36 @@ class IngestionStep:
             log.info("ingestion.input_downloaded", jobId=str(job.job_id), size=size)
             _stop_if_cancelled(cancel)
             sources.append(target)
+        deadline = self.deadline_seconds
         if job.attempt <= 1:
             arguments = [OUT_DIR, *sources]
         else:
-            # A retry: one child per image, so an image that crashes its decoder is one unreadable page.
+            # A retry: one child per image, so an image that crashes its decoder is one blank page. The whole retry
+            # keeps to one budget, `deadline_seconds` from the step's start: each decoding child gets the time left,
+            # less a reserve for assembling, shared among the images left (never under `IMAGE_FLOOR_SECONDS`); an image
+            # with no time left for it is not decoded (a blank page); the assembling child gets whatever is left.
             decoded: list[str] = []
             for index, source in enumerate(sources, start=1):
                 target = f"decoded-{index:05d}"
-                self._child(
-                    job,
-                    IMAGES_SCRIPT,
-                    ["--decode", source, target],
-                    folder=folder,
-                    log=log,
-                    cancel=cancel,
-                    deadline=self.page_budget_seconds / len(sources),
-                    page=index,
-                )
-                _stop_if_cancelled(cancel)
+                spare = self.deadline_seconds - (self.clock() - started) - ASSEMBLE_RESERVE_SECONDS
+                if spare >= IMAGE_FLOOR_SECONDS:
+                    share = max(IMAGE_FLOOR_SECONDS, spare / (len(sources) - index + 1))
+                    self._child(
+                        job,
+                        IMAGES_SCRIPT,
+                        ["--decode", source, target],
+                        folder=folder,
+                        log=log,
+                        cancel=cancel,
+                        deadline=min(share, spare),
+                        page=index,
+                    )
+                    _stop_if_cancelled(cancel)
                 (folder / source).unlink()
                 decoded.append(target)
             arguments = ["--assemble", OUT_DIR, *decoded]
-        child = self._child(
-            job, IMAGES_SCRIPT, arguments, folder=folder, log=log, cancel=cancel, deadline=self.deadline_seconds
-        )
+            deadline = max(self.deadline_seconds - (self.clock() - started), 0.0)
+        child = self._child(job, IMAGES_SCRIPT, arguments, folder=folder, log=log, cancel=cancel, deadline=deadline)
         if not _succeeded(child):
             raise StepFailed(STEP_FAILED)
         for source in sources:

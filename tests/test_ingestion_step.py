@@ -19,7 +19,7 @@ import pytest
 
 from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome
 from gmshield_worker.backend.files import JobFiles
-from gmshield_worker.ingestion import PIPELINE_VERSION, layout, sandbox, step
+from gmshield_worker.ingestion import PIPELINE_VERSION, layout, passages, sandbox, step
 from gmshield_worker.ingestion.errors import (
     FILE_UNREADABLE,
     PASSWORD_REQUIRED,
@@ -1070,14 +1070,16 @@ def test_a_retried_images_step_decodes_one_child_per_image_and_one_that_crashes_
     images = photo_set()[:3]
     job = claim_images(stand_in, images)
     calls: list[tuple[list[str], float]] = []
+    now = [0.0]
 
     def runner(script: Path, arguments: list[str], **options: Any) -> sandbox.ChildResult:
         calls.append((arguments, options["deadline_seconds"]))
         if arguments[:2] == ["--decode", "image-00002"]:
-            return sandbox.ChildResult(returncode=-9, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
+            now[0] += 30.0
+            return sandbox.ChildResult(returncode=-9, timed_out=False, cancelled=False, max_rss_kib=1, seconds=30.0)
         return sandbox.run_child(script, arguments, **options)
 
-    outcome = handler(stand_in, tmp_path / "work", runner=runner, page_budget_seconds=540.0)(
+    outcome = handler(stand_in, tmp_path / "work", runner=runner, deadline_seconds=570.0, clock=lambda: now[0])(
         retried(job), threading.Event()
     )
 
@@ -1087,7 +1089,8 @@ def test_a_retried_images_step_decodes_one_child_per_image_and_one_that_crashes_
         ["--decode", "image-00003", "decoded-00003"],
         ["--assemble", "out", "decoded-00001", "decoded-00002", "decoded-00003"],
     ]
-    assert [deadline for _arguments, deadline in calls[:3]] == [180.0, 180.0, 180.0]
+    # 570 s in all, 60 kept for assembling: 510 shared among the images left; the crash took 30 s of it.
+    assert [deadline for _arguments, deadline in calls] == [170.0, 255.0, 480.0, 540.0]
     assert outcome.result is not None
     assert outcome.result["pageTotal"] == 3
     pages = rendered(stand_in.outputs[outcome.result["original"]["fileId"]])
@@ -1096,6 +1099,34 @@ def test_a_retried_images_step_decodes_one_child_per_image_and_one_that_crashes_
     assert pages[1].getpixel((100, 100)) == WHITE_PAGE
     assert near(pages[0].getpixel((5, 5)), RED)
     assert list((tmp_path / "work").iterdir()) == []
+
+
+def test_a_retried_images_steps_children_never_get_more_than_the_step_budget_in_all(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    from PIL import Image
+
+    images = [("png", encoded_image(Image.new("L", (4, 4)), "PNG")) for _index in range(40)]
+    job = claim_images(stand_in, images)
+    deadlines: list[float] = []
+    now = [0.0]
+
+    def slow(_script: Path, arguments: list[str], **options: Any) -> sandbox.ChildResult:
+        # Every child runs out its whole deadline: the worst case.
+        deadlines.append(options["deadline_seconds"])
+        now[0] += options["deadline_seconds"]
+        return sandbox.ChildResult(returncode=-9, timed_out=True, cancelled=False, max_rss_kib=1, seconds=0.0)
+
+    outcome = handler(stand_in, tmp_path / "work", runner=slow, deadline_seconds=100.0, clock=lambda: now[0])(
+        retried(job), threading.Event()
+    )
+
+    assert outcome == Outcome.failed(STEP_FAILED)
+    assert sum(deadlines) <= 100.0
+    # Each image had at least its floor; those past the budget were never decoded; the assembling child kept its share.
+    assert all(deadline >= step.IMAGE_FLOOR_SECONDS for deadline in deadlines[:-1])
+    assert len(deadlines) < 41
+    assert deadlines[-1] >= step.ASSEMBLE_RESERVE_SECONDS
 
 
 def test_a_restarted_image_set_reads_its_stored_original_and_cleans_it_again(stand_in: StandIn, tmp_path: Path) -> None:
@@ -1140,3 +1171,48 @@ def test_an_images_manifest_lists_its_unreadable_pages_within_the_total_in_order
         (tmp_path / "manifest.json").write_text(json.dumps({**good, "unreadable": unreadable}), encoding="utf-8")
         with pytest.raises(StepFailed):
             step.read_manifest(tmp_path)
+
+
+def test_an_image_sets_pages_are_triaged_like_a_pdfs(stand_in: StandIn, tmp_path: Path) -> None:
+    job = claim(stand_in, batch_pdf(tmp_path), step_input("triage", 21, 25, format="images"))
+
+    outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
+
+    assert outcome.outcome == "done", outcome
+    assert outcome.result is not None
+    assert outcome.result["layers"] == [
+        {"firstPage": 21, "lastPage": 21, "layer": "text"},
+        {"firstPage": 22, "lastPage": 23, "layer": "image"},
+        {"firstPage": 24, "lastPage": 25, "layer": "text"},
+    ]
+    assert [item["stage"] for item in outcome.result["next"]] == ["layout", "layout", "ocr"]
+    assert ingestion_result_valid(stand_in.jobs[str(job.job_id)], outcome.result)
+
+
+def test_an_image_sets_passages_are_cut_from_pdf_records_with_their_boxes(
+    stand_in: StandIn, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cutters: list[bool] = []
+    real = passages.cutter
+
+    def recording(pdf: bool) -> Any:
+        cutters.append(pdf)
+        return real(pdf)
+
+    monkeypatch.setattr(passages, "cutter", recording)
+    records = pdf_records((1, [heading("Ficha", 1), para("O Corvo Escarlate guarda a ponte.")]), (2, []))
+    job = claim_passages(
+        stand_in, passages_input([(text_name(1), 1, 2)], fmt="images", total=2), {text_name(1): records}
+    )
+
+    outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
+
+    assert outcome.outcome == "done", outcome
+    assert outcome.result is not None
+    assert cutters == [True]
+    assert [(item["page"], item["text"]) for item in outcome.result["passages"]] == [
+        (1, "Ficha\nO Corvo Escarlate guarda a ponte.")
+    ]
+    assert outcome.result["passages"][0]["boxes"] == [[0, 0, 1, 0.1], [0, 0.2, 1, 0.4]]
+    assert outcome.result["outline"] == [{"level": 1, "title": "Ficha", "page": 1}]
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204

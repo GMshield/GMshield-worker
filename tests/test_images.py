@@ -212,3 +212,48 @@ def test_the_command_line_takes_one_of_its_three_forms() -> None:
         ["images.py", "--other", "a", "b"],
     ):
         assert images.main(argv) == 2
+
+
+def test_a_tiff_frame_past_the_decoded_pixel_cap_is_an_unreadable_page_never_decoded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frames = [Image.new("L", (8, 8), 0), Image.new("L", (20, 20), 255), Image.new("L", (8, 8), 128)]
+    tiff = write(tmp_path / "bomb.tif", frames[0], "TIFF", save_all=True, append_images=frames[1:])
+    monkeypatch.setattr(images, "MAX_DECODED_PIXELS", 100)
+    decoded: list[tuple[int, int]] = []
+    real = images.prepared
+
+    def recording(frame: Image.Image) -> Image.Image:
+        decoded.append(frame.size)
+        return real(frame)
+
+    monkeypatch.setattr(images, "prepared", recording)
+    found = list(images.pages(tiff))
+    assert [page == images.UNREADABLE for page in found] == [False, True, False]
+    assert decoded == [(8, 8), (8, 8)]
+
+
+def test_once_the_most_pages_are_written_no_other_image_or_folder_is_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(images, "MAX_PAGES", 2)
+    sources = [write(tmp_path / f"{index}.png", Image.new("L", (4, 4)), "PNG") for index in range(4)]
+    opened: list[Path] = []
+    real_pages, real_decoded = images.pages, images.decoded
+
+    def pages(source: Path) -> Any:
+        opened.append(source)
+        return real_pages(source)
+
+    def decoded(folder: Path) -> Any:
+        opened.append(folder)
+        return real_decoded(folder)
+
+    monkeypatch.setattr(images, "pages", pages)
+    monkeypatch.setattr(images, "decoded", decoded)
+    assert images.run(tmp_path / "out", sources) == 0
+    assert opened == sources[:2]
+    opened.clear()
+    folders = [tmp_path / f"decoded-{index}" for index in range(4)]
+    assert images.assemble(tmp_path / "again", folders) == 0
+    assert opened == folders[:2]
