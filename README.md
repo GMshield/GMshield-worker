@@ -181,8 +181,9 @@ lockfile and the production image:
   - OCR (`ocr.py`, Story 1.17) renders each image page at 216 DPI (smaller when its longer side would
     pass 10,000 pixels), turns it upright with Tesseract's orientation detection (`--psm 0 -l osd`),
     checked by reading (Story 1.22: the detection was half a turn wrong on every page of an 1892 scan): Tesseract
-    reads a band across the middle of the page as detected and half a turn further, and the turn with more words
-    read at 60 or more confidence wins (a tie keeps the detection; about 1 s more per page on roberto-server),
+    reads a band across the middle of the page as detected and half a turn further, and half a turn further wins
+    only when it reads at least 10 more words at 60 or more confidence (about 1 s more per page on roberto-server;
+    Docling's own detection is switched off, since the page reaches it upright),
     straightens a skew within ±20° with OpenCV (from 0.5°, white fill), and reads it with Docling and
     Tesseract (`por`+`eng`, full page, tables and heading levels) into layout's page shape, its lines
     being Tesseract's words. Each page is `read_by_ocr`, or `unreadable` when OCR finds fewer than 16

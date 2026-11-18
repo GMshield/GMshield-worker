@@ -287,6 +287,46 @@ def test_reading_the_band_runs_tesseract_on_a_band_file_it_then_removes(tmp_path
     assert ocr.readable_words(str(tmp_path / "missing"), picture, 0, target) == 0
 
 
+def test_a_band_that_cannot_be_written_reads_no_word_and_leaves_no_file(tmp_path: Path) -> None:
+    fake = tmp_path / "tesseract"
+    fake.write_text(f"#!/bin/sh\ncat <<EOF\n{tsv((95, 'historia'))}EOF\n")
+    fake.chmod(0o755)
+    target = tmp_path / ocr.BAND
+    # A page a few pixels high has an empty band, which no PNG can hold.
+    assert ocr.readable_words(str(fake), np.full((3, 200), 255, dtype=np.uint8), 0, target) == 0
+    assert not target.exists()
+    # A band that cannot be written (here: its folder is missing) reads nothing either.
+    picture = np.full((300, 200), 255, dtype=np.uint8)
+    assert ocr.readable_words(str(fake), picture, 0, tmp_path / "missing" / ocr.BAND) == 0
+
+
+def test_the_orientation_check_and_docling_stay_within_a_page_by_page_share() -> None:
+    # A page-by-page retry gives each page 540 s / 10 = 54 s: the detection and both reads must fit well inside it.
+    assert ocr.OSD_SECONDS + 2 * ocr.READ_SECONDS < 54
+
+
+def test_doclings_own_detection_is_turned_off_and_its_absence_is_refused() -> None:
+    model = SimpleNamespace(
+        TesseractOcrCliModel=type("TesseractOcrCliModel", (), {"_perform_osd": lambda _self, _file: "osd"}),
+        _parse_orientation=lambda _osd: 180,
+    )
+    ocr.turn_off_docling_detection(model)  # type: ignore[arg-type]
+    assert model.TesseractOcrCliModel()._perform_osd("page.png") is None
+    assert model._parse_orientation("osd") == 0
+    with pytest.raises(RuntimeError, match="_perform_osd"):
+        ocr.turn_off_docling_detection(SimpleNamespace(TesseractOcrCliModel=object, _parse_orientation=print))  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="_parse_orientation"):
+        ocr.turn_off_docling_detection(SimpleNamespace(TesseractOcrCliModel=model.TesseractOcrCliModel))  # type: ignore[arg-type]
+
+
+def test_the_installed_docling_still_has_the_detection_the_child_turns_off() -> None:
+    # A Docling upgrade that renames either name would bring back the double turn; this fails first.
+    from docling.models.stages.ocr import tesseract_ocr_cli_model
+
+    assert callable(getattr(tesseract_ocr_cli_model.TesseractOcrCliModel, "_perform_osd", None))
+    assert callable(getattr(tesseract_ocr_cli_model, "_parse_orientation", None))
+
+
 def test_a_huge_page_is_rendered_with_its_longer_side_capped_and_written_at_216_dpi(tmp_path: Path) -> None:
     # 14,400 x 7,200 points: at scale 3 that would be 43,200 x 21,600 pixels.
     pdf = pikepdf.Pdf.new()
