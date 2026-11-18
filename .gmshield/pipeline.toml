@@ -17,6 +17,9 @@ host_port = 0               # the worker opens no port
 # Story 1.6 (AD-14): gmshield-work (the backend at http://gmshield-backend:8080, Redis, later Qdrant),
 # gmshield-model (Ollama on the network's gateway), gmshield-outbound (the model provider).
 networks = ["gmshield-work", "gmshield-model", "gmshield-outbound"]
+# Story 2.1: Ollama on the gmshield-model gateway (deploy/secure-ollama.sh), for the embeddings. Qdrant's URL and
+# key are secrets, in worker.env (deploy/data-credentials.sh).
+env = { GMSHIELD_OLLAMA_URL = "http://172.30.5.1:11434" }
 certs = true                # ~/gmshield-ci/certs/worker/ca.crt at /run/gmshield/certs: TLS to Redis (Qdrant later)
 read_only = true
 user = "10001:10001"

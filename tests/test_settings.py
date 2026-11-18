@@ -8,6 +8,9 @@ from gmshield_worker.settings import (
     DEFAULT_WORK_DIR,
     INTERACTIVE_CAPACITY,
     MODE,
+    OLLAMA_URL,
+    QDRANT_API_KEY,
+    QDRANT_URL,
     REDIS_CA_FILE,
     REDIS_HOST,
     REDIS_PASSWORD,
@@ -15,6 +18,8 @@ from gmshield_worker.settings import (
     REDIS_TLS,
     REDIS_USERNAME,
     TEST_MODE_BACKEND_URL,
+    TEST_MODE_OLLAMA_URL,
+    TEST_MODE_QDRANT_URL,
     TEST_MODE_WORKER_CREDENTIAL,
     WORK_DIR,
     WORKER_CREDENTIAL,
@@ -30,8 +35,11 @@ COMPLETE = {
     REDIS_HOST: "redis",
     REDIS_USERNAME: "worker",
     REDIS_PASSWORD: "redis-secret-value",
+    OLLAMA_URL: "http://172.30.5.1:11434/",
+    QDRANT_URL: "https://qdrant:6333",
+    QDRANT_API_KEY: "qdrant-secret-value",
 }
-SECRETS = ("sk-secret-value", CREDENTIAL, "redis-secret-value")
+SECRETS = ("sk-secret-value", CREDENTIAL, "redis-secret-value", "qdrant-secret-value")
 
 
 def test_complete_settings_start() -> None:
@@ -46,6 +54,13 @@ def test_complete_settings_start() -> None:
     assert (redis.host, redis.port, redis.username, redis.password) == ("redis", 6379, "worker", "redis-secret-value")
     assert redis.tls
     assert redis.ca_file == REDIS_CA_FILE == "/run/gmshield/certs/ca.crt"
+    index = settings.index
+    assert (index.ollama_url, index.qdrant_url, index.qdrant_api_key) == (
+        "http://172.30.5.1:11434",
+        "https://qdrant:6333",
+        "qdrant-secret-value",
+    )
+    assert index.ca_file == REDIS_CA_FILE
     for secret in SECRETS:
         assert secret not in repr(settings)
 
@@ -55,8 +70,20 @@ def test_complete_settings_start() -> None:
     [
         (
             {},
-            [BACKEND_URL, REDIS_HOST, REDIS_USERNAME, ANTHROPIC_API_KEY, WORKER_CREDENTIAL, REDIS_PASSWORD],
+            [
+                BACKEND_URL,
+                REDIS_HOST,
+                REDIS_USERNAME,
+                OLLAMA_URL,
+                QDRANT_URL,
+                ANTHROPIC_API_KEY,
+                WORKER_CREDENTIAL,
+                REDIS_PASSWORD,
+                QDRANT_API_KEY,
+            ],
         ),
+        ({**COMPLETE, QDRANT_API_KEY: " "}, [QDRANT_API_KEY]),
+        ({k: v for k, v in COMPLETE.items() if k not in (OLLAMA_URL, QDRANT_URL)}, [OLLAMA_URL, QDRANT_URL]),
         ({**COMPLETE, ANTHROPIC_API_KEY: ""}, [ANTHROPIC_API_KEY]),
         ({k: v for k, v in COMPLETE.items() if k != BACKEND_URL}, [BACKEND_URL]),
         ({**COMPLETE, ANTHROPIC_API_KEY: "   "}, [ANTHROPIC_API_KEY]),
@@ -113,6 +140,12 @@ def test_test_mode_needs_no_secret_and_uses_the_stand_in() -> None:
     assert settings.worker_credential == TEST_MODE_WORKER_CREDENTIAL
     redis = settings.redis
     assert (redis.host, redis.port, redis.username, redis.password, redis.tls) == ("redis", 6379, None, None, False)
+    index = settings.index
+    assert (index.ollama_url, index.qdrant_url, index.qdrant_api_key) == (
+        TEST_MODE_OLLAMA_URL,
+        TEST_MODE_QDRANT_URL,
+        None,
+    )
 
 
 def test_test_mode_ignores_redis_credentials_and_tls_but_may_move_redis() -> None:
@@ -179,6 +212,27 @@ def test_test_mode_ignores_a_given_key_and_honours_the_backend_url() -> None:
     settings = check_settings({MODE: "test", BACKEND_URL: "http://127.0.0.1:9", ANTHROPIC_API_KEY: "sk-x"})
     assert settings.backend_url == "http://127.0.0.1:9"
     assert settings.anthropic_api_key is None
+
+
+@pytest.mark.parametrize("name", [OLLAMA_URL, QDRANT_URL])
+@pytest.mark.parametrize("url", ["ftp://ollama", "ollama:11434", "http://user:pass@ollama:11434", "http://o/?q=1"])
+def test_an_invalid_index_url_is_refused_by_name_never_by_value(name: str, url: str) -> None:
+    for environment in (COMPLETE, {MODE: "test"}):
+        with pytest.raises(SettingsRefused) as refused:
+            check_settings({**environment, name: url})
+        assert refused.value.settings == [name]
+        assert url not in str(refused.value)
+
+
+def test_test_mode_may_move_the_index_services_but_ignores_a_qdrant_key() -> None:
+    settings = check_settings(
+        {MODE: "test", OLLAMA_URL: "http://127.0.0.1:1", QDRANT_URL: "http://127.0.0.1:2", QDRANT_API_KEY: "k"}
+    )
+    assert (settings.index.ollama_url, settings.index.qdrant_url, settings.index.qdrant_api_key) == (
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:2",
+        None,
+    )
 
 
 def test_work_dir_is_configurable() -> None:

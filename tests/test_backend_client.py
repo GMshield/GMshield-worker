@@ -9,6 +9,7 @@ import pytest
 
 from gmshield_worker.backend.client import ClaimAnswer, JobsApi, Outcome, fetch_contract_version
 from gmshield_worker.log import new_trace_id
+from gmshield_worker.retrieval.recipe import INDEX_RECIPE
 from tests.conftest import StandIn
 
 
@@ -16,7 +17,7 @@ def test_asks_for_the_version_with_a_traceparent(stand_in: StandIn) -> None:
     trace_id = new_trace_id()
     answer = fetch_contract_version(stand_in.url, trace_id)
     assert answer.status == 200
-    assert answer.version == "1.6.0"
+    assert answer.version == "1.7.0"
     request = stand_in.requests[-1]
     assert request["path"] == "/internal/v1/version"
     assert re.fullmatch(rf"00-{trace_id}-[0-9a-f]{{16}}-01", request["traceparent"])
@@ -51,13 +52,13 @@ def test_connection_refused_raises_for_the_caller(stand_in: StandIn) -> None:
 def test_proxy_settings_of_the_environment_are_ignored(stand_in: StandIn, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
     monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9")
-    assert fetch_contract_version(stand_in.url, new_trace_id()).version == "1.6.0"
+    assert fetch_contract_version(stand_in.url, new_trace_id()).version == "1.7.0"
 
 
 def test_the_workers_credential_is_sent_when_given(stand_in: StandIn) -> None:
     stand_in.credential = "w" * 64
     assert fetch_contract_version(stand_in.url, new_trace_id()).status == 401
-    assert fetch_contract_version(stand_in.url, new_trace_id(), credential="w" * 64).version == "1.6.0"
+    assert fetch_contract_version(stand_in.url, new_trace_id(), credential="w" * 64).version == "1.7.0"
     assert stand_in.requests[-1]["authorization"] == "Bearer " + "w" * 64
 
 
@@ -84,6 +85,10 @@ def test_a_claim_answers_the_job_with_its_own_trace_and_never_shows_the_grant(st
     assert claim_request["path"] == f"/internal/v1/jobs/{job_id}/claims"
     assert claim_request["traceparent"].split("-")[1] == lane_trace
     assert "x-job-grant" not in claim_request
+    # Story 2.1: every claim states this worker's index recipe.
+    assert json.loads(claim_request["body"]) == {"indexRecipe": INDEX_RECIPE}
+    assert claim_request["content-type"] == "application/json"
+    assert stand_in.stated_recipes == [INDEX_RECIPE]
 
     second = api.claim(UUID(job_id), lane_trace)
     assert (second.status, second.code, second.job, second.definite) == (409, "job.claimed", None, True)

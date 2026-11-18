@@ -27,12 +27,14 @@ from gmshield_worker.backend.generated.api.jobs import claim_job, renew_job_clai
 from gmshield_worker.backend.generated.models import (
     ContractVersion,
     JobClaim,
+    JobClaimRequest,
     JobOutcome,
     JobOutcomeResult,
     JobRenewal,
     Problem,
 )
 from gmshield_worker.log import parse_traceparent, traceparent
+from gmshield_worker.retrieval.recipe import INDEX_RECIPE
 
 REQUEST_TIMEOUT_SECONDS = 2.0
 
@@ -149,19 +151,24 @@ def _code(parsed: object) -> str | None:
 
 @dataclass(frozen=True)
 class JobsApi:
-    """The job routes of the internal API, as the lanes use them."""
+    """The job routes of the internal API, as the lanes use them. Every claim states this worker's index recipe
+    (contract 1.7.0, Story 2.1): the backend re-indexes what was indexed under another one."""
 
     base_url: str
     credential: str = field(repr=False)
     httpx_args: Mapping[str, Any] | None = None
+    index_recipe: str = INDEX_RECIPE
 
     def _client(self, trace_id: str) -> Client:
         return backend_client(self.base_url, trace_id, credential=self.credential, httpx_args=self.httpx_args)
 
     def claim(self, job_id: UUID, trace_id: str) -> ClaimAnswer:
-        """`POST /internal/v1/jobs/{id}/claims` under the lane's trace (the job's is not known yet)."""
+        """`POST /internal/v1/jobs/{id}/claims` under the lane's trace (the job's is not known yet), stating the index
+        recipe."""
         with self._client(trace_id) as client:
-            response = claim_job.sync_detailed(job_id, client=client)
+            response = claim_job.sync_detailed(
+                job_id, client=client, body=JobClaimRequest(index_recipe=self.index_recipe)
+            )
         parsed = response.parsed
         if response.status_code == 201 and isinstance(parsed, JobClaim):
             job_trace = parse_traceparent(parsed.traceparent) or trace_id

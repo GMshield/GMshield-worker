@@ -24,6 +24,7 @@ every transitive one, and `[tool.uv] exclude-newer` keeps them all on or before 
 | pikepdf (the clean stage, Story 1.15; MPL-2.0, released 2026-10-11, qpdf 12.4.2 inside) | 10.17.0 | `pyproject.toml` |
 | pypdfium2 (the triage stage, Story 1.16; already installed by Docling, released 2026-10-04) | 5.14.0 | `pyproject.toml` |
 | pi-heif (the images stage's HEIC decoder, Story 1.21; released 2026-06-10). The binding is BSD-3-Clause; its wheel bundles libheif and libde265 (LGPL-3.0, decode only, no x265 encoder). Never pillow-heif, whose wheel bundles x265 (GPL) | 1.4.0 | `pyproject.toml` |
+| qdrant-client (the index, Story 2.1; Apache-2.0, released 2026-10-22; REST only, its gRPC and protobuf dependencies come along unused) | 1.20.0 | `pyproject.toml` |
 | openapi-python-client (client generator) | 0.29.1 | `pyproject.toml` (development) |
 | pytest, pytest-cov | 9.2.0, 7.1.0 | `pyproject.toml` (development) |
 | ruff | 0.17.3 | `pyproject.toml` (development) |
@@ -70,7 +71,8 @@ lockfile and the production image:
 | `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
 | `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind) and `probe.py` (test mode only) |
 | `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.21): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `images.py` (Pillow, pi-heif and pikepdf; Story 1.21), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
-| `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
+| `gmshield_worker/retrieval/` | the index (Story 2.1): `recipe.py` (`INDEX_RECIPE`), `embedding.py` (embeddinggemma through Ollama), `keywords.py` (the keyed keyword vector), `store.py` (the Qdrant collection `passages`), `indexing.py` (the `index.change` and `index.removal` handlers) |
+| `agents/` | empty until its story (its `__init__.py` names it) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
 | `tests/` | unit tests; `tests/image/` runs only inside the production image, `tests/integration/` only beside a Redis (the `integration` stage) |
@@ -249,6 +251,31 @@ lockfile and the production image:
     `input: "source"`, the assembled PDF, which is cleaned and split again as `clean` does.
   - The in-image check decodes `tests/image/two-colours.heic` (provenance in `tests/image/test_image.py`) in the
     sandbox and reads two photographed pages, one of them lying on its side with its EXIF orientation, by OCR.
+- **Index an accepted material (Story 2.1, AD-10, backend contract 1.7.0 or later).** Every claim states the
+  worker's `INDEX_RECIPE` (`retrieval/recipe.py`; bump it on any change to the model, the embedding input, the
+  splitting or the keyword scheme): the backend re-indexes each source recorded under another one. The worker is the
+  only reader and writer of Qdrant.
+  - `index.change`: the claim input is `{source, owner, kind, language, tokenKey, passages}`; the run (at most 200
+    passages) is read whole from the input `passages`, JSON Lines `{id, ordinal, page, title, text}`. Sixteen at a
+    time, each passage is embedded by `embeddinggemma:300m` through `POST {GMSHIELD_OLLAMA_URL}/api/embed` (plain
+    httpx; input `title: {title or "none"} | text: {text}`, `truncate: false`). When Ollama refuses an input as longer
+    than the context, the passage is split in two by `ingestion.passages.split`, each half embedded with the same
+    title and split again if refused, at most 4 times deep, and its vector is the L2-normalized mean of its parts:
+    nothing is cut silently. The keyword vector folds the text (NFKC, casefold, diacritics stripped), takes its Unicode
+    word tokens and numbers each by the first 4 bytes, big-endian, of HMAC-SHA256 under the owner's `tokenKey`, valued
+    by its count; Qdrant applies the `idf` modifier. Each passage is upserted as one point (id: the passage id; vectors
+    `dense` and `sparse`; payload exactly `{owner, source, kind, page, language}`). The result is
+    `{indexRecipe, points}`.
+  - The collection `passages` is created when missing: `dense` (768, cosine), `sparse` (`idf`), a tenant keyword index
+    on `owner` and a keyword index on `source`. Qdrant is reached over REST at `GMSHIELD_QDRANT_URL` with its API key,
+    an https URL verified against `/run/gmshield/certs/ca.crt`, one client per job.
+  - `index.removal`: the claim input is `{source, owner}`; the points go by a filter on both, never by ids. Safe to
+    repeat.
+  - Failures: `index.input_invalid` and `index.passage_too_long` with `retry: false`; `index.embedding_unavailable`
+    (Ollama), `index.store_unavailable` (Qdrant) and `index.input_unavailable` (the backend's input route) for the
+    backend to retry; a re-run upserts the same ids. Lines carry ids, counts and codes only; the token key is held with
+    `repr=False` and no text, title or token reaches Qdrant, Redis or a log.
+  - Deploy the backend first: an older backend fails the claim body's contract check (`backend.incompatible`).
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.
@@ -267,6 +294,8 @@ lockfile and the production image:
 | `GMSHIELD_REDIS_USERNAME`, `GMSHIELD_REDIS_PASSWORD` | the worker's Redis account (required outside test mode; `worker` in production; the password is secret) |
 | `GMSHIELD_REDIS_TLS` | `true` (default): TLS verified, chain and host name, against `/run/gmshield/certs/ca.crt`; `false` only in the development setup |
 | `GMSHIELD_INTERACTIVE_CAPACITY` | interactive jobs at once, 1 to 16 (default 2); the ingestion lane runs one |
+| `GMSHIELD_OLLAMA_URL` | Ollama, for the embeddings (Story 2.1), `http` or `https` without credentials (required outside test mode; production: `http://172.30.5.1:11434`, the `gmshield-model` gateway, set in `.gmshield/pipeline.toml`) |
+| `GMSHIELD_QDRANT_URL`, `GMSHIELD_QDRANT_API_KEY` | Qdrant (Story 2.1; both required outside test mode, the key is secret; production: `https://qdrant:6333`, written with the key by GMshield-pipeline `deploy/data-credentials.sh`); an https URL is verified against `/run/gmshield/certs/ca.crt` |
 | `GMSHIELD_WORK_DIR` | optional, absolute; default `/var/lib/gmshield-worker/work`, where production mounts the named volume `gmshield-worker-work` (on the encrypted volume) |
 | `GMSHIELD_HEALTH_FILE` | for tests that run the worker outside the image only; default `/run/gmshield-worker/healthy` |
 | `GMSHIELD_MODE` | unset, or `test` |
@@ -275,7 +304,9 @@ lockfile and the production image:
 `http://stand-in-backend:8080` unless `GMSHIELD_BACKEND_URL` is set, Redis at `redis:6379` (or
 `GMSHIELD_REDIS_HOST`/`GMSHIELD_REDIS_PORT`) without an account, a password or TLS, and the fixed,
 public worker credential `gmshield-test-mode-worker-credential-not-a-secret` that the backend's test
-mode knows. A worker credential that is the test-mode value is refused outside test mode.
+mode knows, and the stand-ins `http://stand-in-ollama:11434` and `http://stand-in-qdrant:6333` (no key)
+unless `GMSHIELD_OLLAMA_URL` or `GMSHIELD_QDRANT_URL` is set. A worker credential that is the test-mode
+value is refused outside test mode.
 
 ## Internal API client
 

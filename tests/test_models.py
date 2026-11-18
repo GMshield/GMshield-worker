@@ -40,6 +40,9 @@ def test_outside_test_mode_the_claude_client_is_built_without_calling_anything(
             "GMSHIELD_REDIS_HOST": "redis",
             "GMSHIELD_REDIS_USERNAME": "worker",
             "GMSHIELD_REDIS_PASSWORD": "redis-password",
+            "GMSHIELD_OLLAMA_URL": "http://172.30.5.1:11434",
+            "GMSHIELD_QDRANT_URL": "https://qdrant:6333",
+            "GMSHIELD_QDRANT_API_KEY": "q",
         }
     )
     client = select_model_client(settings)
