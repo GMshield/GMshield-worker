@@ -8,6 +8,7 @@ Every page read, the blank one too, keeps its straightened picture as WebP with 
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -200,6 +201,90 @@ def test_an_upside_down_page_reaches_docling_upright(tmp_path: Path, monkeypatch
     # Outside the image there is no Tesseract: no turn.
     monkeypatch.setenv("PATH", str(tmp_path))
     assert ocr.orientation(tmp_path / "missing.png") == 0
+
+
+TSV_HEADER = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"
+
+
+def tsv(*words: tuple[float, str]) -> str:
+    rows = [f"5\t1\t1\t1\t1\t{index}\t0\t0\t10\t10\t{confidence}\t{text}" for index, (confidence, text) in
+            enumerate(words, 1)]  # fmt: skip
+    return "\n".join([TSV_HEADER, "1\t1\t0\t0\t0\t0\t0\t0\t100\t100\t-1\t", *rows, "broken row"]) + "\n"
+
+
+def test_a_word_counts_when_tesseract_read_it_with_confidence_and_it_has_two_letters_or_digits() -> None:
+    report = tsv((96.5, "Universidade"), (60, "de"), (59.9, "Coimbra"), (91, "é"), (88, "—,"), (75, "12"), (80, "x"))
+    assert ocr.confident_words(report) == 3
+    assert ocr.confident_words("") == 0
+    assert ocr.confident_words(TSV_HEADER + "\n5\t1\t1\t1\t1\t1\t0\t0\t1\t1\tnot-a-number\tpalavra\n") == 0
+
+
+def test_the_band_is_the_middle_of_the_turned_and_straightened_picture() -> None:
+    picture = np.full((200, 100), 255, dtype=np.uint8)
+    picture[70, 10] = 100
+    picture[129, 89] = 50
+    straight = ocr.band(picture, 0)
+    assert straight.shape == (60, 80)
+    assert straight[0, 0] == 100
+    # Turned a quarter, the band runs across the turned picture (100 high, 200 wide).
+    assert ocr.band(picture, 90).shape == (30, 160)
+    assert ocr.band(picture, 180)[0, 0] == 50
+    # A crooked page is straightened before its band is cut.
+    crooked = np.array(pdfs.raster_page(angle=7).convert("L"))
+    assert ocr.skew_angle(ocr.band(crooked, 0)) == pytest.approx(0.0, abs=0.5)
+
+
+def test_the_detected_turn_is_kept_unless_half_a_turn_further_reads_better(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    picture = tmp_path / ocr.PICTURE
+    Image.new("L", (40, 60), 255).save(picture)
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/tesseract")
+    detected = {"value": 180}
+    words: dict[int, int] = {}
+    monkeypatch.setattr(ocr, "detect", lambda _command, _picture: detected["value"])
+    monkeypatch.setattr(ocr, "readable_words", lambda _command, _pixels, degrees, _target: words[degrees])
+
+    # The 1892 book: detection says half a turn, but the page reads only as it lies.
+    words.update({0: 120, 180: 3})
+    assert ocr.orientation(picture) == 0
+    # Detection right: kept.
+    words.update({0: 2, 180: 140})
+    assert ocr.orientation(picture) == 180
+    # A tie (a blank page) keeps the detection, and so does a lead under `MIN_LEAD`: text read upside down still
+    # yields a few words (a crooked synthetic scan: 6 against 0 before straightening).
+    words.update({0: 0, 180: 0})
+    assert ocr.orientation(picture) == 180
+    words.update({0: ocr.MIN_LEAD - 1, 180: 0})
+    assert ocr.orientation(picture) == 180
+    words.update({0: ocr.MIN_LEAD, 180: 0})
+    assert ocr.orientation(picture) == 0
+    words.update({0: 0, 180: 0})
+    # A quarter turn is checked against the other quarter.
+    detected["value"] = 90
+    words.update({90: 1, 270: 95})
+    assert ocr.orientation(picture) == 270
+    # A picture Pillow cannot open keeps the detection.
+    picture.write_bytes(b"not a picture")
+    assert ocr.orientation(picture) == 90
+
+
+def test_reading_the_band_runs_tesseract_on_a_band_file_it_then_removes(tmp_path: Path) -> None:
+    fake = tmp_path / "tesseract"
+    calls = tmp_path / "calls.txt"
+    fake.write_text(f'#!/bin/sh\necho "$@" >> {calls}\ncat <<EOF\n{tsv((95, "historia"), (90, "moderna"))}EOF\n')
+    fake.chmod(0o755)
+    picture = np.full((300, 200), 255, dtype=np.uint8)
+    target = tmp_path / ocr.BAND
+    assert ocr.readable_words(str(fake), picture, 0, target) == 2
+    assert not target.exists()
+    arguments = calls.read_text().split()
+    assert arguments[0] == str(target) and arguments[1:] == ["stdout", "-l", "por+eng", "--psm", "3", "tsv"]
+    # Tesseract failing reads no word, and leaves no band behind.
+    fake.write_text("#!/bin/sh\nexit 1\n")
+    assert ocr.readable_words(str(fake), picture, 180, target) == 0
+    assert not target.exists()
+    assert ocr.readable_words(str(tmp_path / "missing"), picture, 0, target) == 0
 
 
 def test_a_huge_page_is_rendered_with_its_longer_side_capped_and_written_at_216_dpi(tmp_path: Path) -> None:
