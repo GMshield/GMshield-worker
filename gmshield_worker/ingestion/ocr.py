@@ -16,8 +16,8 @@ see, so an upside-down page would come out with its blocks in reverse (and since
 is switched off: the page reaches it upright, and it reads it as it lies). The detection can be half a turn wrong on
 old typefaces (Story 1.22: every page of an 1892 Portuguese book, upright ones included, came out as upside down), so
 its answer is checked by reading: Tesseract (`por+eng`) reads a band across the middle of the page turned as
-detected and turned half a turn further, and the turn with more words read with confidence wins; a tie keeps the
-detection. Its skew is then estimated within `MAX_SKEW`
+detected and turned half a turn further, and half a turn further wins only when it reads at least `MIN_LEAD` more
+words with confidence; otherwise the detection stands. Its skew is then estimated within `MAX_SKEW`
 degrees with OpenCV (the angle whose rotation gives the sharpest profile of ink rows), and the page is rotated, with
 a white fill on a canvas that keeps every corner, when the angle is at least `MIN_SKEW`. The straightened picture
 goes to Docling as an image (`InputFormat.IMAGE`, at 216 DPI, so Docling reads it at its own size) with Tesseract
@@ -86,13 +86,14 @@ _ORIENTATION = re.compile(r"^Orientation in degrees: *(0|90|180|270) *$", re.MUL
 # turned and straightened page's height, `BAND_SIDE` in from each side) as detected and half a turn further. A word
 # counts when Tesseract gives it at least `CONFIDENT_WORD` (0 to 100) and it has two letters or digits. Half a turn
 # further wins only by `MIN_LEAD` words or more: text read upside down still yields a few such words (4 to 9 on the
-# test scans). Each read may take `READ_SECONDS`, like the detection.
+# test scans). Each read may take `READ_SECONDS` (a band reads in under a second), so the detection and both reads
+# stay under a page-by-page retry's share (54 s, as for `OSD_SECONDS`).
 BAND_TOP = 0.35
 BAND_BOTTOM = 0.65
 BAND_SIDE = 0.1
 CONFIDENT_WORD = 60.0
 MIN_LEAD = 10
-READ_SECONDS = 20
+READ_SECONDS = 10
 BAND = ".band.png"
 # Tesseract's TSV report: twelve columns, the confidence in the eleventh and the word in the last.
 _TSV_COLUMNS = 12
@@ -220,9 +221,10 @@ def band(picture: np.ndarray, degrees: int) -> np.ndarray:
 
 
 def readable_words(command: str, picture: np.ndarray, degrees: int, target: Path) -> int:
-    """How many words Tesseract reads with confidence in the page's band turned `degrees`; 0 when it fails."""
-    write_picture(band(picture, degrees), target)
+    """How many words Tesseract reads with confidence in the page's band turned `degrees`; 0 when it fails, or when
+    the band cannot be written (an empty band of a page a few pixels high, a full disk)."""
     try:
+        write_picture(band(picture, degrees), target)
         done = subprocess.run(  # noqa: S603 - the image's own Tesseract on our own picture, never a shell
             [command, str(target), "stdout", "-l", "por+eng", "--psm", "3", "tsv"],
             capture_output=True,
@@ -230,7 +232,7 @@ def readable_words(command: str, picture: np.ndarray, degrees: int, target: Path
             check=True,
             timeout=READ_SECONDS,
         )
-    except OSError, subprocess.SubprocessError:
+    except OSError, ValueError, subprocess.SubprocessError:
         return 0
     finally:
         target.unlink(missing_ok=True)
@@ -293,6 +295,20 @@ def characters(record: dict[str, Any]) -> int:
     return count
 
 
+def turn_off_docling_detection(model: ModuleType) -> None:
+    """Story 1.22: the picture reaches Docling already upright (`orientation`, checked by reading). Docling 2.145.0's
+    Tesseract model (`model`, its module) runs the same detection again and turns the picture by it, with no option
+    to stop it; on the 1892 scan that detection is half a turn wrong and undid the turn. So the model reads the picture
+    as it lies: no detection (one Tesseract run fewer per page). It names its languages (`lang`), so it never needs
+    the detection's script either. Both names are Docling's own, not its API: when a Docling upgrade drops either,
+    this raises instead of leaving the detection on (`tests/test_ocr.py` checks the installed Docling)."""
+    owner = getattr(model, "TesseractOcrCliModel", None)
+    if not callable(getattr(owner, "_perform_osd", None)) or not callable(getattr(model, "_parse_orientation", None)):
+        raise RuntimeError("Docling's Tesseract model has no _perform_osd or _parse_orientation to turn off")
+    setattr(owner, "_perform_osd", lambda _self, _file: None)  # noqa: B010
+    setattr(model, "_parse_orientation", lambda _osd: 0)  # noqa: B010
+
+
 def reader(artifacts: Path, threads: int) -> Reader:  # pragma: no cover - runs only in the image
     """Docling with Tesseract over one straightened page picture, offline, built once. Runs only in the image."""
     import torch  # noqa: PLC0415
@@ -309,13 +325,7 @@ def reader(artifacts: Path, threads: int) -> Reader:  # pragma: no cover - runs 
     from docling.document_converter import DocumentConverter, ImageFormatOption  # noqa: PLC0415
     from docling.models.stages.ocr import tesseract_ocr_cli_model  # noqa: PLC0415
 
-    # Story 1.22: the picture reaches Docling already upright (`orientation`, checked by reading). Docling 2.145.0's
-    # Tesseract model runs the same detection again and turns the picture by it, with no option to stop it; on the
-    # 1892 scan that detection is half a turn wrong and undid the turn. So the model reads the picture as it lies:
-    # no detection (one Tesseract run fewer per page). It names its languages (`lang`), so it never needs the
-    # detection's script either. `tests/image` reads the 1892 page through this child.
-    setattr(tesseract_ocr_cli_model.TesseractOcrCliModel, "_perform_osd", lambda _self, _file: None)  # noqa: B010
-    setattr(tesseract_ocr_cli_model, "_parse_orientation", lambda _osd: 0)  # noqa: B010
+    turn_off_docling_detection(tesseract_ocr_cli_model)
 
     options = PdfPipelineOptions(
         artifacts_path=artifacts,

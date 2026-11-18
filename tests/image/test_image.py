@@ -340,6 +340,8 @@ def test_an_1892_page_is_set_upright_whichever_way_it_lies() -> None:
             found.append((lying, ocr.detect(command, picture), ocr.orientation(picture)))
     print(f"1892 page (lying, detected, confirmed): {found}")
     assert [confirmed for _lying, _detected, confirmed in found] == [0, 270, 180, 90], found
+    # The page exists to exercise the correction: Tesseract's detection is half a turn wrong on it.
+    assert any(detected != confirmed for _lying, detected, confirmed in found), found
 
 
 def test_the_ocr_child_reads_an_1892_page_upright_whichever_way_it_lies() -> None:
