@@ -12,7 +12,12 @@ torch, Docling and Tesseract (`OMP_THREAD_LIMIT`) may use.
 Each page is rendered with pypdfium2 at `SCALE` (216 DPI). A page lying at 90, 180 or 270 degrees is turned upright
 first, by Tesseract's orientation detection (the `tesseract` command, `--psm 0 -l osd`, as Docling runs it): Docling
 runs the same detection, but it turns only the words it reads, not the picture its layout model and reading order
-see, so an upside-down page would come out with its blocks in reverse. Its skew is then estimated within `MAX_SKEW`
+see, so an upside-down page would come out with its blocks in reverse (and since Story 1.22 Docling's own detection
+is switched off: the page reaches it upright, and it reads it as it lies). The detection can be half a turn wrong on
+old typefaces (Story 1.22: every page of an 1892 Portuguese book, upright ones included, came out as upside down), so
+its answer is checked by reading: Tesseract (`por+eng`) reads a band across the middle of the page turned as
+detected and turned half a turn further, and the turn with more words read with confidence wins; a tie keeps the
+detection. Its skew is then estimated within `MAX_SKEW`
 degrees with OpenCV (the angle whose rotation gives the sharpest profile of ink rows), and the page is rotated, with
 a white fill on a canvas that keeps every corner, when the angle is at least `MIN_SKEW`. The straightened picture
 goes to Docling as an image (`InputFormat.IMAGE`, at 216 DPI, so Docling reads it at its own size) with Tesseract
@@ -77,6 +82,20 @@ WHITE = (255, 255, 255)
 OSD_SECONDS = 20
 # The line of Tesseract's `--psm 0` report that says how many degrees, counter-clockwise, turn the page upright.
 _ORIENTATION = re.compile(r"^Orientation in degrees: *(0|90|180|270) *$", re.MULTILINE | re.ASCII)
+# Story 1.22: the detected turn is checked by reading a band of the page (from `BAND_TOP` to `BAND_BOTTOM` of the
+# turned and straightened page's height, `BAND_SIDE` in from each side) as detected and half a turn further. A word
+# counts when Tesseract gives it at least `CONFIDENT_WORD` (0 to 100) and it has two letters or digits. Half a turn
+# further wins only by `MIN_LEAD` words or more: text read upside down still yields a few such words (4 to 9 on the
+# test scans). Each read may take `READ_SECONDS`, like the detection.
+BAND_TOP = 0.35
+BAND_BOTTOM = 0.65
+BAND_SIDE = 0.1
+CONFIDENT_WORD = 60.0
+MIN_LEAD = 10
+READ_SECONDS = 20
+BAND = ".band.png"
+# Tesseract's TSV report: twelve columns, the confidence in the eleventh and the word in the last.
+_TSV_COLUMNS = 12
 
 type Reader = Callable[[Path], Any]
 type Orienter = Callable[[Path], int]
@@ -158,12 +177,8 @@ def parse_orientation(report: str) -> int:
     return int(found.group(1)) if found else 0
 
 
-def orientation(picture: Path) -> int:
-    """Tesseract's orientation detection on a page picture; 0 when it finds too little text to tell (a blank page), or
-    when Tesseract is missing (outside the image)."""
-    command = shutil.which("tesseract")
-    if command is None:
-        return 0
+def detect(command: str, picture: Path) -> int:
+    """Tesseract's orientation detection on a page picture; 0 when it finds too little text to tell (a blank page)."""
     try:
         done = subprocess.run(  # noqa: S603 - the image's own Tesseract on our own picture, never a shell
             [command, str(picture), "stdout", "--psm", "0", "-l", "osd"],
@@ -175,6 +190,70 @@ def orientation(picture: Path) -> int:
     except OSError, subprocess.SubprocessError:
         return 0
     return parse_orientation(done.stdout.decode("utf-8", "replace"))
+
+
+def confident_words(report: str) -> int:
+    """The words of Tesseract's TSV report read with at least `CONFIDENT_WORD` confidence and holding two letters or
+    digits."""
+    count = 0
+    for row in report.splitlines()[1:]:
+        columns = row.split("\t")
+        if len(columns) != _TSV_COLUMNS:
+            continue
+        try:
+            confidence = float(columns[10])
+        except ValueError:
+            continue
+        if confidence >= CONFIDENT_WORD and sum(1 for character in columns[11] if character.isalnum()) >= 2:
+            count += 1
+    return count
+
+
+def band(picture: np.ndarray, degrees: int) -> np.ndarray:
+    """The band across the middle of the picture turned `degrees` counter-clockwise and straightened, which
+    `readable_words` reads."""
+    turned = straighten(upright(picture, degrees))[0]
+    height, width = turned.shape[:2]
+    top, bottom = int(height * BAND_TOP), int(height * BAND_BOTTOM)
+    side = int(width * BAND_SIDE)
+    return np.ascontiguousarray(turned[top:bottom, side : width - side])
+
+
+def readable_words(command: str, picture: np.ndarray, degrees: int, target: Path) -> int:
+    """How many words Tesseract reads with confidence in the page's band turned `degrees`; 0 when it fails."""
+    write_picture(band(picture, degrees), target)
+    try:
+        done = subprocess.run(  # noqa: S603 - the image's own Tesseract on our own picture, never a shell
+            [command, str(target), "stdout", "-l", "por+eng", "--psm", "3", "tsv"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            check=True,
+            timeout=READ_SECONDS,
+        )
+    except OSError, subprocess.SubprocessError:
+        return 0
+    finally:
+        target.unlink(missing_ok=True)
+    return confident_words(done.stdout.decode("utf-8", "replace"))
+
+
+def orientation(picture: Path) -> int:
+    """The quarter turns, in degrees counter-clockwise, that set the page picture upright: Tesseract's detection,
+    unless half a turn further reads at least `MIN_LEAD` more words with confidence. 0 when Tesseract is missing
+    (outside the image)."""
+    command = shutil.which("tesseract")
+    if command is None:
+        return 0
+    detected = detect(command, picture)
+    opposite = (detected + 180) % 360
+    try:
+        with Image.open(picture) as opened:
+            pixels = np.array(opened.convert("L"))
+    except OSError:
+        return detected
+    target = picture.with_name(BAND)
+    as_detected = readable_words(command, pixels, detected, target)
+    return opposite if readable_words(command, pixels, opposite, target) >= as_detected + MIN_LEAD else detected
 
 
 def upright(picture: np.ndarray, degrees: int) -> np.ndarray:
@@ -228,6 +307,15 @@ def reader(artifacts: Path, threads: int) -> Reader:  # pragma: no cover - runs 
         TesseractCliOcrOptions,
     )
     from docling.document_converter import DocumentConverter, ImageFormatOption  # noqa: PLC0415
+    from docling.models.stages.ocr import tesseract_ocr_cli_model  # noqa: PLC0415
+
+    # Story 1.22: the picture reaches Docling already upright (`orientation`, checked by reading). Docling 2.145.0's
+    # Tesseract model runs the same detection again and turns the picture by it, with no option to stop it; on the
+    # 1892 scan that detection is half a turn wrong and undid the turn. So the model reads the picture as it lies:
+    # no detection (one Tesseract run fewer per page). It names its languages (`lang`), so it never needs the
+    # detection's script either. `tests/image` reads the 1892 page through this child.
+    setattr(tesseract_ocr_cli_model.TesseractOcrCliModel, "_perform_osd", lambda _self, _file: None)  # noqa: B010
+    setattr(tesseract_ocr_cli_model, "_parse_orientation", lambda _osd: 0)  # noqa: B010
 
     options = PdfPipelineOptions(
         artifacts_path=artifacts,
