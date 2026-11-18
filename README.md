@@ -276,6 +276,16 @@ lockfile and the production image:
     backend to retry; a re-run upserts the same ids. Lines carry ids, counts and codes only; the token key is held with
     `repr=False` and no text, title or token reaches Qdrant, Redis or a log.
   - Deploy the backend first: an older backend fails the claim body's contract check (`backend.incompatible`).
+- **Passages by id (backend contract 1.8.0, Story 2.2).** `contracts/internal.json` carries
+  `POST /internal/v1/jobs/{jobId}/claims/{claimId}/passages` (`readJobPassages`): with the claim's `X-Job-Grant` and
+  `{ids}` (1 to 100 passage ids), the backend answers `{passages: [{id, tier, text, sectionPath, page}]}` in the order
+  asked, each id once, `tier` being `campaign` or `system`. It checks every id against the job's resolved scope before
+  decrypting anything. The refusals: 400 `request.invalid` for a malformed body or an id that is not a UUID (before
+  the grant); 403 `job.grant_refused` for a wrong, ended or lapsed grant; 400 `job.passages_invalid` for no id, more
+  than 100 or a null one; 403 `job.passages_refused` for a kind that reads no passage; 404 `request.not_found` when the
+  job's campaign is gone; 403 `scope.passage_refused`, naming no id, when any id is out of the scope. No production job
+  kind implements `passages` yet: the story that adds the interactive (answer) job kind wires it, and the worker raises
+  `MINIMUM_BACKEND_CONTRACT_VERSION` (1.7.0 today) when it first calls the endpoint.
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.
