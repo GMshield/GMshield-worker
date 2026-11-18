@@ -22,6 +22,15 @@ read_only = true
 user = "10001:10001"
 cap_drop = ["ALL"]
 tmpfs = ["/tmp"]
+# Story 1.22 (measured on roberto-server 2026-11-18; docs/INFRASTRUCTURE.md, "Measured ingestion"):
+# memory = the largest peak outside page cache, 3,257 MiB (the SRD layout child's 3,103 MiB `childMaxRssKib`
+# plus the worker's 154 MiB `workerMaxRssKib`), x 1.3, rounded up to 256m. The container's memory.peak
+# (3,930 MiB) also counts page cache, which the kernel frees under a cap (Dalton, 2026-11-18). With Ollama
+# (about 0.7 GB) it fits ai.slice's 5,093 MiB limit.
+# cpus = 2, ai.slice's two threads: layout and OCR run 2 threads each (layout reached 3 CPUs uncapped).
+memory = "4352m"
+cpus = 2
+slice = "ai.slice"
 # Decrypted material lives only in the work folder (AD-21): a named volume, gmshield-worker-work,
 # in Docker's data on the encrypted volume (AD-24). The worker empties it at start.
 mounts = [{ name = "work", target = "/var/lib/gmshield-worker/work" }]
