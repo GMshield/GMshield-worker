@@ -18,6 +18,13 @@ image has no pytest); pytest collects it too, but `pyproject.toml` leaves `tests
 2026-11-17: drawn with Pillow 13.0.0 and encoded with pillow-heif 1.8.1 (libheif 1.23.6, x265 4.3) in a throwaway
 environment outside the project. It holds nothing but those two rectangles; pillow-heif is never a dependency here.
 
+`coimbra-1892-p2.jpg` (Story 1.22; 1802 x 2706, grey, JPEG quality 30, 216 DPI) is page 2 of Theophilo Braga,
+"Historia da universidade de Coimbra", volume 1 (Lisbon, 1892), from the Internet Archive item
+`historiadauniver01braguoft` (University of Toronto, marked NOT_IN_COPYRIGHT; public domain): its raw 600 DPI scan,
+`historiadauniver01braguoft_raw_0026.jp2`, rendered at 216 DPI and turned upright, the scanner's dark background
+kept. Tesseract's orientation detection is half a turn wrong on it whichever way it lies, as on every page of that
+book; the OCR child must still set it upright.
+
 `python /app/tests/image/test_image.py --ocr-timing PAGES` instead times the OCR child alone on a generated scan of
 PAGES pages (Story 1.17's timing check on roberto-server) and prints its time and peak memory.
 """
@@ -310,6 +317,58 @@ def test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox() -> N
         assert first["box"][1] < 0.3, (record["page"], first)
 
 
+COIMBRA = Path(__file__).with_name("coimbra-1892-p2.jpg")
+
+
+def test_an_1892_page_is_set_upright_whichever_way_it_lies() -> None:
+    import shutil
+
+    import numpy as np
+    from PIL import Image
+
+    from gmshield_worker.ingestion import ocr
+
+    command = shutil.which("tesseract")
+    assert command is not None
+    with Image.open(COIMBRA) as opened:
+        page = np.array(opened.convert("RGB"))
+    with tempfile.TemporaryDirectory(dir="/tmp") as name:
+        picture = Path(name) / ocr.PICTURE
+        found = []
+        for lying in (0, 90, 180, 270):  # the page lies turned this far counter-clockwise
+            ocr.write_picture(ocr.upright(page, lying), picture)
+            found.append((lying, ocr.detect(command, picture), ocr.orientation(picture)))
+    print(f"1892 page (lying, detected, confirmed): {found}")
+    assert [confirmed for _lying, _detected, confirmed in found] == [0, 270, 180, 90], found
+
+
+def test_the_ocr_child_reads_an_1892_page_upright_whichever_way_it_lies() -> None:
+    import json
+
+    from PIL import Image
+
+    from gmshield_worker.ingestion import layout
+    from tests import pdfs
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as name, Image.open(COIMBRA) as opened:
+        folder = Path(name)
+        page = opened.convert("L")
+        pdfs.scanned(folder / "source.pdf", [page, page.rotate(90, expand=True)])
+        result, manifest = run_ocr(folder, 1, 2)
+        assert manifest["pages"] == [1, 2], manifest
+        texts = [
+            " ".join(block["text"] for block in json.loads((folder / "out" / layout.page_file(number)).read_text(
+                encoding="utf-8"))["blocks"])
+            for number in (1, 2)
+        ]  # fmt: skip
+    print(f"ocr child: the 1892 page twice in {result.seconds:.1f} s, peak {result.max_rss_kib // 1024} MiB")
+    for text in texts:
+        # Read upright, in reading order: the first paragraph, then the second (the running head is not a block).
+        for words in ("grande crise", "synthese positiva", "Universidades na Europa"):
+            assert words in text, text[:300]
+        assert text.index("synthese positiva") < text.index("Universidades na Europa"), text[:300]
+
+
 HEIC = Path(__file__).with_name("two-colours.heic")
 
 
@@ -420,6 +479,8 @@ def main() -> int:
         test_the_clean_child_runs_in_its_sandbox,
         test_the_triage_and_layout_children_read_two_columns_and_a_table_offline_in_their_sandbox,
         test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox,
+        test_an_1892_page_is_set_upright_whichever_way_it_lies,
+        test_the_ocr_child_reads_an_1892_page_upright_whichever_way_it_lies,
         test_the_images_child_assembles_photos_offline_in_its_sandbox_and_ocr_reads_them_upright,
         test_tesseract_lists_portuguese_and_english,
         test_docling_converts_offline,
