@@ -9,8 +9,14 @@ Tesseract as its OCR engine. Since Story 1.15 the clean stage's child runs in it
 triage child and the layout child run there too: Docling reads a generated two-column page with a
 table offline, with its models given on the command line (the child's environment is empty). Since Story 1.17 the
 OCR child reads generated scans there (straight, turned 7 degrees, upside down, and blank) with Docling and Tesseract;
-the scans come from `tests/pdfs.py`, which the image carries for these checks. The file runs as a plain script (the
+the scans come from `tests/pdfs.py`, which the image carries for these checks. Since Story 1.21 the images child
+runs there too: it decodes a HEIC with the image's pi-heif, turns a photographed page upright by its EXIF
+orientation, and assembles them into a PDF whose pages the OCR child reads. The file runs as a plain script (the
 image has no pytest); pytest collects it too, but `pyproject.toml` leaves `tests/image` out of the ordinary test run.
+
+`two-colours.heic` (528 bytes, 96 x 64, red on its left half and blue on its right) was made for these tests on
+2026-11-17: drawn with Pillow 13.0.0 and encoded with pillow-heif 1.8.1 (libheif 1.23.6, x265 4.3) in a throwaway
+environment outside the project. It holds nothing but those two rectangles; pillow-heif is never a dependency here.
 
 `python /app/tests/image/test_image.py --ocr-timing PAGES` instead times the OCR child alone on a generated scan of
 PAGES pages (Story 1.17's timing check on roberto-server) and prints its time and peak memory.
@@ -304,6 +310,61 @@ def test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox() -> N
         assert first["box"][1] < 0.3, (record["page"], first)
 
 
+HEIC = Path(__file__).with_name("two-colours.heic")
+
+
+def test_the_images_child_assembles_photos_offline_in_its_sandbox_and_ocr_reads_them_upright() -> None:
+    import json
+    import threading
+
+    from PIL import Image
+
+    from gmshield_worker.ingestion import images, ocr, sandbox
+    from tests import pdfs
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as name:
+        folder = Path(name)
+        page = pdfs.raster_page(list(pdfs.SCAN_LINES)).convert("RGB")
+        # A photo taken with the phone turned: its pixels lie on their side, its EXIF orientation (6) says so.
+        exif = Image.Exif()
+        exif[0x0112] = 6
+        page.rotate(90, expand=True).save(folder / "image-00001", format="JPEG", quality=92, exif=exif.tobytes())
+        page.save(folder / "image-00002", format="PNG")
+        (folder / "image-00003").write_bytes(HEIC.read_bytes())
+        (folder / "image-00004").write_bytes(b"\x00\x00\x00\x18ftypheic" + bytes(400))
+        result = sandbox.run_child(
+            Path(images.__file__),
+            ["out", "image-00001", "image-00002", "image-00003", "image-00004"],
+            folder=folder,
+            cancel=threading.Event(),
+        )
+        assert result.returncode == 0, result
+        manifest = json.loads((folder / "out" / images.MANIFEST).read_text(encoding="utf-8"))
+        assert manifest["pageTotal"] == 4 and manifest["unreadable"] == [4], manifest
+        import pypdfium2 as pdfium  # type: ignore[import-untyped]
+
+        document = pdfium.PdfDocument((folder / "out" / images.ORIGINAL).read_bytes())
+        try:
+            heic = document[2].render(scale=3).to_pil().convert("RGB")
+        finally:
+            document.close()
+        assert heic.size == (96, 64), heic.size
+        left, right = heic.getpixel((10, 30)), heic.getpixel((80, 30))
+        assert isinstance(left, tuple) and isinstance(right, tuple) and left[0] > 180 and right[2] > 180, (left, right)
+        (folder / "source.pdf").write_bytes((folder / "out" / "batch-00001.pdf").read_bytes())
+        for path in (folder / "out").iterdir():
+            path.unlink()
+        (folder / "out").rmdir()
+        _, read = run_ocr(folder, 1, 2)
+        assert read["pages"] == [1, 2], read
+        for number in (1, 2):
+            record = json.loads((folder / "out" / ocr.layout.page_file(number)).read_text(encoding="utf-8"))
+            text = " ".join(block["text"] for block in record["blocks"])
+            for word in OCR_WORDS:
+                assert word in text, (number, text)
+    print(f"images child: 4 images in {result.seconds:.1f} s, peak {result.max_rss_kib // 1024} MiB")
+
+
 def ocr_timing(pages: int) -> int:
     """The OCR child alone over a generated scan of `pages` pages: its time, peak memory and outcome."""
     with tempfile.TemporaryDirectory(dir="/tmp") as name:
@@ -359,6 +420,7 @@ def main() -> int:
         test_the_clean_child_runs_in_its_sandbox,
         test_the_triage_and_layout_children_read_two_columns_and_a_table_offline_in_their_sandbox,
         test_the_ocr_child_straightens_and_reads_scans_offline_in_its_sandbox,
+        test_the_images_child_assembles_photos_offline_in_its_sandbox_and_ocr_reads_them_upright,
         test_tesseract_lists_portuguese_and_english,
         test_docling_converts_offline,
     )

@@ -17,6 +17,13 @@ size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in 
   and Tesseract; the report gives each page `read_by_ocr` or `unreadable`, the pages read as `texts` files, in
   layout's shape, and a page view per page whose child read it (a blank scan, `unreadable`, has its picture and no
   lines).
+- `images` (Story 1.21; an image set, its images named in the claim input's `inputs` in their order): `images.py`
+  assembles them into one image-only PDF, one page per image (per frame of a TIFF), and splits it into batches as
+  clean does; the report gives what clean's gives. An image that did not decode is a blank page at its place, which
+  OCR then reports `unreadable` like any blank scan (so Reprocessar finds the step that read it, as for a PDF). From
+  the claim's second attempt on, one child decodes each image (a child that fails, crashes or runs out of time is one
+  blank page) and a last one assembles. A restart reads the stored original instead (`input: "source"`), which is a
+  PDF: it is cleaned again. The later stages read an image set's pages as a PDF's.
 - `text` (a TXT or Markdown upload): `text.py` splits it into pages of bounded length; the report gives the file back
   unchanged as the `original`, `pageTotal`, one `read_directly` range, its `texts` files, a page view `{page, text}`
   per page (no picture) and the `passages` step.
@@ -53,7 +60,7 @@ import httpx
 
 from gmshield_worker.backend.client import ClaimedJob, Outcome
 from gmshield_worker.backend.files import FileTransferError, StoredOutput
-from gmshield_worker.ingestion import PIPELINE_VERSION, clean, layout, ocr, passages, sandbox, text, triage
+from gmshield_worker.ingestion import PIPELINE_VERSION, clean, images, layout, ocr, passages, sandbox, text, triage
 from gmshield_worker.ingestion.errors import (
     FILE_UNREADABLE,
     PASSWORD_REQUIRED,
@@ -72,7 +79,13 @@ LAYOUT = "layout"
 OCR = "ocr"
 TEXT = "text"
 PASSAGES = "passages"
+IMAGES = "images"
 PDF = "pdf"
+# The format of an image set's version (Story 1.21): its pages are read as a PDF's once assembled.
+IMAGE_SET = "images"
+# The formats an image of a set may have, and the most images a set holds (the backend's limits).
+IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "tiff", "bmp", "heic"})
+MAX_IMAGES = 500
 # The input of a step over every text file of the version (Story 1.18), and the one file a passages step holds.
 TEXTS = "texts"
 TEXTS_FILE = "texts.json"
@@ -85,6 +98,7 @@ TRIAGE_SCRIPT = Path(triage.__file__)
 LAYOUT_SCRIPT = Path(layout.__file__)
 OCR_SCRIPT = Path(ocr.__file__)
 TEXT_SCRIPT = Path(text.__file__)
+IMAGES_SCRIPT = Path(images.__file__)
 # The stages this worker runs, by stage and format.
 STAGES = frozenset(
     {
@@ -97,6 +111,11 @@ STAGES = frozenset(
         (PASSAGES, PDF),
         (PASSAGES, "txt"),
         (PASSAGES, "markdown"),
+        (IMAGES, IMAGE_SET),
+        (TRIAGE, IMAGE_SET),
+        (LAYOUT, IMAGE_SET),
+        (OCR, IMAGE_SET),
+        (PASSAGES, IMAGE_SET),
     }
 )
 # The most image pages one `ocr` step reads: the worker owns this size. Ten pages must stay well inside a step's
@@ -104,6 +123,9 @@ STAGES = frozenset(
 OCR_PAGES = 10
 # The time a page-by-page retry shares among its pages: each child gets this divided by the step's page count.
 PAGE_BUDGET_SECONDS = 540.0
+# A retried images step (Story 1.21): the time kept for its assembling child, and the least an image's decoding gets.
+ASSEMBLE_RESERVE_SECONDS = 60.0
+IMAGE_FLOOR_SECONDS = 2.0
 # Docling's models, baked into the image (the Dockerfile's DOCLING_ARTIFACTS_PATH), and its threads.
 DOCLING_ARTIFACTS = "/opt/docling-models"
 LAYOUT_THREADS = 2
@@ -115,6 +137,7 @@ _OUTPUT_FILE = re.compile(r"(original|batch-[0-9]{5})\.pdf", re.ASCII)
 _TEXT_FILE = re.compile(r"text-[0-9]{5}\.json", re.ASCII)
 _UUID = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", re.ASCII)
 _TEXT_INPUT = re.compile(r"text-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.ASCII)
+_IMAGE_INPUT = re.compile(r"image-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.ASCII)
 MAX_PAGES = 1_000_000
 # The backend's limits on a page view (Story 1.19): a picture's side in pixels, its lines and each line's code points,
 # and a text page's code points. Lines past them are dropped or cut here, so a page never fails its version.
@@ -147,6 +170,8 @@ class Manifest:
     page_total: int
     original: str
     batches: list[Batch]
+    # The images child's pages whose image did not decode (Story 1.21); never any from clean.
+    unreadable: tuple[int, ...] = ()
 
 
 def _page(value: object, total: int = MAX_PAGES) -> bool:
@@ -183,7 +208,14 @@ def read_manifest(out: Path) -> Manifest:
         or not _OUTPUT_FILE.fullmatch(original)
     ):
         raise StepFailed(STEP_FAILED)
-    return Manifest(total, original, batches)
+    unreadable = body.get("unreadable", [])
+    if (
+        not isinstance(unreadable, list)
+        or any(not _page(page, total) for page in unreadable)
+        or unreadable != sorted(set(unreadable))
+    ):
+        raise StepFailed(STEP_FAILED)
+    return Manifest(total, original, batches, tuple(unreadable))
 
 
 def read_layers(out: Path, pages: list[int]) -> dict[int, str]:
@@ -262,6 +294,14 @@ class TextInput:
 
 
 @dataclass(frozen=True)
+class ImageInput:
+    """One image an images step reads (Story 1.21): its input name and its format."""
+
+    name: str
+    format: str
+
+
+@dataclass(frozen=True)
 class StepInput:
     """What the claim's input says about the step, checked: the stage's pages and the input file's; for a step over
     every text file, those files in page order."""
@@ -274,6 +314,7 @@ class StepInput:
     input_file_id: str | None
     input_first_page: int | None
     texts: tuple[TextInput, ...] = ()
+    images: tuple[ImageInput, ...] = ()
 
     def pages(self) -> list[int]:
         if self.first_page is None or self.last_page is None:
@@ -319,7 +360,26 @@ def step_input(values: dict[str, Any]) -> StepInput:
         if first is not None and last is not None and not input_first <= first <= last <= input_last:
             raise StepFailed(STEP_FAILED, retry=False)
     texts = _texts(values.get("texts"), total) if name == TEXTS else ()
-    return StepInput(str(values.get("stage")), name, total, first, last, file_id, input_first, texts)
+    inputs = _images(values.get("inputs")) if name == IMAGES else ()
+    return StepInput(str(values.get("stage")), name, total, first, last, file_id, input_first, texts, inputs)
+
+
+def _images(value: object) -> tuple[ImageInput, ...]:
+    """The images of an images step (Story 1.21), in their order: 1 to `MAX_IMAGES`, names of their own kind, each
+    once, each an image's format."""
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_IMAGES:
+        raise StepFailed(STEP_FAILED, retry=False)
+    found: list[ImageInput] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise StepFailed(STEP_FAILED, retry=False)
+        name, kind = item.get("name"), item.get("format")
+        if not isinstance(name, str) or not _IMAGE_INPUT.fullmatch(name) or kind not in IMAGE_FORMATS:
+            raise StepFailed(STEP_FAILED, retry=False)
+        found.append(ImageInput(name, str(kind)))
+    if len({item.name for item in found}) != len(found):
+        raise StepFailed(STEP_FAILED, retry=False)
+    return tuple(found)
 
 
 def _texts(value: object, total: int | None) -> tuple[TextInput, ...]:
@@ -351,6 +411,7 @@ class IngestionStep:
     deadline_seconds: float = sandbox.DEADLINE_SECONDS
     page_budget_seconds: float = PAGE_BUDGET_SECONDS
     runner: Runner = field(default=sandbox.run_child)
+    clock: Callable[[], float] = field(default=time.monotonic)
     artifacts: str = field(default_factory=lambda: os.environ.get("DOCLING_ARTIFACTS_PATH", DOCLING_ARTIFACTS))
 
     def __call__(self, job: ClaimedJob, cancel: threading.Event, /) -> Outcome:
@@ -374,6 +435,7 @@ class IngestionStep:
         log.info("ingestion.step_started", jobId=job_id, stage=stage, attempt=job.attempt)
         run = {
             CLEAN: self._clean,
+            IMAGES: self._images,
             TRIAGE: self._triage,
             LAYOUT: self._layout,
             OCR: self._ocr,
@@ -445,6 +507,85 @@ class IngestionStep:
             + [passages_step(manifest.page_total)],
         }
         return result, {"pageTotal": manifest.page_total, "batches": len(batches)}
+
+    def _images(
+        self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """An image set's images, in order, into one PDF (Story 1.21). A restart's input is the stored original, a PDF
+        this stage assembled before: it is cleaned and split again, as clean does."""
+        if checked.name != IMAGES:
+            return self._clean(job, checked, cancel, folder, log)
+        started = self.clock()
+        sources: list[str] = []
+        for index, item in enumerate(checked.images, start=1):
+            target = f"image-{index:05d}"
+            size = self.files.download(job, item.name, folder / target)
+            log.info("ingestion.input_downloaded", jobId=str(job.job_id), size=size)
+            _stop_if_cancelled(cancel)
+            sources.append(target)
+        deadline = self.deadline_seconds
+        if job.attempt <= 1:
+            arguments = [OUT_DIR, *sources]
+        else:
+            # A retry: one child per image, so an image that crashes its decoder is one blank page. The whole retry
+            # keeps to one budget, `deadline_seconds` from the step's start: each decoding child gets the time left,
+            # less a reserve for assembling, shared among the images left (never under `IMAGE_FLOOR_SECONDS`); an image
+            # with no time left for it is not decoded (a blank page); the assembling child gets whatever is left.
+            decoded: list[str] = []
+            for index, source in enumerate(sources, start=1):
+                target = f"decoded-{index:05d}"
+                spare = self.deadline_seconds - (self.clock() - started) - ASSEMBLE_RESERVE_SECONDS
+                if spare >= IMAGE_FLOOR_SECONDS:
+                    share = max(IMAGE_FLOOR_SECONDS, spare / (len(sources) - index + 1))
+                    self._child(
+                        job,
+                        IMAGES_SCRIPT,
+                        ["--decode", source, target],
+                        folder=folder,
+                        log=log,
+                        cancel=cancel,
+                        deadline=min(share, spare),
+                        page=index,
+                    )
+                    _stop_if_cancelled(cancel)
+                (folder / source).unlink()
+                decoded.append(target)
+            arguments = ["--assemble", OUT_DIR, *decoded]
+            deadline = max(self.deadline_seconds - (self.clock() - started), 0.0)
+        child = self._child(job, IMAGES_SCRIPT, arguments, folder=folder, log=log, cancel=cancel, deadline=deadline)
+        if not _succeeded(child):
+            raise StepFailed(STEP_FAILED)
+        for source in sources:
+            (folder / source).unlink(missing_ok=True)
+        out = folder / OUT_DIR
+        manifest = read_manifest(out)
+        original = self._send(job, out, manifest.original)
+        stored_batches = [
+            (str(self._send(job, out, batch.file).file_id), batch.first_page, batch.last_page)
+            for batch in manifest.batches
+        ]
+        log.info("ingestion.outputs_stored", jobId=str(job.job_id), files=1 + len(stored_batches))
+        result = {
+            "pipelineVersion": PIPELINE_VERSION,
+            "pageTotal": manifest.page_total,
+            "original": {"fileId": str(original.file_id)},
+            "batches": [
+                {"fileId": file_id, "firstPage": first, "lastPage": last} for file_id, first, last in stored_batches
+            ],
+            # Each batch's triage, as clean asks it; the blank page of an image that did not decode goes to OCR,
+            # which reports it unreadable. Then the passages step, held until every page has an outcome.
+            "next": [
+                {"stage": TRIAGE, "firstPage": first, "lastPage": last, "input": file_id}
+                for file_id, first, last in stored_batches
+            ]
+            + [passages_step(manifest.page_total)],
+        }
+        return result, {
+            "images": len(sources),
+            "pageTotal": manifest.page_total,
+            "batches": len(stored_batches),
+            "undecodedPages": len(manifest.unreadable),
+        }
 
     def _triage(
         self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
@@ -668,7 +809,8 @@ class IngestionStep:
         self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
     ) -> tuple[dict[str, Any], dict[str, int]]:
         """Every text file of the version, one at a time, through one cutter: the heading stack crosses files."""
-        pdf = job.input.get("format") == PDF
+        # An image set's pages are a PDF's once assembled (Story 1.21).
+        pdf = job.input.get("format") in (PDF, IMAGE_SET)
         cutter = passages.cutter(pdf)
         path = folder / TEXTS_FILE
         for item in checked.texts:
