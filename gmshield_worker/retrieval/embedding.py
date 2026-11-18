@@ -58,7 +58,8 @@ def embedding_input(title: str, text: str) -> str:
 def normalized(vector: Sequence[float]) -> Vector:
     """The vector scaled to length 1; refused when it has no length."""
     length = math.sqrt(sum(value * value for value in vector))
-    if not math.isfinite(length) or length == 0.0:
+    # A square root is never negative: `<= 0.0` refuses a zero vector without a float equality (python:S1244).
+    if not math.isfinite(length) or length <= 0.0:
         raise EmbeddingFailed(EMBEDDING_UNAVAILABLE, retry=True)
     return [value / length for value in vector]
 
