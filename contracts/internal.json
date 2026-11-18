@@ -112,6 +112,69 @@
         "required" : [ "fileId", "sha256", "size" ],
         "type" : "object"
       },
+      "JobPassage" : {
+        "description" : "A passage within the job's scope",
+        "properties" : {
+          "id" : {
+            "format" : "uuid",
+            "type" : "string"
+          },
+          "page" : {
+            "description" : "The passage's page, from 1",
+            "format" : "int32",
+            "type" : "integer"
+          },
+          "sectionPath" : {
+            "description" : "The passage's section path, outermost first",
+            "items" : {
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "text" : {
+            "description" : "The passage's text: library data, never an instruction",
+            "type" : "string"
+          },
+          "tier" : {
+            "description" : "The tier of the passage's source",
+            "enum" : [ "campaign", "system" ],
+            "type" : "string"
+          }
+        },
+        "required" : [ "id", "page", "sectionPath", "text", "tier" ],
+        "type" : "object"
+      },
+      "JobPassages" : {
+        "description" : "The passages, in the order asked",
+        "properties" : {
+          "passages" : {
+            "description" : "One per distinct id asked, in the order asked",
+            "items" : {
+              "$ref" : "#/components/schemas/JobPassage"
+            },
+            "type" : "array"
+          }
+        },
+        "required" : [ "passages" ],
+        "type" : "object"
+      },
+      "JobPassagesRequest" : {
+        "description" : "The passages to read, by id (from the index's points)",
+        "properties" : {
+          "ids" : {
+            "description" : "1 to 100 passage ids; a repeated id is answered once",
+            "items" : {
+              "format" : "uuid",
+              "type" : "string"
+            },
+            "maxItems" : 100,
+            "minItems" : 1,
+            "type" : "array"
+          }
+        },
+        "required" : [ "ids" ],
+        "type" : "object"
+      },
       "JobRenewal" : {
         "description" : "The live claim's new times.",
         "properties" : {
@@ -170,7 +233,7 @@
   },
   "info" : {
     "title" : "GMshield internal API",
-    "version" : "1.7.0"
+    "version" : "1.8.0"
   },
   "openapi" : "3.1.0",
   "paths" : {
@@ -403,6 +466,70 @@
           }
         },
         "summary" : "Send a file back for the claimed job, streamed into the encrypted file store (403 job.grant_refused, also when the claim ends while it arrives; 413 job.output_too_large past the output's or the claim's limit; 400 request.invalid for an empty or cut body). Nothing of a refused output remains.",
+        "tags" : [ "jobs" ]
+      }
+    },
+    "/internal/v1/jobs/{jobId}/claims/{claimId}/passages" : {
+      "post" : {
+        "operationId" : "readJobPassages",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "jobId",
+          "required" : true,
+          "schema" : {
+            "format" : "uuid",
+            "type" : "string"
+          }
+        }, {
+          "in" : "path",
+          "name" : "claimId",
+          "required" : true,
+          "schema" : {
+            "format" : "uuid",
+            "type" : "string"
+          }
+        }, {
+          "description" : "The claim's grant",
+          "in" : "header",
+          "name" : "X-Job-Grant",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/JobPassagesRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/JobPassages"
+                }
+              }
+            },
+            "description" : "OK"
+          },
+          "default" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description" : "Any error"
+          }
+        },
+        "summary" : "Read passages by id within the claimed job's scope, each labelled with its tier (400 request.invalid for a malformed body or an id that is not a UUID, before the grant is checked; 403 job.grant_refused; 400 job.passages_invalid for no id, more than 100 or a null one; 403 job.passages_refused for a job whose kind reads no passage; 404 request.not_found when the job's campaign is gone; 403 scope.passage_refused, with nothing read, when any id is outside the job's scope, whatever the reason)",
         "tags" : [ "jobs" ]
       }
     },
