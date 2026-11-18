@@ -23,6 +23,7 @@ every transitive one, and `[tool.uv] exclude-newer` keeps them all on or before 
 | attrs (used by the generated client) | 26.1.0 | `pyproject.toml` |
 | pikepdf (the clean stage, Story 1.15; MPL-2.0, released 2026-10-11, qpdf 12.4.2 inside) | 10.17.0 | `pyproject.toml` |
 | pypdfium2 (the triage stage, Story 1.16; already installed by Docling, released 2026-10-04) | 5.14.0 | `pyproject.toml` |
+| pi-heif (the images stage's HEIC decoder, Story 1.21; released 2026-06-10). The binding is BSD-3-Clause; its wheel bundles libheif and libde265 (LGPL-3.0, decode only, no x265 encoder). Never pillow-heif, whose wheel bundles x265 (GPL) | 1.4.0 | `pyproject.toml` |
 | openapi-python-client (client generator) | 0.29.1 | `pyproject.toml` (development) |
 | pytest, pytest-cov | 9.2.0, 7.1.0 | `pyproject.toml` (development) |
 | ruff | 0.17.3 | `pyproject.toml` (development) |
@@ -68,7 +69,7 @@ lockfile and the production image:
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
 | `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
 | `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind) and `probe.py` (test mode only) |
-| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.19): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
+| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.21): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `images.py` (Pillow, pi-heif and pikepdf; Story 1.21), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
 | `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
@@ -164,7 +165,7 @@ lockfile and the production image:
   - Logs carry the job's trace id, the sizes, counts and times, and the child's and the worker's
     peak RSS (`childMaxRssKib`, `workerMaxRssKib`). A generated 1 GiB PDF is cleaned with a child
     peak under 512 MiB (`tests/test_clean.py`).
-- **Reading pages (Stories 1.16 and 1.17; `PIPELINE_VERSION` "3", now "5").** The clean report asks one `triage` step per
+- **Reading pages (Stories 1.16 and 1.17; `PIPELINE_VERSION` "3", now "6").** The clean report asks one `triage` step per
   batch. Triage (`triage.py`, pypdfium2) gives each page a layer: `text` when its text layer has at
   least 16 characters other than whitespace, unless it has fewer than 200 and one image covers at least
   half of the page, else `image`; its report gives the `layers`, one `layout` step per run of text pages,
@@ -223,6 +224,27 @@ lockfile and the production image:
     `texts` files (at most 16,384 code points).
   - The backend stores one encrypted page view per page and adopts each picture as a `picture` file of its page; a
     report replaces the views of the pages it carries. Deploy the backend before this worker.
+- **Photos as the pages of one material (Story 1.21, `PIPELINE_VERSION` "6", backend contract 1.6.0 or later).** An
+  image set's version has the format `images` (an image sent alone is a set of one). Its first step, `images`, has the
+  claim input `input: "images"` and `inputs: [{name: "image-<uploadId>", format}]`, the set's images in their
+  confirmed order, each downloaded by its name (`GET …/inputs/image-<uploadId>`).
+  - `images.py` decodes each with Pillow (HEIC through pi-heif, no system libheif), turns it upright by its EXIF
+    orientation, lays a transparent one on white, keeps it grey or makes it RGB, shrinks it (never enlarges) to at most
+    24 million pixels and 10,000 a side, and writes it as a JPEG (quality 90, which also drops the photo's other
+    metadata) on a page of its pixels at 216 DPI, the OCR stage's resolution. A multi-frame TIFF gives one page per
+    frame, in place. A picture past 200 million pixels is refused before it is decoded. An image or a frame that does
+    not decode is a blank A4 page at its place; it never fails the step.
+  - The child writes what `clean.py` writes (`original.pdf`, batches of 20 pages, the manifest) plus `unreadable`,
+    the blank pages (logged as `undecodedPages`). The report is clean's: `original`, `batches`, one `triage` step per
+    batch and the held `passages` step. Triage, layout, OCR and passages then read the pages as a PDF's (format
+    `images`); OCR reports a blank page `unreadable`, as any blank scan, so Reprocessar finds the step that read it.
+    The backend removes every image's raw upload once the original is recorded.
+  - From the claim's second attempt on, one child decodes each image (`--decode`, a share of the 540 s each) and a
+    last one assembles (`--assemble`): an image whose child crashes or runs out of time is one unreadable page.
+  - A restart (`ingestion.pipeline_changed`) or a retry from the stored original gives the `images` step
+    `input: "source"`, the assembled PDF, which is cleaned and split again as `clean` does.
+  - The in-image check decodes `tests/image/two-colours.heic` (provenance in `tests/image/test_image.py`) in the
+    sandbox and reads two photographed pages, one of them lying on its side with its EXIF orientation, by OCR.
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.

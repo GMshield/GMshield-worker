@@ -19,6 +19,9 @@ dependencies = [
     "opencv-python-headless==5.0.0.93",  # deskew; Apache-2.0
     "numpy==2.5.4",
     "pillow==13.0.0",  # the straightened page picture at 216 DPI
+    # The images stage (Story 1.21) decodes HEIC with it. BSD-3-Clause binding; its wheel bundles libheif and libde265
+    # (LGPL-3.0, decode only, no x265). Never pillow-heif, whose wheel bundles x265 (GPL).
+    "pi-heif==1.4.0",
 ]
 
 [dependency-groups]

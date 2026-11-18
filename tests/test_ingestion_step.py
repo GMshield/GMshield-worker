@@ -933,3 +933,210 @@ def test_the_stand_in_refuses_page_views_the_backend_would_refuse(stand_in: Stan
 def _written(path: Path) -> Path:
     path.write_bytes(PICTURE)
     return path
+
+
+# --- Story 1.21: an image set's images assembled into one PDF
+
+# A 96 x 64 HEIC, red on its left half and blue on its right, committed for these tests (see tests/image/test_image.py
+# for its provenance).
+HEIC = Path(__file__).parent / "image" / "two-colours.heic"
+RED = (220, 30, 30)
+WHITE_PAGE = (255, 255, 255)
+
+
+def image_name(index: int) -> str:
+    return f"image-0195a3c0-0000-7000-8000-{index:012d}"
+
+
+def images_input(formats: list[str]) -> dict[str, Any]:
+    """An images step's claim input: the set's images, in their order."""
+    return {
+        "versionId": CLEAN_INPUT["versionId"],
+        "stage": "images",
+        "format": "images",
+        "input": "images",
+        "inputs": [{"name": image_name(index), "format": fmt} for index, fmt in enumerate(formats, start=1)],
+    }
+
+
+def encoded_image(picture: Any, fmt: str, **options: Any) -> bytes:
+    buffer = io.BytesIO()
+    picture.save(buffer, format=fmt, **options)
+    return buffer.getvalue()
+
+
+def photo_set() -> list[tuple[str, bytes]]:
+    """A JPEG lying on its side with its EXIF orientation (upright, 40 x 60 with a red block at its top-left), the HEIC,
+    a WebP, a TIFF of two frames, a BMP, a HEIC that does not decode and a PNG with transparency: eight pages, the
+    seventh unreadable. Each page has a size of its own."""
+    from PIL import Image, ImageDraw
+
+    upright = Image.new("RGB", (40, 60), WHITE_PAGE)
+    ImageDraw.Draw(upright).rectangle([0, 0, 14, 14], fill=RED)
+    exif = Image.Exif()
+    exif[0x0112] = 6  # turn 90 degrees clockwise to show it
+    lying = upright.rotate(90, expand=True)
+    frames = [Image.new("L", (30, 20), 0), Image.new("L", (32, 20), 128)]
+    tiff = io.BytesIO()
+    frames[0].save(tiff, format="TIFF", save_all=True, append_images=frames[1:])
+    transparent = Image.new("RGBA", (24, 36), (0, 0, 0, 0))
+    return [
+        ("jpeg", encoded_image(lying, "JPEG", quality=95, exif=exif.tobytes())),
+        ("heic", HEIC.read_bytes()),
+        ("webp", encoded_image(Image.new("RGB", (50, 20), (0, 200, 0)), "WEBP", lossless=True)),
+        ("tiff", tiff.getvalue()),
+        ("bmp", encoded_image(Image.new("RGB", (16, 16), (0, 0, 255)), "BMP")),
+        ("heic", b"\x00\x00\x00\x18ftypheic" + bytes(600)),
+        ("png", encoded_image(transparent, "PNG")),
+    ]
+
+
+def claim_images(stand_in: StandIn, images: list[tuple[str, bytes]]) -> ClaimedJob:
+    stand_in.credential = CREDENTIAL
+    files = {image_name(index): content for index, (_fmt, content) in enumerate(images, start=1)}
+    job_id = stand_in.offer(
+        "ingestion", images_input([fmt for fmt, _content in images]), trace_id=new_trace_id(), inputs=files
+    )
+    answer = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(job_id), new_trace_id())
+    assert answer.job is not None
+    return answer.job
+
+
+def rendered(content: bytes) -> list[Any]:
+    """Each page of a PDF rendered at 216 DPI, as the OCR stage renders it."""
+    import pypdfium2 as pdfium  # type: ignore[import-untyped]
+
+    document = pdfium.PdfDocument(content)
+    try:
+        return [document[index].render(scale=3).to_pil().convert("RGB") for index in range(len(document))]
+    finally:
+        document.close()
+
+
+def near(colour: tuple[int, int, int], expected: tuple[int, int, int]) -> bool:
+    return all(abs(got - want) <= 12 for got, want in zip(colour, expected, strict=True))
+
+
+def test_an_image_sets_images_become_its_pages_in_order_upright_and_an_undecodable_one_is_a_blank_page_in_place(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job = claim_images(stand_in, photo_set())
+    work = tmp_path / "work"
+
+    outcome = handler(stand_in, work)(job, threading.Event())
+
+    assert outcome.outcome == "done", outcome
+    result = outcome.result
+    assert result is not None
+    assert result["pipelineVersion"] == PIPELINE_VERSION
+    assert result["pageTotal"] == 8
+    assert [(batch["firstPage"], batch["lastPage"]) for batch in result["batches"]] == [(1, 8)]
+    # The undecodable image is a blank page that triage sends to OCR, which reports it unreadable as any blank scan.
+    assert "pages" not in result
+    batch = result["batches"][0]["fileId"]
+    assert result["next"] == [
+        {"stage": "triage", "firstPage": 1, "lastPage": 8, "input": batch},
+        {"stage": "passages", "firstPage": 1, "lastPage": 8, "input": "texts"},
+    ]
+    assert ingestion_result_valid(stand_in.jobs[str(job.job_id)], result)
+    pages = rendered(stand_in.outputs[result["original"]["fileId"]])
+    # Each page keeps its picture's pixels at 216 DPI, in the set's order, a TIFF's frames in place.
+    assert [page.size for page in pages[:6]] == [(40, 60), (96, 64), (50, 20), (30, 20), (32, 20), (16, 16)]
+    assert pages[7].size == (24, 36)
+    # The JPEG is upright: its red block at the top-left, white below it.
+    assert near(pages[0].getpixel((5, 5)), RED)
+    assert near(pages[0].getpixel((35, 55)), WHITE_PAGE)
+    assert near(pages[1].getpixel((10, 30)), RED)
+    assert near(pages[1].getpixel((80, 30)), (30, 30, 220))
+    assert near(pages[2].getpixel((25, 10)), (0, 200, 0))
+    assert near(pages[3].getpixel((5, 5)), (0, 0, 0))
+    assert near(pages[4].getpixel((5, 5)), (128, 128, 128))
+    assert near(pages[5].getpixel((5, 5)), (0, 0, 255))
+    # The undecodable image is a blank page at its place; the transparent PNG lies on white.
+    assert pages[6].getpixel((100, 100)) == WHITE_PAGE
+    assert pages[7].getpixel((5, 5)) == WHITE_PAGE
+    assert rendered(stand_in.outputs[batch]) and len(rendered(stand_in.outputs[batch])) == 8
+    assert list(work.iterdir()) == []
+    lines = [line for line in log_lines(capsys.readouterr().out) if line.get("jobId") == str(job.job_id)]
+    assert [line["event"] for line in lines].count("ingestion.input_downloaded") == 7
+    assert lines[-1]["event"] == "ingestion.step_done"
+    assert lines[-1]["undecodedPages"] == 1
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
+
+
+def test_a_retried_images_step_decodes_one_child_per_image_and_one_that_crashes_is_a_blank_page(
+    stand_in: StandIn, tmp_path: Path
+) -> None:
+    images = photo_set()[:3]
+    job = claim_images(stand_in, images)
+    calls: list[tuple[list[str], float]] = []
+
+    def runner(script: Path, arguments: list[str], **options: Any) -> sandbox.ChildResult:
+        calls.append((arguments, options["deadline_seconds"]))
+        if arguments[:2] == ["--decode", "image-00002"]:
+            return sandbox.ChildResult(returncode=-9, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
+        return sandbox.run_child(script, arguments, **options)
+
+    outcome = handler(stand_in, tmp_path / "work", runner=runner, page_budget_seconds=540.0)(
+        retried(job), threading.Event()
+    )
+
+    assert [arguments for arguments, _deadline in calls] == [
+        ["--decode", "image-00001", "decoded-00001"],
+        ["--decode", "image-00002", "decoded-00002"],
+        ["--decode", "image-00003", "decoded-00003"],
+        ["--assemble", "out", "decoded-00001", "decoded-00002", "decoded-00003"],
+    ]
+    assert [deadline for _arguments, deadline in calls[:3]] == [180.0, 180.0, 180.0]
+    assert outcome.result is not None
+    assert outcome.result["pageTotal"] == 3
+    pages = rendered(stand_in.outputs[outcome.result["original"]["fileId"]])
+    assert [page.size for page in pages[::2]] == [(40, 60), (50, 20)]
+    # The image whose child crashed is a blank page at its place.
+    assert pages[1].getpixel((100, 100)) == WHITE_PAGE
+    assert near(pages[0].getpixel((5, 5)), RED)
+    assert list((tmp_path / "work").iterdir()) == []
+
+
+def test_a_restarted_image_set_reads_its_stored_original_and_cleans_it_again(stand_in: StandIn, tmp_path: Path) -> None:
+    content = made(tmp_path / "original.pdf", lambda path: pdfs.with_text(path, [SENTENCE, SENTENCE]))
+    job = claim(stand_in, content, {**CLEAN_INPUT, "stage": "images", "format": "images", "pageTotal": 2})
+
+    outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
+
+    assert outcome.result is not None
+    assert outcome.result["pageTotal"] == 2
+    assert "pages" not in outcome.result
+    assert [item["stage"] for item in outcome.result["next"]] == ["triage", "passages"]
+    assert ingestion_result_valid(stand_in.jobs[str(job.job_id)], outcome.result)
+
+
+def test_a_malformed_images_input_fails_at_once_before_any_download(stand_in: StandIn, tmp_path: Path) -> None:
+    good = images_input(["jpeg", "png"])
+    for inputs in (
+        None,
+        [],
+        [{"name": "image-../x", "format": "jpeg"}],
+        [{"name": image_name(1), "format": "pdf"}],
+        [{"name": image_name(1), "format": "jpeg"}, {"name": image_name(1), "format": "png"}],
+        [{"name": image_name(index), "format": "jpeg"} for index in range(1, 502)],
+        ["image"],
+    ):
+        job = claim(stand_in, b"x", {**good, "inputs": inputs})
+        outcome = handler(stand_in, tmp_path / "work")(job, threading.Event())
+        assert outcome == Outcome.failed(STEP_FAILED, retry=False), inputs
+        assert not any("/inputs/" in request["path"] for request in stand_in.job_requests(str(job.job_id)))
+    # An images stage of another format is a stage this worker does not run.
+    job = claim(stand_in, b"x", {**good, "format": "pdf"})
+    assert handler(stand_in, tmp_path / "work")(job, threading.Event()) == Outcome.failed(STAGE_UNKNOWN, retry=False)
+
+
+def test_an_images_manifest_lists_its_unreadable_pages_within_the_total_in_order_once(tmp_path: Path) -> None:
+    good = {"pageTotal": 3, "original": "original.pdf", "batches": [{"file": "batch-00001.pdf", "firstPage": 1,
+                                                                      "lastPage": 3}]}  # fmt: skip
+    (tmp_path / "manifest.json").write_text(json.dumps({**good, "unreadable": [1, 3]}), encoding="utf-8")
+    assert step.read_manifest(tmp_path).unreadable == (1, 3)
+    for unreadable in ([4], [2, 2], [3, 1], ["1"], 1):
+        (tmp_path / "manifest.json").write_text(json.dumps({**good, "unreadable": unreadable}), encoding="utf-8")
+        with pytest.raises(StepFailed):
+            step.read_manifest(tmp_path)
