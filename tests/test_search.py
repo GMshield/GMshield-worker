@@ -6,12 +6,15 @@ the Qdrant client proves the owner and source filters are on every query. No mod
 from __future__ import annotations
 
 import base64
+import itertools
 import json
 import threading
+import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -267,7 +270,7 @@ def test_with_matches_in_both_tiers_the_campaign_tiers_ids_come_first_each_label
     assert "Exhaustion" not in repr(handed)
 
 
-def test_a_pending_passage_that_names_a_word_of_the_question_is_handed_over_from_the_first_100_only(
+def test_a_pending_passage_past_the_first_100_that_names_a_word_of_the_question_is_handed_over(
     stand_in: StandIn, indexed: Library, capsys: pytest.CaptureFixture[str]
 ) -> None:
     serve_fixtures(stand_in)
@@ -276,26 +279,287 @@ def test_a_pending_passage_that_names_a_word_of_the_question_is_handed_over_from
         stand_in.passages[passage_id] = StandInPassage(NEW, f"Página de enchimento número {index}.", ["Notas"], 1)
     taverna = BY_KEY["pt-taverna"]
     stand_in.passages[pending[10]] = StandInPassage(NEW, taverna.text, taverna.section_path, taverna.page)
-    # A better match, but after the first 100: never fetched, never handed over.
+    # Matrix row "Big pending tier": a better match after the first 100, in the second page.
     stand_in.passages[pending[120]] = StandInPassage(NEW, "Osvaldo Brandão é quem é Osvaldo Brandão.", ["Notas"], 2)
     before = len(indexed.spy.queries)
 
     run = ask(stand_in, indexed, QUESTIONS["q-pending"].question, [tier("campaign", [SRD, NEW], pending)])
 
     assert pending[10] in run.ids
-    assert pending[120] not in run.ids
+    assert pending[120] in run.ids
     fetched = passages_requests(stand_in)
-    assert fetched[0] == pending[:100]
-    assert fetched[1] == run.ids
-    assert len(fetched) == 2
+    # Two pages of at most 100 ids (read at once, in either order), then the found ids' text.
+    assert sorted(fetched[:2], key=len, reverse=True) == [pending[:100], pending[100:]]
+    assert fetched[2] == run.ids
+    assert len(fetched) == 3
     # The sources still went to Qdrant, the new one included.
     assert len(indexed.spy.queries) == before + 1
     assert_filtered(indexed.spy.queries[-1], [SRD, NEW])
     lines = log_lines(capsys.readouterr().out)
-    skipped = [line for line in lines if line["event"] == "retrieval.pending_skipped"]
-    assert [(line["tier"], line["skipped"]) for line in skipped] == [("campaign", 50)]
+    assert not [line for line in lines if line["event"] == "retrieval.pending_skipped"]
     done = [line for line in lines if line["event"] == "retrieval.search_done"]
-    assert (done[0]["pendingFetched"], done[0]["pendingSkipped"]) == (100, 50)
+    assert (done[0]["pendingFetched"], done[0]["pendingSkipped"]) == (150, 0)
+
+
+def test_the_pending_ids_past_the_cap_are_skipped_and_logged_as_a_count(
+    stand_in: StandIn, indexed: Library, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    serve_fixtures(stand_in)
+    monkeypatch.setattr(search, "MAX_PENDING", 120)
+    pending = [str(uuid.uuid4()) for _ in range(150)]
+    for index, passage_id in enumerate(pending):
+        stand_in.passages[passage_id] = StandInPassage(NEW, f"Página de enchimento número {index}.", ["Notas"], 1)
+    # The best match, past the cap: never fetched, never handed over.
+    stand_in.passages[pending[130]] = StandInPassage(NEW, "Osvaldo Brandão é quem é Osvaldo Brandão.", ["Notas"], 2)
+
+    run = ask(stand_in, indexed, QUESTIONS["q-pending"].question, [tier("campaign", [SRD, NEW], pending)])
+
+    assert pending[130] not in run.ids
+    fetched = passages_requests(stand_in)
+    assert sorted(fetched[:2], key=len, reverse=True) == [pending[:100], pending[100:120]]
+    lines = log_lines(capsys.readouterr().out)
+    skipped = [line for line in lines if line["event"] == "retrieval.pending_skipped"]
+    assert [(line["tier"], line["skipped"]) for line in skipped] == [("campaign", 30)]
+    done = [line for line in lines if line["event"] == "retrieval.search_done"]
+    assert (done[0]["pendingFetched"], done[0]["pendingSkipped"]) == (120, 30)
+    assert search.MAX_PENDING == 120
+    monkeypatch.undo()
+    assert (search.MAX_PENDING, search.PAGE, search.PARALLEL, search.PENDING_BUDGET_SECONDS) == (5000, 100, 4, 1.5)
+
+
+def test_a_spent_budget_starts_no_page_and_every_unread_id_is_logged_as_skipped(
+    stand_in: StandIn, indexed: Library, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    serve_fixtures(stand_in)
+    monkeypatch.setattr(search, "PENDING_BUDGET_SECONDS", 0.0)
+    pending = [str(uuid.uuid4()) for _ in range(150)]
+    for index, passage_id in enumerate(pending):
+        stand_in.passages[passage_id] = StandInPassage(NEW, f"Página de enchimento número {index}.", ["Notas"], 1)
+
+    run = ask(stand_in, indexed, QUESTIONS["q-vorpal"].question, [tier("system", [SRD], pending)])
+
+    # The search still answers from Qdrant; no pending page was read.
+    assert run.ids
+    assert passages_requests(stand_in) == [run.ids]
+    lines = log_lines(capsys.readouterr().out)
+    skipped = [line for line in lines if line["event"] == "retrieval.pending_skipped"]
+    assert [(line["tier"], line["skipped"]) for line in skipped] == [("system", 150)]
+    done = [line for line in lines if line["event"] == "retrieval.search_done"]
+    assert (done[0]["pendingFetched"], done[0]["pendingSkipped"]) == (0, 150)
+
+
+def test_both_tiers_pending_pages_are_read_in_turns_and_each_tier_keeps_its_matches(
+    stand_in: StandIn, indexed: Library, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    serve_fixtures(stand_in)
+    # One page at a time, so the order the stand-in sees is the order the pages started.
+    monkeypatch.setattr(search, "PARALLEL", 1)
+    campaign = [str(uuid.uuid4()) for _ in range(150)]
+    system = [str(uuid.uuid4()) for _ in range(250)]
+    for index, passage_id in enumerate(campaign):
+        stand_in.passages[passage_id] = StandInPassage(NEW, f"Página de enchimento número {index}.", ["Notas"], 1)
+    for index, passage_id in enumerate(system):
+        stand_in.passages[passage_id] = StandInPassage(SRD, f"Página de enchimento número {index}.", ["Notas"], 1)
+    stand_in.passages[campaign[120]] = StandInPassage(NEW, "Osvaldo Brandão é quem é Osvaldo Brandão.", ["Notas"], 2)
+    stand_in.passages[system[220]] = StandInPassage(SRD, "Osvaldo Brandão, de novo Osvaldo Brandão.", ["Notas"], 3)
+
+    handed = find(
+        stand_in,
+        indexed,
+        QUESTIONS["q-pending"].question,
+        [tier("campaign", [NEW], campaign), tier("system", [SRD], system)],
+    )
+
+    # Matrix row "Both tiers pending": campaign, system, campaign, system, then the rest of the longer one.
+    fetched = passages_requests(stand_in)
+    assert fetched[:5] == [campaign[:100], system[:100], campaign[100:], system[100:200], system[200:]]
+    by_id = {item.passage_id: item.tier for item in handed}
+    assert (by_id[campaign[120]], by_id[system[220]]) == ("campaign", "system")
+    lines = log_lines(capsys.readouterr().out)
+    assert not [line for line in lines if line["event"] == "retrieval.pending_skipped"]
+    done = [line for line in lines if line["event"] == "retrieval.search_done"]
+    assert (done[0]["pendingFetched"], done[0]["pendingSkipped"]) == (400, 0)
+
+
+class PageReader:
+    """Serves any id as a passage of its tier (`tiers`, else `default`), recording each call's ids in the order they
+    started. The first calls, as many as `gate` (a barrier) has parties, wait at it, and a call whose page is in `hold`
+    waits for `release` before it answers."""
+
+    def __init__(
+        self,
+        default: str = "system",
+        tiers: dict[str, str] | None = None,
+        refuse_page: int | None = None,
+        gate: threading.Barrier | None = None,
+        hold: tuple[list[str], ...] = (),
+    ) -> None:
+        self.default = default
+        self.tiers = tiers or {}
+        self.refuse_page = refuse_page
+        self.gate = gate
+        self.hold = [list(page) for page in hold]
+        self.release = threading.Event()
+        self.calls: list[list[str]] = []
+        self.running = 0
+        self.most = 0
+        self.lock = threading.Lock()
+
+    def passages(self, job: ClaimedJob, ids: list[str]) -> PassagesAnswer:
+        with self.lock:
+            self.calls.append(list(ids))
+            page = len(self.calls) - 1
+            self.running += 1
+            self.most = max(self.most, self.running)
+        try:
+            if self.gate is not None and page < self.gate.parties:
+                self.gate.wait(timeout=5)
+            if ids in self.hold:
+                self.release.wait(timeout=5)
+            if self.refuse_page is not None and page == self.refuse_page:
+                return PassagesAnswer(403, code="scope.passage_refused")
+            return PassagesAnswer(
+                200, passages=[ReadPassage(item, self.tiers.get(item, self.default), 1, item, []) for item in ids]
+            )
+        finally:
+            with self.lock:
+                self.running -= 1
+
+
+def fake_job() -> ClaimedJob:
+    return ClaimedJob(
+        job_id=uuid.uuid4(),
+        claim_id=uuid.uuid4(),
+        attempt=1,
+        renew_at=datetime.now(UTC),
+        lapses_at=datetime.now(UTC),
+        kind=question.KIND,
+        input={},
+        trace_id=new_trace_id(),
+        grant="g" * 43,
+    )
+
+
+def stepping_clock(step: float) -> Callable[[], float]:
+    """A clock for one page at a time (`parallel=1`): the first reading (the deadline's start) is 0, then each pair of
+    readings, a page's start check and the wait after it, reads `step` more. The deadline is only ever passed at a
+    start check, while no page runs."""
+    readings = itertools.count()
+
+    def now() -> float:
+        return ((next(readings) + 1) // 2) * step
+
+    return now
+
+
+def test_pending_passages_are_read_in_pages_of_100_exactly_4_at_a_time_in_input_order() -> None:
+    ids = [str(uuid.uuid4()) for _ in range(1050)]
+    # The first four calls only go on once all four run at once: fewer in parallel breaks the barrier.
+    gate = threading.Barrier(4)
+    reader = PageReader(gate=gate)
+
+    read = search.read_pending(reader, fake_job(), [("system", ids)], clock=lambda: 0.0)
+
+    assert [item.passage_id for item in read["system"].passages] == ids
+    assert read["system"].unread == 0
+    assert sorted(reader.calls) == sorted(ids[start : start + 100] for start in range(0, 1050, 100))
+    assert reader.most == 4
+
+
+def test_the_tiers_pages_are_started_in_turns_then_the_rest_of_the_longer_tier() -> None:
+    campaign = [str(uuid.uuid4()) for _ in range(250)]
+    system = [str(uuid.uuid4()) for _ in range(450)]
+    reader = PageReader(tiers=dict.fromkeys(campaign, "campaign"))
+
+    read = search.read_pending(
+        reader, fake_job(), [("campaign", campaign), ("system", system)], clock=lambda: 0.0, parallel=1
+    )
+
+    assert reader.calls == [
+        campaign[:100],
+        system[:100],
+        campaign[100:200],
+        system[100:200],
+        campaign[200:],
+        system[200:300],
+        system[300:400],
+        system[400:],
+    ]
+    assert [item.passage_id for item in read["campaign"].passages] == campaign
+    assert [item.passage_id for item in read["system"].passages] == system
+    assert (read["campaign"].unread, read["system"].unread) == (0, 0)
+
+
+def test_one_deadline_for_both_tiers_and_no_page_starts_after_it() -> None:
+    campaign = [str(uuid.uuid4()) for _ in range(1000)]
+    system = [str(uuid.uuid4()) for _ in range(3142)]
+    reader = PageReader(tiers=dict.fromkeys(campaign, "campaign"))
+
+    # Pages start at 0.5, 1.0 and 1.5 s past the deadline's start: with 2 s, three start, the fourth check is at 2 s.
+    read = search.read_pending(
+        reader,
+        fake_job(),
+        [("campaign", campaign), ("system", system)],
+        clock=stepping_clock(0.5),
+        budget=2.0,
+        parallel=1,
+    )
+
+    # Matrix row "Both tiers pending": three pages in all, not three per tier.
+    assert reader.calls == [campaign[:100], system[:100], campaign[100:200]]
+    assert [item.passage_id for item in read["campaign"].passages] == campaign[:200]
+    assert [item.passage_id for item in read["system"].passages] == system[:100]
+    assert (read["campaign"].unread, read["system"].unread) == (800, 3042)
+
+
+def test_a_page_not_back_by_the_deadline_is_dropped_and_not_waited_for() -> None:
+    campaign = [str(uuid.uuid4()) for _ in range(200)]
+    system = [str(uuid.uuid4()) for _ in range(300)]
+    # The system tier's second page answers only once released, long after the deadline.
+    reader = PageReader(tiers=dict.fromkeys(campaign, "campaign"), hold=(system[100:200],))
+    started = time.monotonic()
+    try:
+        read = search.read_pending(reader, fake_job(), [("campaign", campaign), ("system", system)], budget=0.5)
+        spent = time.monotonic() - started
+    finally:
+        reader.release.set()
+
+    assert spent < 3.0  # the held page waits up to 5 s: it was not waited for
+    assert system[100:200] in reader.calls
+    assert [item.passage_id for item in read["campaign"].passages] == campaign
+    assert [item.passage_id for item in read["system"].passages] == system[:100] + system[200:]
+    assert (read["campaign"].unread, read["system"].unread) == (0, 100)
+
+
+def test_a_page_that_fails_after_the_deadline_is_dropped_and_its_ids_are_skipped() -> None:
+    ids = [str(uuid.uuid4()) for _ in range(200)]
+    # One page at a time: the second page is refused, and the clock passes the deadline only once it has answered.
+    reader = PageReader(refuse_page=1)
+    readings = itertools.count()
+
+    def clock() -> float:
+        if next(readings) < 4:  # the deadline's start, then the first page's start check and wait, the second's start
+            return 0.0
+        time.sleep(0.2)  # the refusal is back well before this reading
+        return 5.0
+
+    read = search.read_pending(reader, fake_job(), [("system", ids)], clock=clock, budget=1.5, parallel=1)
+
+    assert reader.calls == [ids[:100], ids[100:]]
+    assert [item.passage_id for item in read["system"].passages] == ids[:100]
+    assert read["system"].unread == 100
+
+
+def test_a_refused_page_fails_the_whole_read_with_the_backends_code() -> None:
+    ids = [str(uuid.uuid4()) for _ in range(500)]
+
+    with pytest.raises(search.SearchFailed) as failed:
+        search.read_pending(PageReader(refuse_page=2), fake_job(), [("system", ids)], clock=lambda: 0.0)
+
+    assert (failed.value.code, failed.value.retry) == ("scope.passage_refused", False)
+    with pytest.raises(search.SearchFailed) as other_tier:
+        search.read_pending(PageReader(default="campaign"), fake_job(), [("system", ids)], clock=lambda: 0.0)
+    assert (other_tier.value.code, other_tier.value.retry) == ("retrieval.passages_unavailable", True)
 
 
 def test_an_id_found_both_in_qdrant_and_pending_ranks_above_where_either_list_alone_puts_it(

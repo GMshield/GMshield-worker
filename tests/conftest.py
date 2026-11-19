@@ -40,6 +40,10 @@ Since Story 2.6 (contract 1.11.0) a usage may say `estimated` (a boolean, else 4
 once a job has that many accepted batches, every later batch of it stores no event, only its usage, and is answered
 `{"stop": true}`, as the backend does after a stop.
 
+Since contract 1.12.0 it serves `PUT /internal/v1/index-recipe` as the backend does: a body `{indexRecipe}` with a
+recipe as the backend reads it is answered 204 and kept in `recipe_statements`; anything else 400 `request.invalid`.
+`recipe_status` forces an answer (for example 503).
+
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
 """
@@ -139,6 +143,8 @@ class StandIn:
     events_status: int | None = None
     events_failures: int | None = None
     stop_after: int | None = None
+    recipe_statements: list[str] = field(default_factory=list)
+    recipe_status: int | None = None
 
     def offer(
         self,
@@ -621,16 +627,31 @@ def _outcome(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     return 204, None
 
 
+def _recipe(state: StandIn, body: bytes) -> tuple[int, Any]:
+    if state.recipe_status is not None:
+        return problem(state.recipe_status, "server.unavailable")
+    try:
+        statement = json.loads(body)
+    except ValueError:
+        return problem(400, "request.invalid")
+    recipe = statement.get("indexRecipe") if isinstance(statement, dict) else None
+    if not isinstance(recipe, str) or not RECIPE.fullmatch(recipe):
+        return problem(400, "request.invalid")
+    with state.lock:
+        state.recipe_statements.append(recipe)
+    return 204, None
+
+
 def _route(state: StandIn, method: str, path: str, headers: dict[str, str], body: bytes) -> tuple[int, Any]:
     if state.credential is not None and headers.get("authorization") != f"Bearer {state.credential}":
         return problem(401, "service.unauthenticated")
     if method == "GET" and path == "/internal/v1/version":
-        if state.body is not None:
-            return state.status, state.body
-        return state.status, {"version": state.version}
+        return state.status, state.body if state.body is not None else {"version": state.version}
     inputs = INPUT_ROUTE.fullmatch(path)
     if method == "GET" and inputs is not None:
         return _input(state, inputs, headers)
+    if method == "PUT" and path == "/internal/v1/index-recipe":
+        return _recipe(state, body)
     if method != "POST":
         return problem(404, "request.not_found")
     with state.lock:
@@ -666,6 +687,9 @@ def stand_in() -> Iterator[StandIn]:
 
         def do_POST(self) -> None:
             self._answer("POST")
+
+        def do_PUT(self) -> None:
+            self._answer("PUT")
 
         def _send(self, status: int, content_type: str, body: bytes) -> None:
             self.send_response(status)

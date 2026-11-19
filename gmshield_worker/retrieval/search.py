@@ -2,19 +2,25 @@
 
 The question input is the backend's (`Scopes.questionInput`), never computed here: `{question, owner, tiers: [{tier,
 sources, pending}], tokenKey}`, the tiers in order (campaign, then system), `pending` the ids of the tier's passages
-whose index change has not ended (the backend lists at most the first 100 of each tier), and `tokenKey` Base64 of the
-owner's 32-byte token key.
+that are not indexed yet (their index change has not ended, or it failed; the backend lists at most the first 5,000 of
+each tier), and `tokenKey` Base64 of the owner's 32-byte token key.
 
 1. When no tier has a source, nothing is asked of Ollama, Qdrant or the backend: the list is empty.
 2. The question is embedded with the indexing model under embeddinggemma's query prompt (`Embedder.embed_query`), and
    its keyword vector is `keyword_vector(question, tokenKey)`.
 3. Per tier with sources, one Qdrant search (`PassageStore.search`): dense and sparse prefetches fused by RRF, `LIMIT`
    points, the owner and source filters always on. A tier without sources issues no query.
-4. Pending: the first `MAX_PENDING` ids of the tier's `pending`, in input order, are read by id in one call; those that
-   share at least one keyword token with the question are ranked by how many they share (input order breaks ties), and
-   that ranking is fused with the tier's Qdrant results as a third RRF list (`fuse`), `LIMIT` ids. An id found both
-   ways is one entry whose scores add up, as RRF does. The rest of `pending` is skipped and logged as a count. A
-   question with no keyword token can match no pending passage: its pending passages are not read at all.
+4. Pending: once every tier is searched, the first `MAX_PENDING` ids of each tier's `pending`, in input order, are read
+   by id in pages of `PAGE` (the backend's most ids per call, `JobPassageReads.MAX_IDS`), at most `PARALLEL` pages at
+   a time, the tiers' pages in turns (campaign, system, campaign, ..., then the rest of the longer one), under one
+   deadline `PENDING_BUDGET_SECONDS` after the question's first pending read (`read_pending`), so the first words stay
+   within NFR-14's 5 s: no page starts after it, and a page not back by it is dropped, never waited for. Those read
+   that share at least one keyword token with the question are ranked by how many they share (input order breaks
+   ties), and that ranking is fused with the tier's Qdrant results as a third RRF list (`fuse`), `LIMIT` ids. An id
+   found both ways is one entry whose scores add up, as RRF does. The ids not read (past `MAX_PENDING`, in pages the
+   deadline left out, or in pages it dropped) are skipped and logged as a count per tier
+   (`retrieval.pending_skipped`). A question with no keyword token can match no pending passage: its pending passages
+   are not read at all.
 5. The text of every found id, in rank order, campaign tier first, is read in one call to `POST …/passages` (contract
    1.8.0): the handed-over list is `[Handed(id, tier, text, section_path, page)]`. Library text reaches the worker by
    no other path, and nothing of it reaches Qdrant.
@@ -31,9 +37,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import itertools
 import re
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -48,7 +56,14 @@ from gmshield_worker.retrieval.store import RRF_K, Found, StoreFailed
 
 TIERS = ("campaign", "system")
 LIMIT = 8
-MAX_PENDING = 100
+# The most pending ids of a tier the worker reads: as many as the backend lists (`Scopes.MAX_PENDING`).
+MAX_PENDING = 5000
+# The most ids of one passages call (the backend's `JobPassageReads.MAX_IDS`).
+PAGE = 100
+# The most passages calls of a question's pending reads at a time, both tiers together.
+PARALLEL = 4
+# The pending reads' deadline, from the question's first pending read, for both tiers together.
+PENDING_BUDGET_SECONDS = 1.5
 MAX_QUESTION = 4000
 INPUT_INVALID = "retrieval.input_invalid"
 EMBEDDING_UNAVAILABLE = "retrieval.embedding_unavailable"
@@ -189,6 +204,68 @@ def _read(reader: PassageReader, job: ClaimedJob, ids: list[str], tiers: dict[st
     raise SearchFailed(PASSAGES_UNAVAILABLE, retry=True)
 
 
+@dataclass(frozen=True)
+class PendingRead:
+    """What `read_pending` read of one tier: the passages of its pages back by the deadline, in input order, and how
+    many of its ids it left unread (pages not started, or dropped)."""
+
+    passages: list[ReadPassage]
+    unread: int
+
+
+def _in_turns(pending: Sequence[tuple[str, Sequence[str]]], page: int) -> list[tuple[str, int, list[str]]]:
+    """The tiers' pages as `(tier, index, ids)`, in turns: each tier's first page in tier order, then each one's
+    second, and so on; once a tier has no page left, the others' go on alone."""
+    paged = [
+        [(tier, index, list(ids[start : start + page])) for index, start in enumerate(range(0, len(ids), page))]
+        for tier, ids in pending
+    ]
+    return [item for turn in itertools.zip_longest(*paged) for item in turn if item is not None]
+
+
+def read_pending(
+    reader: PassageReader,
+    job: ClaimedJob,
+    pending: Sequence[tuple[str, Sequence[str]]],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    budget: float = PENDING_BUDGET_SECONDS,
+    page: int = PAGE,
+    parallel: int = PARALLEL,
+) -> dict[str, PendingRead]:
+    """Reads the pending passages of each `(tier, ids)` in pages of `page` ids, at most `parallel` pages at a time,
+    the tiers' pages in turns (`_in_turns`), under one deadline `budget` seconds after the first read: no page starts
+    after it, and a page not back by it is dropped, never waited for (its thread ends on its own, its answer unread).
+    A page that fails before the deadline fails the whole read (`SearchFailed`), as one read did before."""
+    pages = _in_turns(pending, page)
+    read: dict[tuple[str, int], list[ReadPassage]] = {}
+    if pages:
+        deadline = clock() + budget
+        running: dict[Future[list[ReadPassage]], tuple[str, int]] = {}
+        started = 0
+        pool = ThreadPoolExecutor(max_workers=max(1, parallel), thread_name_prefix="pending-read")
+        try:
+            while True:
+                while started < len(pages) and len(running) < parallel and clock() < deadline:
+                    tier, index, ids = pages[started]
+                    running[pool.submit(_read, reader, job, ids, dict.fromkeys(ids, tier))] = (tier, index)
+                    started += 1
+                left = deadline - clock()
+                if not running or left <= 0:
+                    # Past the deadline nothing more is read: a page that ends, or fails, from now on is dropped.
+                    break
+                done, _ = wait(running, timeout=left, return_when=FIRST_COMPLETED)
+                for future in done:
+                    read[running.pop(future)] = future.result()
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+    result: dict[str, PendingRead] = {}
+    for name, asked in pending:
+        passages = [item for key in sorted(key for key in read if key[0] == name) for item in read[key]]
+        result[name] = PendingRead(passages=passages, unread=len(asked) - len(passages))
+    return result
+
+
 @dataclass
 class _Timings:
     clock: Callable[[], float]
@@ -227,28 +304,36 @@ def find_passages(
         raise SearchFailed(EMBEDDING_UNAVAILABLE if error.retry else error.code, retry=error.retry) from error
     sparse = keyword_vector(checked.question, checked.token_key)
     timings.lap("embedSeconds")
-    ranked: list[tuple[str, list[str]]] = []
-    fetched = skipped = 0
+    found: list[tuple[TierScope, list[Found]]] = []
     try:
         with stores() as store:
             store.ensure_collection()
             for tier in searched:
-                found = store.search(checked.owner, tier.sources, dense, sparse, LIMIT)
+                found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, LIMIT)))
                 timings.lap("searchSeconds")
-                pending = list(tier.pending[:MAX_PENDING])
-                extra = len(tier.pending) - len(pending)
-                if extra > 0:
-                    skipped += extra
-                    log.info("retrieval.pending_skipped", jobId=job_id, tier=tier.tier, skipped=extra)
-                matching: list[str] = []
-                if pending and sparse.indices:
-                    read = _read(reader, job, pending, dict.fromkeys(pending, tier.tier))
-                    matching = rank_pending(read, set(sparse.indices), checked.token_key)
-                    fetched += len(pending)
-                    timings.lap("pendingSeconds")
-                ranked.append((tier.tier, fuse(found, matching)))
     except StoreFailed as error:
         raise SearchFailed(STORE_UNAVAILABLE, retry=True) from error
+    capped = [(tier.tier, list(tier.pending[:MAX_PENDING])) for tier, _ in found if tier.pending]
+    read: dict[str, PendingRead] = {}
+    if capped and sparse.indices:
+        read = read_pending(
+            reader, job, capped, clock=clock, budget=PENDING_BUDGET_SECONDS, page=PAGE, parallel=PARALLEL
+        )
+        timings.lap("pendingSeconds")
+    ranked: list[tuple[str, list[str]]] = []
+    fetched = skipped = 0
+    for tier, tier_found in found:
+        unread = len(tier.pending) - min(len(tier.pending), MAX_PENDING)
+        matching: list[str] = []
+        tier_read = read.get(tier.tier)
+        if tier_read is not None:
+            matching = rank_pending(tier_read.passages, set(sparse.indices), checked.token_key)
+            fetched += len(tier_read.passages)
+            unread += tier_read.unread
+        if unread > 0:
+            skipped += unread
+            log.info("retrieval.pending_skipped", jobId=job_id, tier=tier.tier, skipped=unread)
+        ranked.append((tier.tier, fuse(tier_found, matching)))
     tiers = {passage_id: tier for tier, ids in ranked for passage_id in ids}
     ids = list(tiers)
     handed: list[Handed] = []

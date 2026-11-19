@@ -30,8 +30,10 @@ from gmshield_worker.backend.generated.api.jobs import (
     renew_job_claim,
     report_job_outcome,
 )
+from gmshield_worker.backend.generated.api.jobs import state_index_recipe as index_recipe_route
 from gmshield_worker.backend.generated.models import (
     ContractVersion,
+    IndexRecipeStatement,
     JobCallUsage,
     JobClaim,
     JobClaimRequest,
@@ -98,6 +100,36 @@ def fetch_contract_version(
     if response.status_code == 200 and isinstance(parsed, ContractVersion):
         return VersionAnswer(status=200, version=parsed.version)
     return VersionAnswer(status=int(response.status_code), version=None)
+
+
+@dataclass(frozen=True)
+class RecipeAnswer:
+    """What `PUT /internal/v1/index-recipe` answered: the status, and the problem's code when it refused."""
+
+    status: int
+    code: str | None = None
+
+    @property
+    def stated(self) -> bool:
+        return self.status == 204
+
+
+def state_index_recipe(
+    base_url: str,
+    trace_id: str,
+    *,
+    credential: str | None = None,
+    httpx_args: Mapping[str, Any] | None = None,
+    index_recipe: str = INDEX_RECIPE,
+) -> RecipeAnswer:
+    """States this worker's index recipe outside a claim (contract 1.12.0): the backend reacts as to a recipe stated at
+    a claim, so a deploy starts indexing before any job is claimed.
+
+    Raises the transport's exception for the caller to log by type; the next check states it again.
+    """
+    with backend_client(base_url, trace_id, credential=credential, httpx_args=httpx_args) as client:
+        response = index_recipe_route.sync_detailed(client=client, body=IndexRecipeStatement(index_recipe=index_recipe))
+    return RecipeAnswer(status=int(response.status_code), code=_code(response.parsed))
 
 
 @dataclass(frozen=True)
