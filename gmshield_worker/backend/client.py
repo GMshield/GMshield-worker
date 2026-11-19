@@ -13,7 +13,7 @@ as no answer at all.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
@@ -25,24 +25,30 @@ from gmshield_worker.backend.generated import Client
 from gmshield_worker.backend.generated.api.contract import get_internal_contract_version
 from gmshield_worker.backend.generated.api.jobs import (
     claim_job,
+    post_job_events,
     read_job_passages,
     renew_job_claim,
     report_job_outcome,
 )
 from gmshield_worker.backend.generated.models import (
     ContractVersion,
+    JobCallUsage,
     JobClaim,
     JobClaimRequest,
+    JobEvents,
+    JobEventsReply,
     JobModel,
     JobOutcome,
     JobOutcomeResult,
     JobPassages,
     JobPassagesRequest,
     JobRenewal,
+    JobStreamEvent,
     Problem,
 )
-from gmshield_worker.backend.generated.types import Unset
+from gmshield_worker.backend.generated.types import UNSET, Unset
 from gmshield_worker.log import parse_traceparent, traceparent
+from gmshield_worker.models.output import Citation, TextDelta, Usage
 from gmshield_worker.models.providers import ModelChoice
 from gmshield_worker.retrieval.recipe import INDEX_RECIPE
 
@@ -179,6 +185,34 @@ class PassagesAnswer:
     code: str | None = None
 
 
+@dataclass(frozen=True)
+class EventsAnswer:
+    """What `POST .../events` answered (contract 1.10.0): the status, and on a 200 whether the answer must stop;
+    else the problem's code."""
+
+    status: int
+    stop: bool = False
+    code: str | None = None
+
+
+def _stream_event(event: TextDelta | Citation) -> JobStreamEvent:
+    if isinstance(event, TextDelta):
+        return JobStreamEvent(type_="delta", text=event.text)
+    return JobStreamEvent(type_="citation", passage_id=UUID(event.passage_id), offset=event.offset)
+
+
+def _call_usage(usage: Usage) -> JobCallUsage:
+    return JobCallUsage(
+        call_id=UUID(usage.call_id),
+        response_id=usage.response_id if usage.response_id is not None else UNSET,
+        input_=usage.input,
+        cache_read=usage.cache_read,
+        cache_write=usage.cache_write,
+        output=usage.output,
+        reasoning=usage.reasoning,
+    )
+
+
 def _code(parsed: object) -> str | None:
     return parsed.code if isinstance(parsed, Problem) else None
 
@@ -195,7 +229,7 @@ class JobsApi:
     recipe (contract 1.7.0, Story 2.1): the backend re-indexes what was indexed under another one. Every claim also
     states the providers this worker holds a key for (contract 1.9.0, Story 2.10): the backend refuses a kind that calls
     a model through another one. `passages` reads passage text by id under the claim's grant (contract 1.8.0, Story
-    2.3)."""
+    2.3); `events` posts a numbered batch of answer events and usage (contract 1.10.0, Story 2.4)."""
 
     base_url: str
     credential: str = field(repr=False)
@@ -262,6 +296,26 @@ class JobsApi:
                 ],
             )
         return PassagesAnswer(status=int(response.status_code), code=_code(parsed))
+
+    def events(
+        self, job: ClaimedJob, batch: int, events: Sequence[TextDelta | Citation], usage: Sequence[Usage] = ()
+    ) -> EventsAnswer:
+        """`POST /internal/v1/jobs/{id}/claims/{claimId}/events` (contract 1.10.0, Story 2.4): a numbered batch of
+        answer events (from 1 per claim) and the usage of the model calls that ended since the last one, under the
+        claim's grant. The answer says whether the answer must stop."""
+        body = JobEvents(
+            batch=batch,
+            events=[_stream_event(event) for event in events],
+            usage=[_call_usage(item) for item in usage],
+        )
+        with self._client(job.trace_id) as client:
+            response = post_job_events.sync_detailed(
+                job.job_id, job.claim_id, client=client, body=body, x_job_grant=job.grant
+            )
+        parsed = response.parsed
+        if response.status_code == 200 and isinstance(parsed, JobEventsReply):
+            return EventsAnswer(status=200, stop=parsed.stop)
+        return EventsAnswer(status=int(response.status_code), code=_code(parsed))
 
     def renew(self, job: ClaimedJob) -> RenewalAnswer:
         with self._client(job.trace_id) as client:
