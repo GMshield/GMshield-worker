@@ -976,3 +976,29 @@ def test_a_search_without_a_source_asks_nothing_and_one_without_keywords_has_no_
     assert BY_KEY["srd-vorpal-sword"].passage_id in [item.passage_id for item in found]
     assert [prefetch.using for prefetch in indexed.spy.queries[-1]["prefetch"]] == ["dense"]
     assert indexed.spy.queries[-1]["query_filter"].must[0].match == models.MatchValue(value=OWNER)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The Tarrasque's Armor Class is 25; its challenge rating is 30.",
+        "armor_class armorclass ARMOR-class class2 2class the_tarrasque tarrasques",
+        "Classes and sub-classes: the class of a creature.",
+        "",
+        "   ",
+        "A espada vorpal da Ordem de Cristo, fundada em 1319.",
+        "Ação de classe: a Tarrasque é uma criatura colossal.",
+        "\uff34\uff41\uff52\uff52\uff41\uff53\uff51\uff55\uff45 (fullwidth) and \ufb01re (ligature) and Stra\u00dfe",
+    ],
+)
+def test_the_terms_found_in_a_text_are_exactly_its_folded_tokens_that_are_terms(text: str) -> None:
+    # The ASCII fast path (one regex over the lowered text) and the folded tokens agree, word boundaries included.
+    terms = search.question_terms(
+        "What is the Tarrasque's armor class and challenge rating? espada acao classe criatura fire strasse"
+    )
+    assert search.terms_in(text, terms) == terms.intersection(keywords.tokens(text))
+
+
+def test_a_question_with_no_ascii_term_finds_none_in_ascii_text() -> None:
+    terms = frozenset({"ação", "straße"})
+    assert search.terms_in("Plain ASCII text about acao and strasse.", terms) == frozenset()

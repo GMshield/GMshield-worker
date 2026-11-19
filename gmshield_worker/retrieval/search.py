@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import itertools
 import math
 import re
@@ -233,14 +234,32 @@ def _read(reader: PassageReader, job: ClaimedJob, ids: list[str], tiers: dict[st
     raise SearchFailed(PASSAGES_UNAVAILABLE, retry=True)
 
 
+@functools.lru_cache(maxsize=64)
+def _terms_pattern(terms: frozenset[str]) -> re.Pattern[str] | None:
+    """One regex for the ASCII terms, each a whole word: `\\b(?:term|…)\\b`; None when no term is ASCII."""
+    ascii_terms = sorted((term for term in terms if term.isascii()), key=lambda term: (-len(term), term))
+    if not ascii_terms:
+        return None
+    return re.compile(r"\b(?:" + "|".join(map(re.escape, ascii_terms)) + r")\b")
+
+
+def terms_in(text: str, terms: frozenset[str]) -> frozenset[str]:
+    """The `terms` the text's folded tokens contain: exactly `terms ∩ tokens(text)`. For ASCII text (the SRD), folding
+    is lowercasing and a token is a run of `[A-Za-z0-9_]`, so one regex over the lowered text finds the same terms
+    about three times faster (measured on roberto-server: 0.13 against 0.40 ms for a 1,500-character passage); any
+    other text is folded and tokenized whole."""
+    if text.isascii():
+        pattern = _terms_pattern(terms)
+        return frozenset() if pattern is None else frozenset(pattern.findall(text.lower()))
+    return terms.intersection(tokens(text))
+
+
 def _read_terms(
     reader: PassageReader, job: ClaimedJob, ids: list[str], tiers: dict[str, str], terms: frozenset[str]
 ) -> list[PendingPassage]:
-    """A page of pending passages (`_read`), each kept as its id and the `terms` its folded text contains."""
-    return [
-        PendingPassage(item.passage_id, terms.intersection(tokens(item.text)))
-        for item in _read(reader, job, ids, tiers)
-    ]
+    """A page of pending passages (`_read`), each kept as its id and the `terms` its folded text contains
+    (`terms_in`)."""
+    return [PendingPassage(item.passage_id, terms_in(item.text, terms)) for item in _read(reader, job, ids, tiers)]
 
 
 @dataclass(frozen=True)
