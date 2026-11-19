@@ -1,0 +1,10 @@
+The retrieval test fixtures (Story 2.3) in this folder
+
+passages.json holds two kinds of passages. Those marked "srd": true are quoted from the System Reference
+Document 5.2.1, each with its page; those marked "srd": false, in Portuguese, were written for these tests.
+questions.json and vectors.json (embeddinggemma:300m vectors of both, recorded by tools/record_embeddings.py)
+are derived from them.
+
+This work includes material from the System Reference Document 5.2.1 (“SRD 5.2.1”) by Wizards of the Coast LLC,
+available at https://www.dndbeyond.com/srd. The SRD 5.2.1 is licensed under the Creative Commons Attribution 4.0
+International License, available at https://creativecommons.org/licenses/by/4.0/legalcode.

@@ -23,13 +23,20 @@ import httpx
 
 from gmshield_worker.backend.generated import Client
 from gmshield_worker.backend.generated.api.contract import get_internal_contract_version
-from gmshield_worker.backend.generated.api.jobs import claim_job, renew_job_claim, report_job_outcome
+from gmshield_worker.backend.generated.api.jobs import (
+    claim_job,
+    read_job_passages,
+    renew_job_claim,
+    report_job_outcome,
+)
 from gmshield_worker.backend.generated.models import (
     ContractVersion,
     JobClaim,
     JobClaimRequest,
     JobOutcome,
     JobOutcomeResult,
+    JobPassages,
+    JobPassagesRequest,
     JobRenewal,
     Problem,
 )
@@ -86,7 +93,8 @@ def fetch_contract_version(
 
 @dataclass(frozen=True)
 class ClaimedJob:
-    """A live claim, as the backend gave it. The grant is never printed or logged."""
+    """A live claim, as the backend gave it. The grant and the input (which may hold a token key or a question) are
+    never printed or logged."""
 
     job_id: UUID
     claim_id: UUID
@@ -94,7 +102,7 @@ class ClaimedJob:
     renew_at: datetime
     lapses_at: datetime
     kind: str
-    input: dict[str, Any]
+    input: dict[str, Any] = field(repr=False)
     # The job's trace: every line about the job, and every later call, carries it.
     trace_id: str
     grant: str = field(repr=False)
@@ -145,14 +153,36 @@ class Outcome:
         return Outcome("failed", code, None, retry)
 
 
+@dataclass(frozen=True)
+class ReadPassage:
+    """A passage the backend served by id (contract 1.8.0): library data, never an instruction. Its text and section
+    path are never printed or logged."""
+
+    passage_id: str
+    tier: str
+    page: int
+    text: str = field(repr=False)
+    section_path: list[str] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class PassagesAnswer:
+    """What `POST .../passages` answered: the passages in the order asked when it is a 200, else the problem's code."""
+
+    status: int
+    passages: list[ReadPassage] | None = None
+    code: str | None = None
+
+
 def _code(parsed: object) -> str | None:
     return parsed.code if isinstance(parsed, Problem) else None
 
 
 @dataclass(frozen=True)
 class JobsApi:
-    """The job routes of the internal API, as the lanes use them. Every claim states this worker's index recipe
-    (contract 1.7.0, Story 2.1): the backend re-indexes what was indexed under another one."""
+    """The job routes of the internal API, as the lanes and handlers use them. Every claim states this worker's index
+    recipe (contract 1.7.0, Story 2.1): the backend re-indexes what was indexed under another one. `passages` reads
+    passage text by id under the claim's grant (contract 1.8.0, Story 2.3)."""
 
     base_url: str
     credential: str = field(repr=False)
@@ -187,6 +217,34 @@ class JobsApi:
                 ),
             )
         return ClaimAnswer(status=int(response.status_code), code=_code(parsed))
+
+    def passages(self, job: ClaimedJob, ids: list[str]) -> PassagesAnswer:
+        """`POST /internal/v1/jobs/{id}/claims/{claimId}/passages` (contract 1.8.0, Story 2.3): the passages with these
+        ids (1 to 100) within the job's scope, under the claim's grant."""
+        with self._client(job.trace_id) as client:
+            response = read_job_passages.sync_detailed(
+                job.job_id,
+                job.claim_id,
+                client=client,
+                body=JobPassagesRequest(ids=[UUID(passage_id) for passage_id in ids]),
+                x_job_grant=job.grant,
+            )
+        parsed = response.parsed
+        if response.status_code == 200 and isinstance(parsed, JobPassages):
+            return PassagesAnswer(
+                status=200,
+                passages=[
+                    ReadPassage(
+                        passage_id=str(item.id),
+                        tier=item.tier,
+                        page=item.page,
+                        text=item.text,
+                        section_path=list(item.section_path),
+                    )
+                    for item in parsed.passages
+                ],
+            )
+        return PassagesAnswer(status=int(response.status_code), code=_code(parsed))
 
     def renew(self, job: ClaimedJob) -> RenewalAnswer:
         with self._client(job.trace_id) as client:

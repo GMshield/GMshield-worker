@@ -11,6 +11,11 @@ deep. Its vector is the L2-normalized mean of its parts' vectors, so every word 
 passage. A passage still refused at that depth fails the job with `PASSAGE_TOO_LONG`, which no attempt can change; any
 other failure of Ollama (refused, unreachable, an answer that is not the contract's) with `EMBEDDING_UNAVAILABLE`,
 which the backend retries. Nothing here logs: the caller logs counts.
+
+A question (Story 2.3) is embedded by `Embedder.embed_query` with the same model, `truncate: false` and normalization,
+as embeddinggemma's query prompt `task: search result | query: {question}`. A question is never split: one the model
+refuses as too long fails with `QUESTION_TOO_LONG`, which no attempt can change; any other failure with
+`EMBEDDING_UNAVAILABLE`.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ BATCH = 16
 MAX_SPLITS = 4
 EMBEDDING_UNAVAILABLE = "index.embedding_unavailable"
 PASSAGE_TOO_LONG = "index.passage_too_long"
+QUESTION_TOO_LONG = "retrieval.question_too_long"
 # Ollama's answer (HTTP 400) when an input is longer than the context and `truncate` is false.
 _CONTEXT_REFUSAL = "exceeds the context length"
 TIMEOUT = httpx.Timeout(connect=2.0, read=120.0, write=30.0, pool=2.0)
@@ -53,6 +59,11 @@ class _TooLong(Exception):
 def embedding_input(title: str, text: str) -> str:
     """embeddinggemma's document prompt: the section title in its title slot ("none" without one)."""
     return f"title: {title or 'none'} | text: {text}"
+
+
+def query_input(question: str) -> str:
+    """embeddinggemma's query prompt for retrieval (Story 2.3)."""
+    return f"task: search result | query: {question}"
 
 
 def normalized(vector: Sequence[float]) -> Vector:
@@ -87,20 +98,23 @@ class Embedded:
 
 @dataclass(frozen=True)
 class Embedder:
-    """The embeddings of passages, one `Embedded` per `(title, text)`, in order."""
+    """The embeddings of passages, one `Embedded` per `(title, text)`, in order, and of a question."""
 
     base_url: str
     timeout: httpx.Timeout = field(default_factory=lambda: TIMEOUT)
     transport: httpx.BaseTransport | None = field(default=None, repr=False)
 
-    def embed(self, passages: Sequence[tuple[str, str]]) -> list[Embedded]:
-        with httpx.Client(
+    def _client(self) -> httpx.Client:
+        return httpx.Client(
             base_url=self.base_url,
             timeout=self.timeout,
             follow_redirects=False,
             trust_env=False,
             transport=self.transport,
-        ) as client:
+        )
+
+    def embed(self, passages: Sequence[tuple[str, str]]) -> list[Embedded]:
+        with self._client() as client:
             found: list[Embedded] = []
             for start in range(0, len(passages), BATCH):
                 batch = passages[start : start + BATCH]
@@ -112,6 +126,14 @@ class Embedder:
                         parts = self._parts(client, title, text, depth=0)
                         found.append(Embedded(normalized(mean(parts)), len(parts)))
             return found
+
+    def embed_query(self, question: str) -> Vector:
+        """The question's vector, under the query prompt: one call, never split."""
+        with self._client() as client:
+            try:
+                return normalized(self._call(client, [query_input(question)])[0])
+            except _TooLong:
+                raise EmbeddingFailed(QUESTION_TOO_LONG, retry=False) from None
 
     def _parts(self, client: httpx.Client, title: str, text: str, *, depth: int) -> list[Vector]:
         """The vectors of the passage's parts: itself when it fits, else its halves' parts, `MAX_SPLITS` deep."""
