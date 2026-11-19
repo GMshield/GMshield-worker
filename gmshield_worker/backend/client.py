@@ -187,8 +187,8 @@ class PassagesAnswer:
 
 @dataclass(frozen=True)
 class EventsAnswer:
-    """What `POST .../events` answered (contract 1.10.0): the status, and on a 200 whether the answer must stop;
-    else the problem's code."""
+    """What `POST .../events` answered (contract 1.11.0): the status, and on a 200 whether the answer must stop (the GM
+    stopped it, Story 2.6); else the problem's code."""
 
     status: int
     stop: bool = False
@@ -210,6 +210,7 @@ def _call_usage(usage: Usage) -> JobCallUsage:
         cache_write=usage.cache_write,
         output=usage.output,
         reasoning=usage.reasoning,
+        estimated=usage.estimated,
     )
 
 
@@ -300,9 +301,10 @@ class JobsApi:
     def events(
         self, job: ClaimedJob, batch: int, events: Sequence[TextDelta | Citation], usage: Sequence[Usage] = ()
     ) -> EventsAnswer:
-        """`POST /internal/v1/jobs/{id}/claims/{claimId}/events` (contract 1.10.0, Story 2.4): a numbered batch of
-        answer events (from 1 per claim) and the usage of the model calls that ended since the last one, under the
-        claim's grant. The answer says whether the answer must stop."""
+        """`POST /internal/v1/jobs/{id}/claims/{claimId}/events` (contract 1.11.0, Stories 2.4 and 2.6): a numbered
+        batch of answer events (from 1 per claim) and the usage of the model calls that ended since the last one (an
+        estimate marked `estimated`), under the claim's grant. The answer says whether the answer must stop: the GM
+        stopped it."""
         body = JobEvents(
             batch=batch,
             events=[_stream_event(event) for event in events],
