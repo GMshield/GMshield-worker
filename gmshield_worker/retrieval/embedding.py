@@ -2,7 +2,14 @@
 
 `POST {GMSHIELD_OLLAMA_URL}/api/embed` with the model `MODEL`, `truncate: false`, and each passage as
 `title: {title or "none"} | text: {text}` (embeddinggemma's document prompt, its section title in the title slot), in
-batches of `BATCH`. Plain httpx: no `ollama` package, no proxy from the environment, no redirect.
+batches of `BATCH` (4: Ollama embeds one request at a time, about 0.6 s a passage, so a question waits behind at most
+one small batch). Plain httpx: no `ollama` package, no proxy from the environment, no redirect.
+
+Questions first: within the worker process, no index call to Ollama (a batch, or one passage or one part of a split
+passage) starts while a question's embedding waits or runs (`QUESTIONS_FIRST`, shared by every `Embedder`, so by both
+lanes). A call waits at most `INDEX_WAIT_SECONDS` (10 s) for the questions to end, then goes, so a steady flow of
+questions never stops indexing. The gate is per process: the bound assumes one worker process per Ollama, as deployed.
+The batch size and the gate are not part of the index recipe: the vectors do not change.
 
 When Ollama refuses a batch because an input is longer than the model's context, each of its passages is embedded on
 its own, and a passage refused alone is split in two by `ingestion.passages.split` (at a blank line, a line end or a
@@ -21,7 +28,9 @@ refuses as too long fails with `QUESTION_TOO_LONG`, which no attempt can change;
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,7 +40,9 @@ from gmshield_worker.ingestion.passages import split
 
 MODEL = "embeddinggemma:300m"
 DIMENSIONS = 768
-BATCH = 16
+BATCH = 4
+# The longest an index batch waits for the questions embedding before it, then goes.
+INDEX_WAIT_SECONDS = 10.0
 MAX_SPLITS = 4
 EMBEDDING_UNAVAILABLE = "index.embedding_unavailable"
 PASSAGE_TOO_LONG = "index.passage_too_long"
@@ -88,6 +99,35 @@ def halves(text: str) -> tuple[str, str] | None:
     return front, rest
 
 
+class QuestionsFirst:
+    """The gate that puts questions before index batches at Ollama: `question()` holds it while a question's embedding
+    waits or runs; `before_batch(wait)` waits until no question holds it, at most `wait` seconds: True when no question
+    holds it, False when the wait ran out."""
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._questions = 0
+
+    @contextmanager
+    def question(self) -> Iterator[None]:
+        with self._changed:
+            self._questions += 1
+        try:
+            yield
+        finally:
+            with self._changed:
+                self._questions -= 1
+                self._changed.notify_all()
+
+    def before_batch(self, wait: float = INDEX_WAIT_SECONDS) -> bool:
+        with self._changed:
+            return self._changed.wait_for(lambda: self._questions == 0, timeout=wait)
+
+
+# The worker's one gate: every `Embedder` shares it unless a test gives its own.
+QUESTIONS_FIRST = QuestionsFirst()
+
+
 @dataclass
 class Embedded:
     """One passage's vector, and how many parts it was embedded in (1 when it fitted whole)."""
@@ -103,6 +143,8 @@ class Embedder:
     base_url: str
     timeout: httpx.Timeout = field(default_factory=lambda: TIMEOUT)
     transport: httpx.BaseTransport | None = field(default=None, repr=False)
+    gate: QuestionsFirst = field(default=QUESTIONS_FIRST, repr=False, compare=False)
+    index_wait: float = INDEX_WAIT_SECONDS
 
     def _client(self) -> httpx.Client:
         return httpx.Client(
@@ -118,6 +160,8 @@ class Embedder:
             found: list[Embedded] = []
             for start in range(0, len(passages), BATCH):
                 batch = passages[start : start + BATCH]
+                # Questions first: a question waiting or running at Ollama goes before this batch (at most index_wait).
+                self.gate.before_batch(self.index_wait)
                 try:
                     vectors = self._call(client, [embedding_input(title, text) for title, text in batch])
                     found.extend(Embedded(normalized(vector)) for vector in vectors)
@@ -128,15 +172,18 @@ class Embedder:
             return found
 
     def embed_query(self, question: str) -> Vector:
-        """The question's vector, under the query prompt: one call, never split."""
-        with self._client() as client:
+        """The question's vector, under the query prompt: one call, never split, holding the questions-first gate from
+        before the client opens until the answer is read."""
+        with self.gate.question(), self._client() as client:
             try:
                 return normalized(self._call(client, [query_input(question)])[0])
             except _TooLong:
                 raise EmbeddingFailed(QUESTION_TOO_LONG, retry=False) from None
 
     def _parts(self, client: httpx.Client, title: str, text: str, *, depth: int) -> list[Vector]:
-        """The vectors of the passage's parts: itself when it fits, else its halves' parts, `MAX_SPLITS` deep."""
+        """The vectors of the passage's parts: itself when it fits, else its halves' parts, `MAX_SPLITS` deep. Each
+        call waits for the questions first, as a batch does."""
+        self.gate.before_batch(self.index_wait)
         try:
             return self._call(client, [embedding_input(title, text)])
         except _TooLong:

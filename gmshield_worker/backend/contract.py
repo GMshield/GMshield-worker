@@ -2,7 +2,8 @@
 works with. Against an older backend the worker stays up, unhealthy, and keeps checking.
 
 When the worker starts using something a newer contract added, raise the constant in the same
-change as the refreshed `contracts/internal.json`.
+change as the refreshed `contracts/internal.json`, unless the worker gates that use on the backend's
+version (as `INDEX_RECIPE_CONTRACT_VERSION` does) and works without it against an older backend.
 """
 
 from __future__ import annotations
@@ -10,6 +11,9 @@ from __future__ import annotations
 import re
 
 MINIMUM_BACKEND_CONTRACT_VERSION = "1.11.0"
+# The first contract with `PUT /internal/v1/index-recipe`: the worker states its index recipe at every check only to a
+# backend at least this new, and works as before with an older one (the minimum above stays).
+INDEX_RECIPE_CONTRACT_VERSION = "1.12.0"
 
 _VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})", re.ASCII)
 

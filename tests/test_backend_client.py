@@ -7,7 +7,7 @@ from uuid import UUID
 import httpx
 import pytest
 
-from gmshield_worker.backend.client import ClaimAnswer, JobsApi, Outcome, fetch_contract_version
+from gmshield_worker.backend.client import ClaimAnswer, JobsApi, Outcome, fetch_contract_version, state_index_recipe
 from gmshield_worker.log import new_trace_id
 from gmshield_worker.models.providers import ModelChoice
 from gmshield_worker.retrieval.recipe import INDEX_RECIPE
@@ -136,3 +136,29 @@ def test_a_claim_without_a_definite_answer_is_not_definite(stand_in: StandIn) ->
     assert api.claim(UUID(job_id), new_trace_id()).definite
     assert not ClaimAnswer(status=404).definite
     assert not ClaimAnswer(status=401).definite
+
+
+def test_the_recipe_statement_puts_the_recipe_with_the_credential_and_no_grant(stand_in: StandIn) -> None:
+    stand_in.credential = "c" * 40
+    trace = new_trace_id()
+
+    answer = state_index_recipe(stand_in.url, trace, credential="c" * 40)
+
+    assert answer.stated
+    assert answer.status == 204
+    assert stand_in.recipe_statements == [INDEX_RECIPE]
+    request = stand_in.requests[-1]
+    assert (request["method"], request["path"]) == ("PUT", "/internal/v1/index-recipe")
+    assert json.loads(request["body"]) == {"indexRecipe": INDEX_RECIPE}
+    assert request["authorization"] == "Bearer " + "c" * 40
+    assert request["traceparent"].split("-")[1] == trace
+    assert "x-job-grant" not in request
+
+
+def test_a_refused_recipe_statement_reports_its_status_and_code(stand_in: StandIn) -> None:
+    refused = state_index_recipe(stand_in.url, new_trace_id(), index_recipe="two words")
+    assert (refused.stated, refused.status, refused.code) == (False, 400, "request.invalid")
+    stand_in.recipe_status = 503
+    unavailable = state_index_recipe(stand_in.url, new_trace_id())
+    assert (unavailable.stated, unavailable.status) == (False, 503)
+    assert stand_in.recipe_statements == []
