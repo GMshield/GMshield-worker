@@ -330,7 +330,7 @@ lockfile and the production image:
     the query and on each prefetch. A question with no keyword token has no sparse prefetch. No payload or vector is
     read back.
   - Pending: once every tier is searched, the first 5,000 (`MAX_PENDING`) `pending` ids of each tier, in input order,
-    are read by id in pages of 100 (`PAGE`, the backend's most per passages call), at most 4 at a time (`PARALLEL`),
+    are read by id in pages of 100 (`PAGE`, the backend's most per passages call), at most 8 at a time (`PARALLEL`),
     the tiers' pages in turns (campaign, system, campaign, ..., then the rest of the longer one), under one deadline
     1.5 s (`PENDING_BUDGET_SECONDS`) after the question's first pending read, both tiers together (`read_pending`), so
     the first words stay within NFR-14's 5 s: no page starts after it, and a page not back by it is dropped, never

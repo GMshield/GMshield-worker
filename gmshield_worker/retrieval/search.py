@@ -68,8 +68,10 @@ LIMIT = 8
 MAX_PENDING = 5000
 # The most ids of one passages call (the backend's `JobPassageReads.MAX_IDS`).
 PAGE = 100
-# The most passages calls of a question's pending reads at a time, both tiers together.
-PARALLEL = 4
+# The most passages calls of a question's pending reads at a time, both tiers together. 8, not 4: on roberto-server
+# while indexing loaded it (2026-11-19), 4 read about 2,100-2,900 of 3,900 pending passages in the 1.5 s and 8 read
+# all 3,721 in about 1 s.
+PARALLEL = 8
 # The pending reads' deadline, from the question's first pending read, for both tiers together.
 PENDING_BUDGET_SECONDS = 1.5
 MAX_QUESTION = 4000

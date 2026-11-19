@@ -376,7 +376,7 @@ def test_the_pending_ids_past_the_cap_are_skipped_and_logged_as_a_count(
     assert (done[0]["pendingFetched"], done[0]["pendingSkipped"]) == (120, 30)
     assert search.MAX_PENDING == 120
     monkeypatch.undo()
-    assert (search.MAX_PENDING, search.PAGE, search.PARALLEL, search.PENDING_BUDGET_SECONDS) == (5000, 100, 4, 1.5)
+    assert (search.MAX_PENDING, search.PAGE, search.PARALLEL, search.PENDING_BUDGET_SECONDS) == (5000, 100, 8, 1.5)
 
 
 def test_a_spent_budget_starts_no_page_and_every_unread_id_is_logged_as_skipped(
@@ -508,10 +508,10 @@ def stepping_clock(step: float) -> Callable[[], float]:
     return now
 
 
-def test_pending_passages_are_read_in_pages_of_100_exactly_4_at_a_time_in_input_order() -> None:
+def test_pending_passages_are_read_in_pages_of_100_exactly_8_at_a_time_in_input_order() -> None:
     ids = [str(uuid.uuid4()) for _ in range(1050)]
-    # The first four calls only go on once all four run at once: fewer in parallel breaks the barrier.
-    gate = threading.Barrier(4)
+    # The first eight calls only go on once all eight run at once: fewer in parallel breaks the barrier.
+    gate = threading.Barrier(8)
     reader = PageReader(gate=gate)
 
     read = search.read_pending(reader, fake_job(), [("system", ids)], terms=NO_TERMS, clock=lambda: 0.0)
@@ -519,7 +519,7 @@ def test_pending_passages_are_read_in_pages_of_100_exactly_4_at_a_time_in_input_
     assert [item.passage_id for item in read["system"].passages] == ids
     assert read["system"].unread == 0
     assert sorted(reader.calls) == sorted(ids[start : start + 100] for start in range(0, 1050, 100))
-    assert reader.most == 4
+    assert reader.most == 8
 
 
 def test_the_tiers_pages_are_started_in_turns_then_the_rest_of_the_longer_tier() -> None:
