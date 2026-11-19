@@ -337,10 +337,11 @@ lockfile and the production image:
     waited for. A page that fails before the deadline fails the search as one read did. Each page is tokenized as it
     comes back, in its read's thread and so inside the deadline: each passage keeps only the question's distinct folded
     tokens of two characters or more (`question_terms`, from `keywords.tokens`, never an HMAC) that it contains. After
-    the deadline only the counting runs: a passage scores the sum, over those tokens, of BM25's weight
-    ln(1 + (N - df + 0.5) / (df + 0.5)), N the pending passages read for the question (both tiers) and df how many
-    contain the token (`rarity`), so a rare name ("tarrasque") outweighs common words ("armor", "class", "the"); a
-    passage scoring 0 is dropped, and ties keep input order (`rank_pending`). That ranking is fused with the tier's
+    the deadline only the counting runs: each token weighs BM25's ln(1 + (N - df + 0.5) / (df + 0.5)), N the pending
+    passages read for the question (both tiers) and df how many contain it (`rarity`); passages are ordered by the
+    weight of the rarest question token they contain, then by the sum of their tokens' weights, so the passage naming
+    what the question is about ("tarrasque") comes before those sharing several commoner words ("challenge",
+    "rating"); a passage with no token is dropped, and ties keep input order (`rank_pending`). That ranking is fused with the tier's
     Qdrant results as a third RRF list (a pending id at rank r scores 1/(r + 2), Qdrant's constant), 8 ids; an id
     found both ways is one entry whose scores add up, as RRF does. The ids not read (past the cap, in pages the
     deadline left out, or in pages it dropped) are skipped and logged as a count per tier

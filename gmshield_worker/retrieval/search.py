@@ -17,10 +17,11 @@ each tier), and `tokenKey` Base64 of the owner's 32-byte token key.
    within NFR-14's 5 s: no page starts after it, and a page not back by it is dropped, never waited for. Each page is
    tokenized as it comes back, inside the deadline: each passage keeps only the question's distinct folded tokens of
    two characters or more (`question_terms`, from `keywords.tokens`, never an HMAC) that it contains, and its text is
-   let go. After the deadline only the counting runs: a passage scores the sum, over those tokens, of BM25's weight
-   ln(1 + (N - df + 0.5) / (df + 0.5)), N the pending passages read for the question (both tiers) and df how many of
-   them contain the token (`rarity`), so a rare name outweighs common words; those scoring 0 are dropped and ties keep
-   input order (`rank_pending`). That ranking is fused with the tier's
+   let go. After the deadline only the counting runs: each token weighs BM25's ln(1 + (N - df + 0.5) / (df + 0.5)), N
+   the pending passages read for the question (both tiers) and df how many of them contain it (`rarity`); passages
+   are ordered by the weight of the rarest question token they contain, then by the sum of their tokens' weights, so
+   the passage naming what the question is about (a monster, a spell, a person) comes first; those with no token are
+   dropped and ties keep input order (`rank_pending`). That ranking is fused with the tier's
    Qdrant results as a third RRF list (`fuse`), `LIMIT` ids. An id found both ways is one entry whose scores add up,
    as RRF does. The ids not read (past `MAX_PENDING`, in pages the deadline left out, or in pages it dropped) are
    skipped and logged as a count per tier (`retrieval.pending_skipped`). A question with no token of two characters or
@@ -201,11 +202,22 @@ def rarity(read: Iterable[PendingPassage]) -> dict[str, float]:
 
 
 def rank_pending(passages: Sequence[PendingPassage], weights: dict[str, float]) -> list[str]:
-    """The ids of the passages that contain at least one of the question's tokens, by the sum of those tokens' weights
-    (`rarity`, 0 for a token it lacks), highest first; those scoring 0 are dropped and input order breaks ties.
-    `math.fsum` makes the sum correctly rounded, whatever the order."""
-    scored = [(math.fsum(weights.get(term, 0.0) for term in item.terms), item.passage_id) for item in passages]
-    return [passage_id for score, passage_id in sorted(scored, key=lambda pair: -pair[0]) if score > 0]
+    """The ids of the passages that contain at least one of the question's tokens, highest first by the weight of the
+    rarest question token they contain (`rarity`, 0 for a token missing from `weights`), then by the sum of those
+    tokens' weights; those scoring 0 are dropped and input order breaks ties. The rarest token comes first because a
+    sum lets several mid-frequency words outvote the one name the question is about: on roberto-server (2026-11-19),
+    "challenge" + "rating" outweighed "tarrasque" and buried its stat block. `math.fsum` makes the sum correctly
+    rounded, whatever the order."""
+    scored = [
+        (
+            max((weights.get(term, 0.0) for term in item.terms), default=0.0),
+            math.fsum(weights.get(term, 0.0) for term in item.terms),
+            item.passage_id,
+        )
+        for item in passages
+    ]
+    ranked = sorted(scored, key=lambda entry: (-entry[0], -entry[1]))
+    return [passage_id for rarest, _, passage_id in ranked if rarest > 0]
 
 
 def fuse(found: Sequence[Found], pending: Sequence[str], limit: int = LIMIT) -> list[str]:

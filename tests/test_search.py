@@ -895,15 +895,9 @@ def test_the_pending_ranking_weighs_shared_tokens_by_rarity_and_fusion_sums_an_i
     [
         "What is the Tarrasque's armor class and challenge rating?",
         "What is the armor class and challenge rating of the Tarrasque?",
-        # The decided BM25 weight's limit, kept visible: 100 of the 241 passages hold 8 of this phrasing's words
-        # (armor, class, of, the, creature, in, this, rules), each in under half of them, and score 5.61; the
-        # Tarrasque's name alone scores 5.09, so it ranks 101st. Strict: a weight that fixes it fails this mark.
-        pytest.param(
-            WORDY_TARRASQUE,
-            marks=pytest.mark.xfail(
-                strict=True, reason="BM25 sum: 8 shared mid-frequency words outweigh one rare name"
-            ),
-        ),
+        # A wordy phrasing: 100 of the 241 passages share 8 of its words; the rarest token still decides.
+        WORDY_TARRASQUE,
+        "What is the Tarrasque's challenge rating?",
     ],
 )
 def test_a_rare_name_outweighs_common_words_the_tarrasque_stat_block_ranks_first(asked: str) -> None:
@@ -920,9 +914,10 @@ def test_a_rare_name_outweighs_common_words_the_tarrasque_stat_block_ranks_first
 
     assert ranked[0] == "p150"
     # Counting shared tokens, as before, put it below every rules passage sharing armor, class and challenge.
-    rules = [item for item in read if {"armor", "class", "challenge"} <= item.terms]
-    assert rules
-    assert all(len(item.terms) > len(read[150].terms) for item in rules)
+    if {"armor", "class", "challenge"} <= search.question_terms(asked):
+        rules = [item for item in read if {"armor", "class", "challenge"} <= item.terms]
+        assert rules
+        assert all(len(item.terms) > len(read[150].terms) for item in rules)
 
 
 def test_ranking_compares_plain_tokens_and_never_computes_an_hmac(monkeypatch: pytest.MonkeyPatch) -> None:
