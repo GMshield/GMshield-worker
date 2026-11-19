@@ -72,7 +72,7 @@ lockfile and the production image:
 | `gmshield_worker/workdir.py` | emptying the work folder, each step's own folder and the sweep thread |
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
 | `gmshield_worker/models/` | the one way to a model (Story 2.10): `providers.py` (the providers, the claim's `ModelChoice`, base URLs and keys), `chat.py` (`chat_model`: `ChatOpenAI`, `ChatAnthropic` or the fake), `output.py` (the uniform events, the citation markers, the typed failures), `fake.py` (the fake chat model); the only place a provider SDK is imported |
-| `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind), `probe.py`, `question.py` and `model_probe.py` (test mode only; Story 2.3's `test.question`, Story 2.10's `test.model`) |
+| `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind), `answer.py` (Story 2.4's `question.answer`) and `batches.py` (its event batches), `probe.py`, `question.py` and `model_probe.py` (test mode only; Story 2.3's `test.question`, Story 2.10's `test.model`) |
 | `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.21): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `images.py` (Pillow, pi-heif and pikepdf; Story 1.21), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
 | `gmshield_worker/retrieval/` | the index (Story 2.1): `recipe.py` (`INDEX_RECIPE`), `embedding.py` (embeddinggemma through Ollama), `keywords.py` (the keyed keyword vector), `store.py` (the Qdrant collection `passages`), `indexing.py` (the `index.change` and `index.removal` handlers); the search (Story 2.3): `search.py` (`find_passages`) |
 | `gmshield_worker/agents/` | the agents (Story 2.10): `graphs.py` (`compile_graph`, the only place a LangGraph graph is compiled; `AnswerWithTools`, the model-and-tools node), `tools.py` (`read_passages`, read-only under the job's grant) |
@@ -136,7 +136,8 @@ lockfile and the production image:
     a kind without a handler `worker.unknown_kind`.
   - Every line about a job, and every renewal and outcome, carries the job's trace id (the claim's
     `traceparent`): the backend logs the same id for the same job.
-  - Handlers: `ingestion` in every mode (Story 1.15, below), the test-mode `probe` (it works
+  - Handlers: `ingestion` in every mode (Story 1.15, below), `index.change` and `index.removal` (Story 2.1) and
+    `question.answer` (Story 2.4, below) in every mode, the test-mode `probe` (it works
     `workMs`, fails its first `failTimes` attempts with `probe.failed`), the test-mode `test.question` (Story 2.3,
     below) and the test-mode `test.model` (Story 2.10, below).
   - Redis down, restarted or not yet holding the group (`NOGROUP`): the lane logs
@@ -401,7 +402,29 @@ lockfile and the production image:
     ```
 
   - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
-    `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0.
+    `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4).
+- **The answer to a question (Story 2.4, `question.answer`, backend contract 1.10.0).** Registered in every mode
+  (`lanes/answer.py`), on the interactive lane.
+  - The claim's input is the backend's question input (`retrieval.search.question_input`; else
+    `retrieval.input_invalid`, no retry) and its `model` the attempt's provider, model and tier (none:
+    `model.input_invalid`, no retry; a provider this worker cannot call: its code, no retry).
+  - `find_passages` finds the passages (Story 2.3, its failures as there). Then one model call through a one-node
+    LangGraph graph (`agents.graphs.answer_graph` around `AnswerWithTools` with no tools, compiled by `compile_graph`)
+    with `models.chat.chat_model(job.model)`. The `SystemMessage` holds instructions only: answer only from the
+    passages, write `[[<passage id>]]` after each statement, answer in the question's language, and say so in one
+    sentence when the passages do not answer. The one `HumanMessage` holds the passages as data blocks
+    (`<passage id="…" section="Magias > Fire Bolt">text</passage>`, XML-escaped), then `<question>…</question>`.
+    The handed ids go to `CitationMarkers.give`, so only they can be cited. Nothing of the account (owner, token key,
+    grant) is sent.
+  - Every event goes to `lanes/batches.EventBatcher`, whose sender thread posts numbered batches to
+    `POST …/claims/{claimId}/events` (`JobsApi.events`, from 1 per claim): the first text delta at once and alone,
+    then at most every 100 ms or 32 events; a call's usage rides in the next batch. A 5xx or a transport error is
+    retried with the same number while the claim lives; any other refusal stops the answer (`failed` with its code, no
+    retry). The final batch is flushed before the outcome.
+  - A model failure is reported with its code (`model.refused`, `model.truncated`, `model.unavailable`). Only an
+    unavailable store, embedder, passages route or model before any event was accepted may be retried: once the GM
+    has seen words, the attempt fails with `retry: false` (the backend refuses a splice too).
+  - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.

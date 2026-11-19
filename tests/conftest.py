@@ -30,6 +30,12 @@ list kept in `stated_providers`. A job offered with `model=` calls a model: its 
 worker did not state its provider, when the job ends `failed` with `job.provider_unavailable` (`ended_code`), no
 attempt used, and the claim is answered 409 `job.not_offered`, as the backend does.
 
+Since Story 2.4 (contract 1.10.0) it serves `POST .../events` as the backend does: a batch number from 1 per claim, a
+repeated number accepted and recorded once, a gap 409 `job.batch_out_of_order`; each accepted batch is kept in
+`batches` under its job (`{claimId, batch, events, usage}`), and each call's usage once in `usage` by call id.
+`events_status` forces an answer (for example 503) `events_failures` times (or always when `None`). A failed outcome of
+a job with an accepted batch holding an event ends it at once (no splice), as the backend does.
+
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
 """
@@ -56,7 +62,7 @@ PR_SET_DUMPABLE = 4
 PIPELINE_VERSION = re.compile(r"[A-Za-z0-9._-]{1,32}")
 CLAIMS = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims")
 CLAIM_ROUTE = re.compile(
-    r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs|passages)"
+    r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs|passages|events)"
 )
 INPUT_ROUTE = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/inputs/([^/]+)")
 
@@ -102,7 +108,7 @@ class StandInPassage:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.9.0"
+    version: str = "1.10.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -124,6 +130,10 @@ class StandIn:
     passages: dict[str, StandInPassage] = field(default_factory=dict)
     passages_status: int | None = None
     passages_code: str = "scope.passage_refused"
+    batches: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    usage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    events_status: int | None = None
+    events_failures: int | None = None
 
     def offer(
         self,
@@ -266,7 +276,7 @@ def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tu
     job = _granted(state, job_id, claim_id, headers.get("x-job-grant"))
     if job is None:
         return problem(403, "job.grant_refused")
-    answers = {"outputs": _output, "passages": _passages, "outcome": _outcome}
+    answers = {"outputs": _output, "passages": _passages, "outcome": _outcome, "events": _events}
     return _renewal(state, job) if action == "renewals" else answers[action](state, job, body)
 
 
@@ -301,6 +311,46 @@ def _passages(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
             }
         )
     return 200, {"passages": found}
+
+
+EVENT_TYPES = ("delta", "citation")
+
+
+def _events_valid(body: dict[str, Any]) -> bool:
+    events, usage = body.get("events"), body.get("usage") or []
+    if type(body.get("batch")) is not int or body["batch"] < 1 or not isinstance(events, list) or len(events) > 500:
+        return False
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") not in EVENT_TYPES:
+            return False
+        if event["type"] == "delta" and not (isinstance(event.get("text"), str) and event["text"]):
+            return False
+        if event["type"] == "citation" and not (type(event.get("offset")) is int and event["offset"] >= 0):
+            return False
+    keys = ("input", "cacheRead", "cacheWrite", "output", "reasoning")
+    return isinstance(usage, list) and all(
+        isinstance(item, dict) and isinstance(item.get("callId"), str) and all(type(item.get(k)) is int for k in keys)
+        for item in usage
+    )
+
+
+def _events(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
+    if state.events_status is not None and (state.events_failures is None or state.events_failures > 0):
+        if state.events_failures is not None:
+            state.events_failures -= 1
+        return problem(state.events_status, "server.unavailable" if state.events_status >= 500 else "job.refused")
+    request = json.loads(body)
+    if not _events_valid(request):
+        return problem(400, "job.events_invalid")
+    stored = state.batches.setdefault(job.job_id, [])
+    last = max((item["batch"] for item in stored if item["claimId"] == job.claim_id), default=0)
+    if request["batch"] > last + 1:
+        return problem(409, "job.batch_out_of_order")
+    if request["batch"] == last + 1:
+        stored.append({"claimId": job.claim_id, **request})
+        for item in request.get("usage") or []:
+            state.usage.setdefault(item["callId"], item)
+    return 200, {"stop": False}
 
 
 def _renewal(state: StandIn, job: StandInJob) -> tuple[int, Any]:
@@ -550,7 +600,8 @@ def _outcome(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
         return problem(400, "job.result_invalid")
     job.outcomes.append(outcome)
     if outcome["outcome"] == "failed":
-        last = outcome.get("retry") is False or job.attempt >= state.max_attempts
+        delivered = any(batch["events"] for batch in state.batches.get(job.job_id, []))
+        last = outcome.get("retry") is False or job.attempt >= state.max_attempts or delivered
         job.state = "failed" if last else "offered"
     else:
         job.state = "done"

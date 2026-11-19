@@ -396,13 +396,13 @@ def test_the_probe_stops_when_cancelled_and_refuses_bad_input() -> None:
 
 
 def test_ingestion_runs_in_every_mode_and_the_probes_in_test_mode_only() -> None:
-    index = {"index.change", "index.removal"}
+    always = {"index.change", "index.removal", "question.answer"}
     assert set(handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))) == {
         "ingestion",
         "probe",
         "test.question",
         "test.model",
-        *index,
+        *always,
     }
     production = check_settings(
         {
@@ -417,7 +417,7 @@ def test_ingestion_runs_in_every_mode_and_the_probes_in_test_mode_only() -> None
             "GMSHIELD_QDRANT_API_KEY": "q",
         }
     )
-    assert set(handlers.handlers_for(production)) == {"ingestion", *index}
+    assert set(handlers.handlers_for(production)) == {"ingestion", *always}
 
 
 def test_both_lanes_start_interactive_first_and_stop_together() -> None:
@@ -469,7 +469,15 @@ def test_build_lanes_puts_the_interactive_lane_first_with_its_capacity() -> None
     assert second.stream.name == "gmshield:work:ingestion"
     assert first.consumer == second.consumer
     assert first.stop_event is second.stop_event is built.stop_event
-    assert set(first.handlers) == {"ingestion", "probe", "test.question", "test.model", "index.change", "index.removal"}
+    assert set(first.handlers) == {
+        "ingestion",
+        "probe",
+        "test.question",
+        "test.model",
+        "index.change",
+        "index.removal",
+        "question.answer",
+    }
     # Story 2.10: every claim states the providers; test mode states all three.
     assert first.api is second.api
     assert isinstance(first.api, JobsApi)
