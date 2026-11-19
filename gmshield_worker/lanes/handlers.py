@@ -4,8 +4,9 @@ lapsed, or the worker is stopping): a handler checks it and returns early, and t
 reports nothing.
 
 `ingestion` (Story 1.15, `gmshield_worker.ingestion.step`), `index.change` and `index.removal` (Story 2.1,
-`gmshield_worker.retrieval.indexing`) run in every mode; `probe` in test mode only. The index handlers
-open a Qdrant client of their own for each job.
+`gmshield_worker.retrieval.indexing`) run in every mode; `probe` and `test.question` (Story 2.3,
+`gmshield_worker.lanes.question`) in test mode only. The index and question handlers open a Qdrant client of
+their own for each job.
 """
 
 from __future__ import annotations
@@ -15,10 +16,10 @@ from collections.abc import Mapping
 from functools import partial
 from typing import Protocol
 
-from gmshield_worker.backend.client import ClaimedJob, Outcome
+from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome
 from gmshield_worker.backend.files import JobFiles
 from gmshield_worker.ingestion import step
-from gmshield_worker.lanes import probe
+from gmshield_worker.lanes import probe, question
 from gmshield_worker.retrieval import indexing, store
 from gmshield_worker.retrieval.embedding import Embedder
 from gmshield_worker.settings import Settings
@@ -29,14 +30,19 @@ class Handler(Protocol):
 
 
 def handlers_for(settings: Settings) -> Mapping[str, Handler]:
-    """The handlers this worker runs: ingestion steps and the index always, the probe in test mode only."""
+    """The handlers this worker runs: ingestion steps and the index always, the probe and the question probe in test
+    mode only."""
     files = JobFiles(settings.backend_url, settings.worker_credential)
     stores = partial(store.passage_store, settings.index)
+    embedder = Embedder(settings.index.ollama_url)
     found: dict[str, Handler] = {
         step.KIND: step.IngestionStep(files, settings.work_dir),
-        indexing.CHANGE: indexing.IndexChange(files, Embedder(settings.index.ollama_url), stores),
+        indexing.CHANGE: indexing.IndexChange(files, embedder, stores),
         indexing.REMOVAL: indexing.IndexRemoval(stores),
     }
     if settings.test_mode:
         found[probe.KIND] = probe.run
+        found[question.KIND] = question.QuestionProbe(
+            JobsApi(settings.backend_url, settings.worker_credential), embedder, stores
+        )
     return found

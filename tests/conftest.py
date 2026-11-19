@@ -20,6 +20,11 @@ it has one, must state a recipe as the backend reads it (else 400), and each one
 `index.change` outcome must report `indexRecipe` (`index_result_valid`). An index change's passages are an input like
 any other (`offer(inputs={"passages": ...})`).
 
+Since Story 2.3 (contract 1.8.0) it serves `POST .../passages` as the backend's scope does: 1 to 100 ids (else 400
+`job.passages_invalid`), each a passage of `passages` (`StandInPassage`) whose source is in one of the job input's
+`tiers`, else 403 `scope.passage_refused` with nothing returned; each answered once, in the order asked, labelled
+with the tier whose sources hold it. `passages_status` forces a refusal with `passages_code` instead.
+
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
 """
@@ -45,7 +50,9 @@ import pytest
 PR_SET_DUMPABLE = 4
 PIPELINE_VERSION = re.compile(r"[A-Za-z0-9._-]{1,32}")
 CLAIMS = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims")
-CLAIM_ROUTE = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs)")
+CLAIM_ROUTE = re.compile(
+    r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs|passages)"
+)
 INPUT_ROUTE = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/inputs/([^/]+)")
 
 
@@ -74,11 +81,21 @@ class StandInJob:
     output_ids: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class StandInPassage:
+    """A passage the backend holds: its source (a version id), text, section path and page."""
+
+    source: str
+    text: str
+    section_path: list[str]
+    page: int
+
+
 @dataclass
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.7.0"
+    version: str = "1.8.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -96,6 +113,9 @@ class StandIn:
     output_status: int | None = None
     wrong_sha256: bool = False
     stated_recipes: list[str | None] = field(default_factory=list)
+    passages: dict[str, StandInPassage] = field(default_factory=dict)
+    passages_status: int | None = None
+    passages_code: str = "scope.passage_refused"
 
     def offer(
         self,
@@ -207,9 +227,41 @@ def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tu
     job = _granted(state, job_id, claim_id, headers.get("x-job-grant"))
     if job is None:
         return problem(403, "job.grant_refused")
-    if action == "outputs":
-        return _output(state, job, body)
-    return _renewal(state, job) if action == "renewals" else _outcome(state, job, body)
+    answers = {"outputs": _output, "passages": _passages, "outcome": _outcome}
+    return _renewal(state, job) if action == "renewals" else answers[action](state, job, body)
+
+
+def _tier_of(job: StandInJob, source: str) -> str | None:
+    tiers = job.input.get("tiers")
+    for tier in tiers if isinstance(tiers, list) else []:
+        if isinstance(tier, dict) and source in (tier.get("sources") or []):
+            return str(tier.get("tier"))
+    return None
+
+
+def _passages(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
+    ids = json.loads(body).get("ids")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 100 or any(not isinstance(item, str) for item in ids):
+        return problem(400, "job.passages_invalid")
+    if state.passages_status is not None:
+        return problem(state.passages_status, state.passages_code)
+    wanted = list(dict.fromkeys(ids))
+    found = []
+    for passage_id in wanted:
+        passage = state.passages.get(passage_id)
+        tier = _tier_of(job, passage.source) if passage is not None else None
+        if passage is None or tier is None:
+            return problem(403, "scope.passage_refused")
+        found.append(
+            {
+                "id": passage_id,
+                "tier": tier,
+                "text": passage.text,
+                "sectionPath": passage.section_path,
+                "page": passage.page,
+            }
+        )
+    return 200, {"passages": found}
 
 
 def _renewal(state: StandIn, job: StandInJob) -> tuple[int, Any]:

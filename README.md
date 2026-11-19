@@ -69,13 +69,14 @@ lockfile and the production image:
 | `gmshield_worker/workdir.py` | emptying the work folder, each step's own folder and the sweep thread |
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
 | `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
-| `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind) and `probe.py` (test mode only) |
+| `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind), `probe.py` and `question.py` (test mode only; Story 2.3's `test.question`) |
 | `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.21): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `images.py` (Pillow, pi-heif and pikepdf; Story 1.21), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
-| `gmshield_worker/retrieval/` | the index (Story 2.1): `recipe.py` (`INDEX_RECIPE`), `embedding.py` (embeddinggemma through Ollama), `keywords.py` (the keyed keyword vector), `store.py` (the Qdrant collection `passages`), `indexing.py` (the `index.change` and `index.removal` handlers) |
+| `gmshield_worker/retrieval/` | the index (Story 2.1): `recipe.py` (`INDEX_RECIPE`), `embedding.py` (embeddinggemma through Ollama), `keywords.py` (the keyed keyword vector), `store.py` (the Qdrant collection `passages`), `indexing.py` (the `index.change` and `index.removal` handlers); the search (Story 2.3): `search.py` (`find_passages`) |
 | `agents/` | empty until its story (its `__init__.py` names it) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
-| `tests/` | unit tests; `tests/image/` runs only inside the production image, `tests/integration/` only beside a Redis (the `integration` stage) |
+| `tools/record_embeddings.py` | records (or `--check`s) the real embeddinggemma vectors of the retrieval fixtures (Story 2.3) |
+| `tests/` | unit tests; `tests/image/` runs only inside the production image, `tests/integration/` only beside a Redis (the `integration` stage); `tests/fixtures/retrieval/` the retrieval fixtures and their recorded vectors (SRD 5.2.1 passages, CC-BY-4.0, attribution in `ATTRIBUTION.txt`) |
 
 ## Start-up and behaviour
 
@@ -132,8 +133,9 @@ lockfile and the production image:
     a kind without a handler `worker.unknown_kind`.
   - Every line about a job, and every renewal and outcome, carries the job's trace id (the claim's
     `traceparent`): the backend logs the same id for the same job.
-  - Handlers: `ingestion` in every mode (Story 1.15, below) and the test-mode `probe` (it works
-    `workMs`, fails its first `failTimes` attempts with `probe.failed`).
+  - Handlers: `ingestion` in every mode (Story 1.15, below), the test-mode `probe` (it works
+    `workMs`, fails its first `failTimes` attempts with `probe.failed`) and the test-mode `test.question` (Story 2.3,
+    below).
   - Redis down, restarted or not yet holding the group (`NOGROUP`): the lane logs
     `stream.unavailable` by error type and retries with backoff (1 s doubling up to 30 s). The worker
     never runs `XADD`, `XTRIM` or `XGROUP`; its Redis account allows only `AUTH`, `HELLO`, `PING`,
@@ -283,9 +285,50 @@ lockfile and the production image:
   decrypting anything. The refusals: 400 `request.invalid` for a malformed body or an id that is not a UUID (before
   the grant); 403 `job.grant_refused` for a wrong, ended or lapsed grant; 400 `job.passages_invalid` for no id, more
   than 100 or a null one; 403 `job.passages_refused` for a kind that reads no passage; 404 `request.not_found` when the
-  job's campaign is gone; 403 `scope.passage_refused`, naming no id, when any id is out of the scope. No production job
-  kind implements `passages` yet: the story that adds the interactive (answer) job kind wires it, and the worker raises
-  `MINIMUM_BACKEND_CONTRACT_VERSION` (1.7.0 today) when it first calls the endpoint.
+  job's campaign is gone; 403 `scope.passage_refused`, naming no id, when any id is out of the scope. The worker calls
+  it through `JobsApi.passages` since Story 2.3, so `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.8.0.
+- **Find the passages that answer a question (Story 2.3, AD-10, backend contract 1.8.0).**
+  `retrieval/search.py` `find_passages` runs for an interactive job whose claim input is the backend's question input
+  (`Scopes.questionInput`): `{question, owner, tiers: [{tier, sources, pending}], tokenKey}`, `question` 1 to 4,000
+  characters (code points), the tiers in order (campaign, then system), `sources` the allowed version ids, `pending`
+  the ids of the tier's passages whose index change has not ended (the backend lists at most the first 100),
+  `tokenKey` Base64 of the owner's 32-byte token key. Provider, model and tier join the input with Story 2.10;
+  nothing here calls a model.
+  - When no tier has a source the answer is an empty list, with no embedding, no Qdrant query and no passages call.
+  - The question is embedded as at indexing (`embeddinggemma:300m`, `truncate: false`, normalized) under the query
+    prompt `task: search result | query: {question}`; its keyword vector is `keyword_vector(question, tokenKey)`. The
+    index recipe does not change.
+  - Per tier with sources, one `query_points` call: a dense and a sparse prefetch (40 each) fused by Qdrant's RRF
+    (`FusionQuery(Fusion.RRF)`), 8 points, the filter `owner == the job's owner AND source IN the tier's sources` on
+    the query and on each prefetch. A question with no keyword token has no sparse prefetch. No payload or vector is
+    read back.
+  - Pending: the first 100 `pending` ids of the tier, in input order, are read by id in one passages call; those that
+    share at least one keyword token with the question are ranked by how many they share, and that ranking is fused
+    with the tier's Qdrant results as a third RRF list (a pending id at rank r scores 1/(r + 2), Qdrant's constant), 8
+    ids; an id found both ways is one entry whose scores add up, as RRF does. The rest is skipped and logged as a count
+    (`retrieval.pending_skipped`). A question with no keyword token reads no pending passage, since none could match.
+  - The text of every found id, in rank order, campaign tier first, comes from one passages call: the handed-over list
+    is `[{id, tier, text, sectionPath, page}]`. Library text reaches the worker by no other path.
+  - Failures: `retrieval.embedding_unavailable` (Ollama), `retrieval.store_unavailable` (Qdrant) and
+    `retrieval.passages_unavailable` (the passages route down, or an answer out of the contract) for the backend to
+    retry; `retrieval.question_too_long` (refused by the model), `retrieval.input_invalid` and a refusal of the
+    passages route with its own code (`scope.passage_refused`, ...), or `retrieval.passages_refused` when it names none,
+    with `retry: false`. Lines carry ids, counts and timings (`retrieval.search_done`), never the question, a text or
+    the key.
+  - No production kind carries a question until Story 2.4. The test-mode kind `test.question` (`lanes/question.py`)
+    runs `find_passages` and reports the handed-over ids, `{ids: [...]}`.
+  - Tests (`tests/test_search.py`) use Qdrant's local mode and the real embeddinggemma vectors of a fixed fixture set
+    (`tests/fixtures/retrieval/`: SRD 5.2.1 passages in English, Portuguese passages written for the tests, and their
+    questions), recorded once through the Ollama tunnel (rounded to 7 decimals) and committed; an input that was not
+    recorded fails the test. Re-record after changing a fixture, the prompts or the model, and check the recording
+    against the live model:
+
+    ```sh
+    uv run python tools/record_embeddings.py           # rewrites tests/fixtures/retrieval/vectors.json
+    uv run python tools/record_embeddings.py --check   # expected: the largest difference is within 1e-4
+    ```
+
+    Ollama is `GMSHIELD_OLLAMA_URL`, else `http://localhost:11434` (the `roberto-server` SSH alias forwards it).
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.

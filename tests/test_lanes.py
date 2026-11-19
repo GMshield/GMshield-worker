@@ -395,9 +395,14 @@ def test_the_probe_stops_when_cancelled_and_refuses_bad_input() -> None:
             probe.run(claimed(bad), threading.Event())
 
 
-def test_ingestion_runs_in_every_mode_and_the_probe_in_test_mode_only() -> None:
+def test_ingestion_runs_in_every_mode_and_the_probe_and_question_probe_in_test_mode_only() -> None:
     index = {"index.change", "index.removal"}
-    assert set(handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))) == {"ingestion", "probe", *index}
+    assert set(handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))) == {
+        "ingestion",
+        "probe",
+        "test.question",
+        *index,
+    }
     production = check_settings(
         {
             "GMSHIELD_BACKEND_URL": "http://b:8080",
@@ -463,4 +468,4 @@ def test_build_lanes_puts_the_interactive_lane_first_with_its_capacity() -> None
     assert second.stream.name == "gmshield:work:ingestion"
     assert first.consumer == second.consumer
     assert first.stop_event is second.stop_event is built.stop_event
-    assert set(first.handlers) == {"ingestion", "probe", "index.change", "index.removal"}
+    assert set(first.handlers) == {"ingestion", "probe", "test.question", "index.change", "index.removal"}

@@ -1,0 +1,341 @@
+{
+  "attribution": "This work includes material from the System Reference Document 5.2.1 (“SRD 5.2.1”) by Wizards of the Coast LLC, available at https://www.dndbeyond.com/srd. The SRD 5.2.1 is licensed under the Creative Commons Attribution 4.0 International License, available at https://creativecommons.org/licenses/by/4.0/legalcode.",
+  "passages": [
+    {
+      "id": "9c221c49-ff05-5ead-b6e6-a147c3ffc747",
+      "key": "srd-vorpal-sword",
+      "language": "en",
+      "srd": true,
+      "page": 250,
+      "sectionPath": [
+        "Magic Items",
+        "Magic Items A–Z",
+        "Vorpal Sword"
+      ],
+      "title": "Vorpal Sword",
+      "text": "Weapon (Glaive, Greatsword, Longsword, or Scimitar), Legendary (Requires Attunement) You gain a +3 bonus to attack rolls and damage rolls made with this magic weapon. In addition, the weapon ignores Resistance to Slashing damage. When you use this weapon to attack a creature that has at least one head and roll a 20 on the d20 for the attack roll, you cut off one of the creature’s heads. The creature dies if it can’t survive without the lost head. A creature is immune to this effect if it has Immunity to Slashing damage, if it doesn’t have or need a head, or if the GM decides that the creature is too big for its head to be cut off with this weapon. Such a creature instead takes an extra 30 Slashing damage from the hit. If the creature has Legendary Resistance, it can expend one daily use of that trait to avoid losing its head, taking the extra damage instead."
+    },
+    {
+      "id": "3b7a1499-f9c1-5e03-9472-577d7729449a",
+      "key": "srd-sword-of-sharpness",
+      "language": "en",
+      "srd": true,
+      "page": 248,
+      "sectionPath": [
+        "Magic Items",
+        "Magic Items A–Z",
+        "Sword of Sharpness"
+      ],
+      "title": "Sword of Sharpness",
+      "text": "Weapon (Glaive, Greatsword, Longsword, or Scimitar), Very Rare (Requires Attunement) When you attack an object with this magic weapon and hit, maximize your weapon damage dice against the target. When you attack a creature with this weapon and roll a 20 on the d20 for the attack roll, that target takes an extra 14 Slashing damage and gains 1 Exhaustion level."
+    },
+    {
+      "id": "ac0a14ac-b352-5358-ae59-86732ca8858c",
+      "key": "srd-sword-of-wounding",
+      "language": "en",
+      "srd": true,
+      "page": 248,
+      "sectionPath": [
+        "Magic Items",
+        "Magic Items A–Z",
+        "Sword of Wounding"
+      ],
+      "title": "Sword of Wounding",
+      "text": "Weapon (Glaive, Greatsword, Longsword, Rapier, Scimitar, or Shortsword), Rare (Requires Attunement) When you hit a creature with an attack using this magic weapon, the target takes an extra 2d6 Necrotic damage and must succeed on a DC 15 Constitution saving throw or be unable to regain Hit Points for 1 hour. The target repeats the save at the end of each of its turns, ending the effect on itself on a success."
+    },
+    {
+      "id": "8ba1d7db-b64f-5d97-ac76-fc889eb5fc76",
+      "key": "srd-sword-of-life-stealing",
+      "language": "en",
+      "srd": true,
+      "page": 248,
+      "sectionPath": [
+        "Magic Items",
+        "Magic Items A–Z",
+        "Sword of Life Stealing"
+      ],
+      "title": "Sword of Life Stealing",
+      "text": "Weapon (Glaive, Greatsword, Longsword, Rapier, Scimitar, or Shortsword), Rare (Requires Attunement) When you attack a creature with this magic weapon and roll a 20 on the d20 for the attack roll, that target takes an extra 15 Necrotic damage if it isn’t a Construct or an Undead, and you gain Temporary Hit Points equal to the amount of Necrotic damage taken."
+    },
+    {
+      "id": "2a4df3bb-efce-5ff7-b9de-18dcbf06b52f",
+      "key": "srd-sun-blade",
+      "language": "en",
+      "srd": true,
+      "page": 248,
+      "sectionPath": [
+        "Magic Items",
+        "Magic Items A–Z",
+        "Sun Blade"
+      ],
+      "title": "Sun Blade",
+      "text": "Weapon (Longsword), Rare (Requires Attunement) This item appears to be a sword hilt. Blade of Radiance. While grasping the hilt, you can take a Bonus Action to cause a blade of pure radiance to spring into existence or make the blade disappear. While the blade exists, this magic weapon functions as a Longsword with the Finesse property. If you are proficient with Longswords or Shortswords, you are proficient with the Sun Blade. You gain a +2 bonus to attack rolls and damage rolls made with this weapon, which deals Radiant damage instead of Slashing damage. When you hit an Undead with it, that target takes an extra 1d8 Radiant damage. Sunlight. The sword’s luminous blade emits Bright Light in a 15-foot radius and Dim Light for an additional 15 feet. The light is sunlight. While the blade persists, you can take a Magic action to expand or reduce its radius of Bright Light and Dim Light by 5 feet each, to a maximum of 30 feet each or a minimum of 10 feet each."
+    },
+    {
+      "id": "c1d6229d-234f-59e4-9a5d-7404211b83f4",
+      "key": "srd-frost-brand",
+      "language": "en",
+      "srd": true,
+      "page": 223,
+      "sectionPath": [
+        "Magic Items",
+        "Magic Items A–Z",
+        "Frost Brand"
+      ],
+      "title": "Frost Brand",
+      "text": "Weapon (Glaive, Greatsword, Longsword, Rapier, Scimitar, or Shortsword), Very Rare (Requires Attunement) When you hit with an attack roll using this magic weapon, the target takes an extra 1d6 Cold damage. In addition, while you hold the weapon, you have Resistance to Fire damage. In freezing temperatures, the weapon sheds Bright Light in a 10-foot radius and Dim Light for an additional 10 feet. When you draw this weapon, you can extinguish all nonmagical flames within 30 feet of yourself. Once used, this property can’t be used again for 1 hour."
+    },
+    {
+      "id": "44a9c9c0-6481-5539-9196-04876dc20650",
+      "key": "srd-flame-tongue",
+      "language": "en",
+      "srd": true,
+      "page": 223,
+      "sectionPath": [
+        "Magic Items",
+        "Magic Items A–Z",
+        "Flame Tongue"
+      ],
+      "title": "Flame Tongue",
+      "text": "Weapon (Any Melee Weapon), Rare (Requires Attunement) While holding this magic weapon, you can take a Bonus Action and use a command word to cause flames to engulf the damage-dealing part of the weapon. These flames shed Bright Light in a 40-foot radius and Dim Light for an additional 40 feet. While the weapon is ablaze, it deals an extra 2d6 Fire damage on a hit. The flames last until you take a Bonus Action to issue the command again or until you drop, stow, or sheathe the weapon."
+    },
+    {
+      "id": "1fe129b1-41b5-578a-8544-b7d22e8217f0",
+      "key": "srd-dancing-sword",
+      "language": "en",
+      "srd": true,
+      "page": 217,
+      "sectionPath": [
+        "Magic Items",
+        "Magic Items A–Z",
+        "Dancing Sword"
+      ],
+      "title": "Dancing Sword",
+      "text": "Weapon (Greatsword, Longsword, Rapier, Scimitar, or Shortsword), Very Rare (Requires Attunement) You can take a Bonus Action to toss this magic weapon into the air. When you do so, the weapon begins to hover, flies up to 30 feet, and attacks one creature of your choice within 5 feet of itself. The weapon uses your attack roll and adds your ability modifier to damage rolls. While the weapon hovers, you can take a Bonus Action to cause it to fly up to 30 feet to another spot within 30 feet of you. As part of the same Bonus Action, you can cause the weapon to attack one creature within 5 feet of the weapon. After the hovering weapon attacks for the fourth time, it flies back to you and tries to return to your hand. If you have no hand free, the weapon falls to the ground in your space. If the weapon has no unobstructed path to you, it moves as close to you as it can and then falls to the ground. It also ceases to hover if you grasp it or are more than 30 feet away from it."
+    },
+    {
+      "id": "3169efaa-2c05-5819-b33c-af4df043aaf6",
+      "key": "srd-bag-of-holding",
+      "language": "en",
+      "srd": true,
+      "page": 212,
+      "sectionPath": [
+        "Magic Items",
+        "Magic Items A–Z",
+        "Bag of Holding"
+      ],
+      "title": "Bag of Holding",
+      "text": "Wondrous Item, Uncommon This bag has an interior space considerably larger than its outside dimensions—roughly 2 feet square and 4 feet deep on the inside. The bag can hold up to 500 pounds, not exceeding a volume of 64 cubic feet. The bag weighs 5 pounds, regardless of its contents. Retrieving an item from the bag requires a Utilize action. If the bag is overloaded, pierced, or torn, it is destroyed, and its contents are scattered in the Astral Plane. If the bag is turned inside out, its contents spill forth unharmed, but the bag must be put right before it can be used again. The bag holds enough air for 10 minutes of breathing, divided by the number of breathing creatures inside. Placing a Bag of Holding inside an extradimensional space created by a Handy Haversack, Portable Hole, or similar item instantly destroys both items and opens a gate to the Astral Plane. The gate originates where the one item was placed inside the other. Any creature within a 10-foot-radius Sphere centered on the gate is sucked through it to a random location on the Astral Plane. The gate then closes. The gate is one-way and can’t be reopened."
+    },
+    {
+      "id": "05c44126-8e4c-5584-8987-14bd20aed747",
+      "key": "srd-fireball",
+      "language": "en",
+      "srd": true,
+      "page": 131,
+      "sectionPath": [
+        "Spells",
+        "Spell Descriptions",
+        "Fireball"
+      ],
+      "title": "Fireball",
+      "text": "Level 3 Evocation (Sorcerer, Wizard) Casting Time: Action Range: 150 feet Components: V, S, M (a ball of bat guano and sulfur) Duration: Instantaneous A bright streak flashes from you to a point you choose within range and then blossoms with a low roar into a fiery explosion. Each creature in a 20-foot-radius Sphere centered on that point makes a Dexterity saving throw, taking 8d6 Fire damage on a failed save or half as much damage on a successful one. Flammable objects in the area that aren’t being worn or carried start burning. Using a Higher-Level Spell Slot. The damage increases by 1d6 for each spell slot level above 3."
+    },
+    {
+      "id": "8479dd7a-0473-53de-8c63-d115b179f7df",
+      "key": "srd-opportunity-attacks",
+      "language": "en",
+      "srd": true,
+      "page": 15,
+      "sectionPath": [
+        "Playing the Game",
+        "Combat",
+        "Opportunity Attacks"
+      ],
+      "title": "Opportunity Attacks",
+      "text": "Combatants watch for enemies to drop their guard. If you move heedlessly past your foes, you put yourself in danger by provoking an Opportunity Attack. Avoiding Opportunity Attacks. You can avoid provoking an Opportunity Attack by taking the Disengage action. You also don’t provoke an Opportunity Attack when you Teleport or when you are moved without using your movement, action, Bonus Action, or Reaction. For example, you don’t provoke an Opportunity Attack if an explosion hurls you out of a foe’s reach or if you fall past an enemy. Making an Opportunity Attack. You can make an Opportunity Attack when a creature that you can see leaves your reach. To make the attack, take a Reaction to make one melee attack with a weapon or an Unarmed Strike against that creature. The attack occurs right before it leaves your reach."
+    },
+    {
+      "id": "49196382-0a03-5436-88f2-03ff9837c27e",
+      "key": "srd-exhaustion",
+      "language": "en",
+      "srd": true,
+      "page": 181,
+      "sectionPath": [
+        "Rules Glossary",
+        "Exhaustion [Condition]"
+      ],
+      "title": "Exhaustion [Condition]",
+      "text": "While you have the Exhaustion condition, you experience the following effects. Exhaustion Levels. This condition is cumulative. Each time you receive it, you gain 1 Exhaustion level. You die if your Exhaustion level is 6. D20 Tests Affected. When you make a D20 Test, the roll is reduced by 2 times your Exhaustion level. Speed Reduced. Your Speed is reduced by a number of feet equal to 5 times your Exhaustion level. Removing Exhaustion Levels. Finishing a Long Rest removes 1 of your Exhaustion levels. When your Exhaustion level reaches 0, the condition ends."
+    },
+    {
+      "id": "7bd237d4-54b7-50e5-b3ef-df842463f129",
+      "key": "srd-falling",
+      "language": "en",
+      "srd": true,
+      "page": 182,
+      "sectionPath": [
+        "Rules Glossary",
+        "Falling [Hazard]"
+      ],
+      "title": "Falling [Hazard]",
+      "text": "A creature that falls takes 1d6 Bludgeoning damage at the end of the fall for every 10 feet it fell, to a maximum of 20d6. When the creature lands, it has the Prone condition unless it avoids taking any damage from the fall. A creature that falls into water or another liquid can use its Reaction to make a DC 15 Strength (Athletics) or Dexterity (Acrobatics) check to hit the surface head or feet first. On a successful check, any damage resulting from the fall is halved."
+    },
+    {
+      "id": "8d302647-c89c-51e9-8d5c-9b1836334760",
+      "key": "srd-suffocation",
+      "language": "en",
+      "srd": true,
+      "page": 189,
+      "sectionPath": [
+        "Rules Glossary",
+        "Suffocation [Hazard]"
+      ],
+      "title": "Suffocation [Hazard]",
+      "text": "A creature can hold its breath for a number of minutes equal to 1 plus its Constitution modifier (minimum of 30 seconds) before suffocation begins. When a creature runs out of breath or is choking, it gains 1 Exhaustion level at the end of each of its turns. When a creature can breathe again, it removes all levels of Exhaustion it gained from suffocating."
+    },
+    {
+      "id": "1f45d79b-3b2e-554a-8a10-298d0c7c3fc0",
+      "key": "srd-darkvision",
+      "language": "en",
+      "srd": true,
+      "page": 180,
+      "sectionPath": [
+        "Rules Glossary",
+        "Darkvision"
+      ],
+      "title": "Darkvision",
+      "text": "If you have Darkvision, you can see in Dim Light within a specified range as if it were Bright Light and in Darkness within that range as if it were Dim Light. You discern colors in that Darkness only as shades of gray. See also “Playing the Game” (“Exploration”)."
+    },
+    {
+      "id": "fe52df4e-5e4a-52c9-9dc0-3d7cff17a3fd",
+      "key": "pt-taverna",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 1,
+      "sectionPath": [
+        "Valmar",
+        "A Taverna do Corvo Rubro"
+      ],
+      "title": "A Taverna do Corvo Rubro",
+      "text": "A Taverna do Corvo Rubro fica no cais do porto de Valmar. O taverneiro, Osvaldo Brandão, vende informações sobre os contrabandistas do porto por cinco peças de ouro, mas só a quem pedir o vinho de amora da casa."
+    },
+    {
+      "id": "a9305067-e97b-511a-b1c7-a5899b78b615",
+      "key": "pt-portao",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 1,
+      "sectionPath": [
+        "Valmar",
+        "O Portão Norte"
+      ],
+      "title": "O Portão Norte",
+      "text": "Os guardas do Portão Norte de Valmar só deixam entrar viajantes que tragam um salvo-conduto selado pelo conde Aurélio. Quem chega depois do toque de recolher espera do lado de fora até o amanhecer."
+    },
+    {
+      "id": "7ea0c3f8-86a5-5a69-a7d2-daae90a13d61",
+      "key": "pt-serpente",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 1,
+      "sectionPath": [
+        "Bestiário",
+        "Serpente-de-cinza"
+      ],
+      "title": "Serpente-de-cinza",
+      "text": "A mordida da serpente-de-cinza injeta um veneno que exige um teste de resistência de Constituição CD 13. Em caso de falha, a criatura fica envenenada por uma hora e não recupera pontos de vida durante esse tempo."
+    },
+    {
+      "id": "1167f925-e3f8-50f2-98a5-e5192531acec",
+      "key": "pt-lobisomens",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 1,
+      "sectionPath": [
+        "Bestiário",
+        "Os Lobisomens da Mata Escura"
+      ],
+      "title": "Os Lobisomens da Mata Escura",
+      "text": "Nas noites de lua cheia, os lobisomens da Mata Escura recuperam 10 pontos de vida no início de cada um dos seus turnos. Feridas causadas por armas de prata impedem essa recuperação até a lua se pôr."
+    },
+    {
+      "id": "6d0fec64-a04a-52e2-a1d4-44e905d3849e",
+      "key": "pt-coroa",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 2,
+      "sectionPath": [
+        "Tesouros",
+        "A Coroa de Espinhos"
+      ],
+      "title": "A Coroa de Espinhos",
+      "text": "A Coroa de Espinhos é um item amaldiçoado. Quem a coloca na cabeça não consegue tirá-la e não pode dormir; a cada amanhecer, ganha um nível de exaustão até que um sacerdote quebre a maldição."
+    },
+    {
+      "id": "d7684c33-fd2a-5a1d-b9a0-ca9d52d3f12b",
+      "key": "pt-estabulo",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 2,
+      "sectionPath": [
+        "Valmar",
+        "O Estábulo de Valmar"
+      ],
+      "title": "O Estábulo de Valmar",
+      "text": "O estábulo de Valmar aluga cavalos de montaria por duas peças de prata por dia. Os animais precisam de descanso depois de oito horas de viagem, e o cavalariço exige a devolução antes do pôr do sol."
+    },
+    {
+      "id": "75352871-5dff-537c-af0c-baffe22b4472",
+      "key": "pt-festival",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 2,
+      "sectionPath": [
+        "Valmar",
+        "O Festival das Lanternas"
+      ],
+      "title": "O Festival das Lanternas",
+      "text": "Uma vez por ano, no solstício de inverno, os moradores de Valmar soltam lanternas de papel no rio. Diz a lenda que quem vê uma lanterna afundar terá um ano de azar."
+    },
+    {
+      "id": "9f00604a-e2b3-54ca-801e-ed58a781fca7",
+      "key": "pt-guilda",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 2,
+      "sectionPath": [
+        "Valmar",
+        "A Guilda dos Cartógrafos"
+      ],
+      "title": "A Guilda dos Cartógrafos",
+      "text": "A Guilda dos Cartógrafos vende mapas das minas abandonadas de Pedra Funda. Um mapa completo custa cinquenta peças de ouro, e a guilda paga o dobro por qualquer mapa de túneis ainda desconhecidos."
+    },
+    {
+      "id": "46616cab-d108-54a7-b18d-0e288addfee3",
+      "key": "pt-ponte",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 3,
+      "sectionPath": [
+        "Arredores",
+        "A Ponte do Enforcado"
+      ],
+      "title": "A Ponte do Enforcado",
+      "text": "A velha ponte sobre o rio Sombrio range sob qualquer peso maior que o de um cavalo. Uma carroça carregada tem uma chance em seis de quebrar as tábuas e cair na correnteza."
+    },
+    {
+      "id": "bf14bff9-f3af-5fcf-a529-b23d8e5afd66",
+      "key": "pt-feiticeira",
+      "language": "pt-BR",
+      "srd": false,
+      "page": 3,
+      "sectionPath": [
+        "Arredores",
+        "A Feiticeira do Pântano"
+      ],
+      "title": "A Feiticeira do Pântano",
+      "text": "Morgana, a feiticeira do pântano, troca poções de cura por dentes de dragão. Ela nunca aceita ouro e amaldiçoa quem tenta enganá-la com dentes falsos."
+    }
+  ]
+}

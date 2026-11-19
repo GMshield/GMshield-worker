@@ -7,6 +7,11 @@ no title, no name, nothing a GM can switch. An upsert of the same passage writes
 job leaves one point per passage. A removal deletes by a filter on owner and source, never by a list of ids, so it is
 safe to repeat and also takes what an index change wrote before it was cancelled.
 
+A search (Story 2.3) is one `query_points` call per tier: a dense and a sparse prefetch (`PREFETCH` each) fused by
+Qdrant's reciprocal rank fusion (`FusionQuery(Fusion.RRF)`, whose constant is `RRF_K`), `limit` points, with the filter
+`owner == the job's owner AND source IN the tier's sources` on the query and on each prefetch, every time. It answers
+ids and fused scores only (no payload, no vector). A question with no keyword token has no sparse prefetch.
+
 The client speaks REST (no gRPC) to `GMSHIELD_QDRANT_URL` with the API key, an https URL verified against the private
 authority's certificate, ignoring proxy settings from the environment. Any failure of Qdrant raises `StoreFailed`
 with `STORE_UNAVAILABLE`, which the backend retries; nothing here logs, and an error's content is never kept.
@@ -36,6 +41,9 @@ OWNER = "owner"
 SOURCE = "source"
 STORE_UNAVAILABLE = "index.store_unavailable"
 TIMEOUT_SECONDS = 30
+PREFETCH = 40
+# Qdrant's constant k of `Fusion.RRF`: a point at rank r (from 0) of a prefetch scores 1 / (r + RRF_K) for it.
+RRF_K = 2
 
 
 class StoreFailed(Exception):
@@ -44,6 +52,14 @@ class StoreFailed(Exception):
     def __init__(self) -> None:
         super().__init__(STORE_UNAVAILABLE)
         self.code = STORE_UNAVAILABLE
+
+
+@dataclass(frozen=True)
+class Found:
+    """A point a search found: the passage's id and its fused score."""
+
+    passage_id: str
+    score: float
 
 
 @dataclass(frozen=True)
@@ -78,6 +94,15 @@ def _source_filter(owner: str, source: str) -> models.Filter:
         must=[
             models.FieldCondition(key=OWNER, match=models.MatchValue(value=owner)),
             models.FieldCondition(key=SOURCE, match=models.MatchValue(value=source)),
+        ]
+    )
+
+
+def _sources_filter(owner: str, sources: Sequence[str]) -> models.Filter:
+    return models.Filter(
+        must=[
+            models.FieldCondition(key=OWNER, match=models.MatchValue(value=owner)),
+            models.FieldCondition(key=SOURCE, match=models.MatchAny(any=list(sources))),
         ]
     )
 
@@ -140,6 +165,38 @@ class PassageStore:
             )
         except (ApiException, httpx.HTTPError, ValueError) as error:
             raise StoreFailed from error
+
+    def search(
+        self, owner: str, sources: Sequence[str], dense: Sequence[float], sparse: Sparse, limit: int
+    ) -> list[Found]:
+        """The owner's points of these sources nearest the question, fused by RRF, best first; nothing, and no call,
+        without a source."""
+        if not sources:
+            return []
+        allowed = _sources_filter(owner, sources)
+        prefetch = [models.Prefetch(query=list(dense), using=DENSE, limit=PREFETCH, filter=allowed)]
+        if sparse.indices:
+            prefetch.append(
+                models.Prefetch(
+                    query=models.SparseVector(indices=sparse.indices, values=sparse.values),
+                    using=SPARSE,
+                    limit=PREFETCH,
+                    filter=allowed,
+                )
+            )
+        try:
+            answer = self.client.query_points(
+                COLLECTION,
+                prefetch=prefetch,
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query_filter=allowed,
+                limit=limit,
+                with_payload=False,
+                with_vectors=False,
+            )
+        except (ApiException, httpx.HTTPError, ValueError) as error:
+            raise StoreFailed from error
+        return [Found(str(point.id), float(point.score)) for point in answer.points]
 
     def count(self, owner: str, source: str) -> int:
         """How many points the owner's source has."""
