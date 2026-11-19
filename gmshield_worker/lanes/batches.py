@@ -1,4 +1,4 @@
-"""Posting an answer's events in numbered batches (Story 2.4, internal contract 1.10.0): `EventBatcher`.
+"""Posting an answer's events in numbered batches (Story 2.4, internal contract 1.11.0): `EventBatcher`.
 
 The handler hands every model event to `emit` as it comes and never waits: a sender thread of the batcher posts them
 to `POST .../events` under the claim's grant, numbered from 1 per claim.
@@ -9,7 +9,9 @@ to `POST .../events` under the claim's grant, numbered from 1 per claim.
 - A call's usage rides in the next batch; at the end, what is left goes out, a usage-only batch included.
 - A 5xx or a transport error is retried with the same number, backing off, while the claim lives (`cancel` is set
   once it lapsed, and then the rest is dropped). Any other refusal (4xx) stops the batcher: `refused` names its code.
-- A batch the backend accepts counts in `accepted`; its answer's `stop` sets `stop` (Story 2.6 makes it true).
+- A batch the backend accepts counts in `accepted`; its answer's `stop` sets `stop` (Story 2.6: the GM stopped the
+  answer). From then on no event is posted, only the usage still to report: events already waiting and any emitted
+  later are dropped (the backend would store none of them).
 
 `close` sends what is left and waits for the sender, so the final batch is posted before the outcome. Lines carry ids,
 numbers and counts only, never a text.
@@ -90,6 +92,8 @@ class EventBatcher:
         """Takes one model event: a delta or a citation to post, a usage to ride along; a failure is not posted."""
         with self._condition:
             if isinstance(event, TextDelta | Citation):
+                if self.stop:
+                    return
                 self._events.append(event)
             elif isinstance(event, Usage):
                 self._usage.append(event)
@@ -121,8 +125,8 @@ class EventBatcher:
     def _due(self) -> tuple[list[StreamEvent], list[Usage]] | None:
         """Under the lock: waits until a batch is due and takes it; `None` once there is nothing more to send."""
         while True:
-            if self.refused is not None or self._cancel.is_set():
-                return None
+            if self.stop or self.refused is not None or self._cancel.is_set():
+                return self._usage_after_stop()
             if not self._first_sent:
                 first = next((index for index, item in enumerate(self._events) if isinstance(item, TextDelta)), None)
                 if first is not None:
@@ -139,6 +143,17 @@ class EventBatcher:
             if self._first_sent and self._events:
                 wait = max(self._interval - (self._clock() - self._last_sent), 0.001)
             self._condition.wait(wait)
+
+    def _usage_after_stop(self) -> tuple[list[StreamEvent], list[Usage]] | None:
+        """Under the lock, once the GM stopped the answer: no event goes out any more, only the usage still to report;
+        `None` once there is none and the batcher is closing. After a refusal or a lapsed claim, nothing more goes out
+        (`None` at once)."""
+        self._events.clear()
+        while not self._usage and not self._closing and self.refused is None and not self._cancel.is_set():
+            self._condition.wait()
+        if self._usage and self.refused is None and not self._cancel.is_set():
+            return self._take(0, with_usage=True)
+        return None
 
     def _take(self, count: int, *, with_usage: bool) -> tuple[list[StreamEvent], list[Usage]]:
         events, self._events = self._events[:count], self._events[count:]
@@ -171,7 +186,9 @@ class EventBatcher:
             if answer is not None and answer.status == 200:
                 with self._condition:
                     self.accepted += 1
-                    self.posted_events += len(events)
+                    if not answer.stop:
+                        # A batch answered stop had its events dropped by the backend: they reached no one.
+                        self.posted_events += len(events)
                     self.stop = self.stop or answer.stop
                 self._log.info("events.posted", jobId=job_id, batch=number, events=len(events), usage=len(usage))
                 return

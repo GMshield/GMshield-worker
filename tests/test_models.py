@@ -3,14 +3,16 @@ every provider and directive, the citation markers, and the typed failures."""
 
 from __future__ import annotations
 
+import math
 import socket
+from collections.abc import Iterator
 
 import anthropic
 import httpx2
 import openai
 import pytest
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_openai.chat_models.base import OpenAIAPIContextOverflowError, OpenAIContextOverflowError
 
@@ -20,6 +22,7 @@ from gmshield_worker.models.output import (
     REFUSED,
     TRUNCATED,
     UNAVAILABLE,
+    CallResult,
     Citation,
     CitationMarkers,
     ModelEvent,
@@ -303,3 +306,138 @@ def test_an_error_that_is_not_a_typed_failure_propagates_from_the_call() -> None
 
     with pytest.raises(ValueError, match="broken"):
         run(Broken(provider="openai"), "x")
+
+
+# ---- the GM's stop (Story 2.6)
+
+
+class Scripted:
+    """A model whose stream yields the given chunks, counting those taken and noting when the stream is closed."""
+
+    def __init__(self, chunks: list[AIMessageChunk]) -> None:
+        self.chunks = chunks
+        self.taken = 0
+        self.closed = False
+
+    def stream(self, messages: object) -> Iterator[AIMessageChunk]:
+        try:
+            for chunk in self.chunks:
+                self.taken += 1
+                yield chunk
+        finally:
+            self.closed = self.taken < len(self.chunks)
+
+
+MESSAGES = [SystemMessage("instruções"), HumanMessage("Quanto dano causa Fire Bolt?")]
+
+
+def stopped_run(
+    model: Scripted, after: int, closed_at_usage: list[bool] | None = None
+) -> tuple[list[ModelEvent], CallResult]:
+    """Runs one call that is stopped once `after` chunks were taken. `closed_at_usage` records whether the stream was
+    closed when the usage was emitted: before `stream_call` returns, so a generator finalized on return proves
+    nothing."""
+    events: list[ModelEvent] = []
+
+    def emit(event: ModelEvent) -> None:
+        if isinstance(event, Usage) and closed_at_usage is not None:
+            closed_at_usage.append(model.closed)
+        events.append(event)
+
+    result = stream_call(
+        model,  # type: ignore[arg-type]
+        MESSAGES,
+        markers=CitationMarkers((A,)),
+        emit=emit,
+        should_stop=lambda: model.taken >= after,
+    )
+    return events, result
+
+
+def test_a_stop_after_n_chunks_closes_the_stream_flushes_the_held_text_and_emits_no_more_deltas() -> None:
+    model = Scripted([AIMessageChunk(content=text) for text in ("Fire ", "Bolt [[", f"{A}]] causa", " 1d10.")])
+
+    closed_at_usage: list[bool] = []
+    events, result = stopped_run(model, 2, closed_at_usage)
+
+    assert model.taken == 2
+    assert closed_at_usage == [True]
+    assert result.stopped
+    assert result.failed is None
+    assert result.message is None
+    # The held-back "[[" is flushed as text: a marker that never closed cites nothing.
+    assert display(events) == "Fire Bolt [["
+    assert not any(isinstance(event, Citation | ModelFailed) for event in events)
+    usage = [event for event in events if isinstance(event, Usage)]
+    assert len(usage) == 1
+    assert events[-1] == usage[0]
+    sent = sum(len(message.text) for message in MESSAGES)
+    assert usage[0] == Usage(
+        call_id=usage[0].call_id,
+        response_id=None,
+        input=math.ceil(sent / 4),
+        cache_read=0,
+        cache_write=0,
+        output=math.ceil(len("Fire Bolt [[") / 4),
+        reasoning=0,
+        estimated=True,
+    )
+
+
+def test_a_stop_keeps_the_usage_the_provider_sent() -> None:
+    first = AIMessageChunk(
+        content="Fire Bolt",
+        usage_metadata={"input_tokens": 120, "output_tokens": 3, "total_tokens": 123},
+        response_metadata={"id": "chatcmpl-real"},
+    )
+    model = Scripted([first, AIMessageChunk(content=" causa 1d10.")])
+
+    events, result = stopped_run(model, 1)
+
+    assert result.stopped
+    assert display(events) == "Fire Bolt"
+    usage = [event for event in events if isinstance(event, Usage)]
+    assert len(usage) == 1
+    assert usage[0].estimated is False
+    assert (usage[0].input, usage[0].output, usage[0].response_id) == (120, 3, "chatcmpl-real")
+
+
+def test_a_stop_before_the_first_chunk_emits_no_text_and_an_estimate_of_the_input() -> None:
+    model = Scripted([AIMessageChunk(content="Fire Bolt")])
+
+    events, result = stopped_run(model, 0)
+
+    assert result.stopped
+    assert model.taken == 0
+    assert not any(isinstance(event, TextDelta) for event in events)
+    usage = [event for event in events if isinstance(event, Usage)]
+    assert len(usage) == 1
+    assert usage[0].estimated
+    assert usage[0].output == 0
+    assert usage[0].input > 0
+
+
+def test_the_fake_model_stops_mid_answer_with_an_estimate() -> None:
+    model = chat_model(choice("azure-openai"), FAKE)
+    taken: list[ModelEvent] = []
+
+    def emit(event: ModelEvent) -> None:
+        taken.append(event)
+
+    result = stream_call(
+        model,
+        [SystemMessage("system"), HumanMessage(f"Uma pergunta sobre {A} e {B}.")],
+        markers=CitationMarkers((A, B)),
+        emit=emit,
+        should_stop=lambda: sum(isinstance(event, TextDelta) for event in taken) >= 2,
+    )
+
+    assert result.stopped
+    deltas = [event for event in taken if isinstance(event, TextDelta)]
+    assert 2 <= len(deltas) <= 3
+    full = display(run(chat_model(choice("azure-openai"), FAKE), f"Uma pergunta sobre {A} e {B}.", (A, B)))
+    assert full.startswith(display(taken))
+    assert len(display(taken)) < len(full)
+    usage = [event for event in taken if isinstance(event, Usage)]
+    assert len(usage) == 1
+    assert usage[0].estimated

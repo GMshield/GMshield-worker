@@ -10,6 +10,9 @@
    (`CitationMarkers.give`).
 4. Every event goes to an `EventBatcher` as it comes, which posts numbered batches to the backend; the final batch is
    flushed before the outcome.
+5. The GM's stop (Story 2.6): once a batch's answer says `stop`, the model stream is closed before its next chunk
+   (`stream_call`'s `should_stop`), no more events are posted, the call's usage (or its estimate) still is, and the
+   outcome is `done`: a stop is the GM's choice, not a failure. `answer.ended` says `stopped=True`.
 
 Failures: an input that is not the backend's, or a claim without a model, fails with `retrieval.input_invalid` or
 `model.input_invalid` and no retry; a provider this worker cannot call with its code and no retry; a search failure with
@@ -123,6 +126,7 @@ class AnswerJob:
         finally:
             batcher.close(FLUSH_SECONDS)
         failed = state.get("failed")
+        stopped = batcher.stop
         log.info(
             "answer.ended",
             jobId=job_id,
@@ -130,9 +134,12 @@ class AnswerJob:
             calls=state.get("calls", 0),
             batches=batcher.accepted,
             events=batcher.posted_events,
+            stopped=stopped,
             code=failed or batcher.refused or "none",
             answerSeconds=round(time.monotonic() - searched, 3),
         )
+        if stopped:
+            return Outcome.done()
         if batcher.refused is not None:
             return Outcome.failed(batcher.refused, retry=False)
         if failed is not None:

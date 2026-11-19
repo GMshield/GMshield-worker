@@ -6,8 +6,9 @@ one). `run_graph` runs it with a small step limit and no callback handler of our
 
 `AnswerWithTools` is the node body most agents share: it calls the model through `models.output.stream_call`, runs the
 read-only tools the model asks for, gives their results back, and stops at the first answer without a tool call, at the
-first failure, or after `max_calls` model calls (then `model.truncated`: the answer was cut by a limit). Library text
-enters only as tool results or user-turn data.
+first failure, or after `max_calls` model calls (then `model.truncated`: the answer was cut by a limit). `should_stop`
+(Story 2.6: the GM's stop) is asked before each model call and, inside `stream_call`, before each chunk: once true, the
+node ends `stopped`, with no failure. Library text enters only as tool results or user-turn data.
 """
 
 from __future__ import annotations
@@ -30,10 +31,12 @@ DEFAULT_MAX_CALLS = 4
 
 
 class AnswerState(TypedDict, total=False):
-    """The state of an answering graph: the conversation so far, how it ended, and how many model calls it took."""
+    """The state of an answering graph: the conversation so far, how it ended (a failure's code, or stopped), and how
+    many model calls it took."""
 
     messages: list[BaseMessage]
     failed: str | None
+    stopped: bool
     calls: int
 
 
@@ -68,13 +71,13 @@ class AnswerWithTools:
         calls = 0
         while calls < self.max_calls and not self.should_stop():
             calls += 1
-            result = stream_call(bound, messages, markers=self.markers, emit=self.emit)
+            result = stream_call(bound, messages, markers=self.markers, emit=self.emit, should_stop=self.should_stop)
             if result.message is None:
-                return {"messages": messages, "failed": result.failed, "calls": calls}
+                return {"messages": messages, "failed": result.failed, "stopped": result.stopped, "calls": calls}
             answer = message_chunk_to_message(result.message)
             messages.append(answer)
             if not isinstance(answer, AIMessage) or not answer.tool_calls:
-                return {"messages": messages, "failed": None, "calls": calls}
+                return {"messages": messages, "failed": None, "stopped": False, "calls": calls}
             for call in answer.tool_calls:
                 tool = by_name.get(call["name"])
                 if tool is None:
@@ -82,9 +85,9 @@ class AnswerWithTools:
                     continue
                 messages.append(tool.invoke(call))
         if self.should_stop():
-            return {"messages": messages, "failed": None, "calls": calls}
+            return {"messages": messages, "failed": None, "stopped": True, "calls": calls}
         self.emit(ModelFailed(TRUNCATED))
-        return {"messages": messages, "failed": TRUNCATED, "calls": calls}
+        return {"messages": messages, "failed": TRUNCATED, "stopped": False, "calls": calls}
 
 
 def answer_graph(node: Callable[[AnswerState], AnswerState]) -> CompiledStateGraph[Any, Any, Any, Any]:

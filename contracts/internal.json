@@ -13,7 +13,7 @@
         "type" : "object"
       },
       "JobCallUsage" : {
-        "description" : "One model call's tokens (contract 1.10.0), recorded once by its call id",
+        "description" : "One model call's tokens (contract 1.10.0), recorded once by its call id; estimated from contract 1.11.0",
         "properties" : {
           "cacheRead" : {
             "format" : "int64",
@@ -29,6 +29,11 @@
             "description" : "The worker's id of the call (a UUIDv7)",
             "format" : "uuid",
             "type" : "string"
+          },
+          "estimated" : {
+            "default" : false,
+            "description" : "True when the counts are the worker's estimate, not the provider's: a call stopped before the provider sent its usage (contract 1.11.0). Absent means false",
+            "type" : "boolean"
           },
           "input" : {
             "description" : "Input tokens, cache reads and writes included",
@@ -154,7 +159,7 @@
         "type" : "object"
       },
       "JobEventsReply" : {
-        "description" : "Whether the worker must stop the answer (always false until the GM can stop one)",
+        "description" : "Whether the worker must stop the answer (contract 1.11.0): true once the GM stopped it. The worker then ends the model call, posts no more events, only the usage still to report, and reports the outcome done",
         "properties" : {
           "stop" : {
             "type" : "boolean"
@@ -378,7 +383,7 @@
   },
   "info" : {
     "title" : "GMshield internal API",
-    "version" : "1.10.0"
+    "version" : "1.11.0"
   },
   "openapi" : "3.1.0",
   "paths" : {

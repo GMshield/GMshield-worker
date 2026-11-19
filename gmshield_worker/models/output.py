@@ -7,8 +7,11 @@ hands its events, in order, to `emit`:
 - `Citation(passage_id, offset)`: the model wrote `[[<passage id>]]` after a statement; the offset is where the marker
   stood, in code points of the display text. Only the ids that were given to the model (`CitationMarkers.give`) are
   kept: a marker with any other id is removed and cites nothing;
-- `Usage(call_id, response_id, input, cache_read, cache_write, output, reasoning)`, once per call, from the model's
-  `usage_metadata`. Input includes the cache reads and writes, output includes the reasoning, as LangChain counts them;
+- `Usage(call_id, response_id, input, cache_read, cache_write, output, reasoning, estimated)`, once per call, from the
+  model's `usage_metadata`. Input includes the cache reads and writes, output includes the reasoning, as LangChain
+  counts them. A call stopped before the provider sent its usage reports an estimate instead (`estimated=True`, Story
+  2.6): input is the code points of the messages' text ÷ 4, output the code points of the text emitted ÷ 4, both
+  rounded up;
 - `ModelFailed(code)`: `model.refused` (a refusal or a content filter), `model.unavailable` (connection, timeout, 5xx,
   429, an error inside the stream) or `model.truncated` (the length or max-tokens stop, or a prompt past the context
   window).
@@ -20,10 +23,15 @@ this event. Nothing inside a call is retried: a job retry is the only retry.
 A stop reason arrives at the end of the stream, so text deltas may already have been emitted when a `content_filter`,
 refusal or length stop turns into `ModelFailed`: a consumer must treat a trailing `ModelFailed` as ending the answer,
 and the deltas already passed on are not withdrawn.
+
+The GM's stop (Story 2.6): `stream_call` asks `should_stop` before it takes each chunk. Once it answers true, the
+provider's stream is closed (no more chunks are read), the held-back marker text is flushed, the usage (or its estimate)
+is emitted, and the call ends `stopped`, with no failure.
 """
 
 from __future__ import annotations
 
+import math
 import re
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -92,6 +100,7 @@ class Usage:
     cache_write: int
     output: int
     reasoning: int
+    estimated: bool = False
 
 
 @dataclass(frozen=True)
@@ -267,10 +276,74 @@ def _response_id(metadata: Mapping[str, Any]) -> str | None:
 
 @dataclass
 class CallResult:
-    """How one call ended: the whole message (for its tool calls) when it answered, else the failure's code."""
+    """How one call ended: the whole message (for its tool calls) when it answered, else the failure's code, or
+    `stopped` (no message, no failure) when `should_stop` ended it."""
 
     message: AIMessageChunk | None
     failed: str | None = None
+    stopped: bool = False
+
+
+CODE_POINTS_PER_TOKEN = 4
+
+
+def estimated_usage(call_id: str, messages: Sequence[BaseMessage], emitted: int) -> Usage:
+    """An estimate for a call the provider sent no usage for: the code points of the messages' text, and of the
+    `emitted` display text, each ÷ 4 and rounded up."""
+    sent = sum(len(message.text) for message in messages)
+    return Usage(
+        call_id=call_id,
+        response_id=None,
+        input=math.ceil(sent / CODE_POINTS_PER_TOKEN),
+        cache_read=0,
+        cache_write=0,
+        output=math.ceil(emitted / CODE_POINTS_PER_TOKEN),
+        reasoning=0,
+        estimated=True,
+    )
+
+
+def _close(stream: object) -> None:
+    """Closes a provider's stream that was left before its end, so its connection is let go."""
+    close = getattr(stream, "close", None)
+    if callable(close):
+        close()
+
+
+@dataclass
+class _Streamed:
+    """What one call's stream gave so far: kept when the stream fails or is stopped."""
+
+    whole: AIMessageChunk | None = None
+    response_id: str | None = None
+    stop_reason: str | None = None
+    stopped: bool = False
+    emitted: int = 0
+
+
+def _read(
+    stream: Any,
+    markers: CitationMarkers,
+    send: Callable[[TextDelta | Citation], None],
+    should_stop: Callable[[], bool] | None,
+    into: _Streamed,
+) -> None:
+    """Takes the stream's chunks into `into`, asking `should_stop` before each one."""
+    chunks = iter(stream)
+    while should_stop is None or not should_stop():
+        chunk = next(chunks, None)
+        if chunk is None:
+            return
+        if not isinstance(chunk, AIMessageChunk):
+            continue
+        into.whole = chunk if into.whole is None else into.whole + chunk
+        into.response_id = into.response_id or _response_id(chunk.response_metadata)
+        into.stop_reason = stop_failure(chunk.response_metadata) or into.stop_reason
+        text = chunk.text
+        if text:
+            for event in markers.feed(text):
+                send(event)
+    into.stopped = True
 
 
 def stream_call(
@@ -280,38 +353,44 @@ def stream_call(
     markers: CitationMarkers,
     emit: Emit,
     call_id: str | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> CallResult:
     """Streams one model call, emitting its events as they come, then its usage, then a failure if it ended in one.
 
-    An exception that is not a typed failure propagates; nothing is retried.
+    `should_stop` is asked before each chunk is taken: once true, the call ends stopped, as the module says. An
+    exception that is not a typed failure propagates; nothing is retried.
     """
     call = call_id or new_call_id()
-    whole: AIMessageChunk | None = None
-    response_id: str | None = None
-    stopped: str | None = None
+    streamed = _Streamed()
     failed: str | None = None
+
+    def send(event: TextDelta | Citation) -> None:
+        if isinstance(event, TextDelta):
+            streamed.emitted += len(event.text)
+        emit(event)
+
+    stream: Any = None
     try:
-        for chunk in model.stream(list(messages)):
-            if not isinstance(chunk, AIMessageChunk):
-                continue
-            whole = chunk if whole is None else whole + chunk
-            response_id = response_id or _response_id(chunk.response_metadata)
-            stopped = stop_failure(chunk.response_metadata) or stopped
-            text = chunk.text
-            if text:
-                for event in markers.feed(text):
-                    emit(event)
+        stream = model.stream(list(messages))
+        _read(stream, markers, send, should_stop, streamed)
     except Exception as error:
         failed = failure_code(error)
         if failed is None:
             raise
+    finally:
+        if streamed.stopped:
+            _close(stream)
     for event in markers.flush():
-        emit(event)
-    usage = usage_of(call, response_id, whole)
+        send(event)
+    usage = usage_of(call, streamed.response_id, streamed.whole)
+    if usage is None and streamed.stopped:
+        usage = estimated_usage(call, messages, streamed.emitted)
     if usage is not None:
         emit(usage)
-    failed = failed or stopped
+    if streamed.stopped:
+        return CallResult(message=None, stopped=True)
+    failed = failed or streamed.stop_reason
     if failed is not None:
         emit(ModelFailed(failed))
         return CallResult(message=None, failed=failed)
-    return CallResult(message=whole)
+    return CallResult(message=streamed.whole)

@@ -36,6 +36,10 @@ repeated number accepted and recorded once, a gap 409 `job.batch_out_of_order`; 
 `events_status` forces an answer (for example 503) `events_failures` times (or always when `None`). A failed outcome of
 a job with an accepted batch holding an event ends it at once (no splice), as the backend does.
 
+Since Story 2.6 (contract 1.11.0) a usage may say `estimated` (a boolean, else 400). `stop_after` plays the GM's stop:
+once a job has that many accepted batches, every later batch of it stores no event, only its usage, and is answered
+`{"stop": true}`, as the backend does after a stop.
+
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
 """
@@ -108,7 +112,7 @@ class StandInPassage:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.10.0"
+    version: str = "1.11.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -134,6 +138,7 @@ class StandIn:
     usage: dict[str, dict[str, Any]] = field(default_factory=dict)
     events_status: int | None = None
     events_failures: int | None = None
+    stop_after: int | None = None
 
     def offer(
         self,
@@ -329,7 +334,10 @@ def _events_valid(body: dict[str, Any]) -> bool:
             return False
     keys = ("input", "cacheRead", "cacheWrite", "output", "reasoning")
     return isinstance(usage, list) and all(
-        isinstance(item, dict) and isinstance(item.get("callId"), str) and all(type(item.get(k)) is int for k in keys)
+        isinstance(item, dict)
+        and isinstance(item.get("callId"), str)
+        and all(type(item.get(k)) is int for k in keys)
+        and type(item.get("estimated", False)) is bool
         for item in usage
     )
 
@@ -343,6 +351,10 @@ def _events(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     if not _events_valid(request):
         return problem(400, "job.events_invalid")
     stored = state.batches.setdefault(job.job_id, [])
+    if state.stop_after is not None and len(stored) >= state.stop_after:
+        for item in request.get("usage") or []:
+            state.usage.setdefault(item["callId"], item)
+        return 200, {"stop": True}
     last = max((item["batch"] for item in stored if item["claimId"] == job.claim_id), default=0)
     if request["batch"] > last + 1:
         return problem(409, "job.batch_out_of_order")

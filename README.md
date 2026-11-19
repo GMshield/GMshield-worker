@@ -358,7 +358,11 @@ lockfile and the production image:
     and `ModelFailed(code)` when the call ended in `model.refused` (a refusal or content filter), `model.unavailable`
     (connection, timeout, 5xx, 429, an error inside the stream) or `model.truncated` (the length or max-tokens stop,
     or a prompt past the context window). Deltas may already have gone out before a trailing `ModelFailed`: it ends
-    the answer, and they are not withdrawn.
+    the answer, and they are not withdrawn. Story 2.6: `stream_call(..., should_stop=)` asks `should_stop` before it
+    takes each chunk; once it is true, the provider's stream is closed, the held-back marker text is flushed as text,
+    the usage the provider sent is emitted, or else an estimate marked `estimated=True` (input: the code points of the
+    messages' text ÷ 4; output: the code points of the text emitted ÷ 4; both rounded up), and the call ends
+    `CallResult(stopped=True)` with no failure. `AnswerWithTools` passes its `should_stop` into every call.
     Any other exception propagates (the attempt fails as `worker.handler_failed`).
   - **Agents** (`agents/`). Every agent is a LangGraph graph compiled by `graphs.compile_graph`: in memory for one
     job, with no persistence, shared store or pause (a test fails the build otherwise), run with no callback handler of ours and
@@ -402,7 +406,7 @@ lockfile and the production image:
     ```
 
   - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
-    `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4).
+    `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4, 1.11.0 from Story 2.6).
 - **The answer to a question (Story 2.4, `question.answer`, backend contract 1.10.0).** Registered in every mode
   (`lanes/answer.py`), on the interactive lane.
   - The claim's input is the backend's question input (`retrieval.search.question_input`; else
@@ -424,6 +428,11 @@ lockfile and the production image:
   - A model failure is reported with its code (`model.refused`, `model.truncated`, `model.unavailable`). Only an
     unavailable store, embedder, passages route or model before any event was accepted may be retried: once the GM
     has seen words, the attempt fails with `retry: false` (the backend refuses a splice too).
+  - **The GM's stop (Story 2.6, backend contract 1.11.0).** A batch's answer `{stop: true}` sets the batcher's `stop`.
+    From then on the batcher posts no event (those waiting and any emitted later are dropped), only the usage still to
+    report, sent with `estimated` (`JobsApi.events`). The model stream is closed before its next chunk (`should_stop`
+    is `cancel` or the batcher halted), and the outcome is `done`: a stop is the GM's choice, not a failure.
+    `answer.ended` says `stopped=true`. Deploy order for this story: backend, then worker, then frontend.
   - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it

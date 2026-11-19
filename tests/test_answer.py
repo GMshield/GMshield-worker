@@ -2,13 +2,17 @@
 (Qdrant's local mode and the recorded embeddinggemma vectors, as in `test_search`), the model is the fake one of the
 claim's provider, and every event reaches the stand-in in numbered batches: the first delta alone, citations of given
 ids only, usage once. A late outage is never retried, an early one is; the system prompt holds no library text and the
-user turn no account data."""
+user turn no account data.
+
+Story 2.6: the GM's stop. Once a batch's answer says `stop`, the model stream is closed, the batcher posts no more
+events, only the usage (an estimate when the provider sent none), and the outcome is `done`."""
 
 from __future__ import annotations
 
 import base64
 import json
 import threading
+import time
 from collections.abc import Iterator, Sequence
 from typing import Any
 from uuid import UUID
@@ -338,6 +342,91 @@ def test_after_the_first_delta_a_batch_goes_out_once_the_interval_has_passed(sta
     ]
     batcher.close(5)
     assert len(poster.posted) == 2
+
+
+# ---- the GM's stop (Story 2.6)
+
+
+class StoppingPoster(Poster):
+    """Records each batch posted, answering `stop` from the `after`-th batch on."""
+
+    def __init__(self, after: int) -> None:
+        super().__init__()
+        self.after = after
+
+    def events(
+        self, job: ClaimedJob, batch: int, events: Sequence[TextDelta | Citation], usage: Sequence[Usage] = ()
+    ) -> EventsAnswer:
+        super().events(job, batch, events, usage)
+        return EventsAnswer(status=200, stop=batch >= self.after)
+
+
+def test_after_stop_the_batcher_posts_only_the_usage_left(stand_in: StandIn) -> None:
+    job = claimed(stand_in, ASKED.question, [tier("system", [SRD])])
+    poster = StoppingPoster(after=1)
+    batcher = batches.EventBatcher(poster, job, threading.Event(), TraceLog("test", job.trace_id), clock=lambda: 0.0)
+    batcher.start()
+    batcher.emit(TextDelta("first"))
+    assert poster.first.wait(5)
+    deadline = time.monotonic() + 5
+    while not batcher.halted and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert batcher.stop
+    assert batcher.halted
+
+    for number in range(40):
+        batcher.emit(TextDelta(f"d{number}"))
+    batcher.emit(Citation("c-1", 3))
+    usage = Usage("019a0000-0000-7000-8000-000000000003", None, 10, 0, 0, 2, 0, estimated=True)
+    batcher.emit(usage)
+    batcher.close(5)
+
+    assert [(batch, events, calls) for batch, events, calls in poster.posted] == [
+        (1, [TextDelta("first")], []),
+        (2, [], [usage]),
+    ]
+    # Batch 1 was answered stop: the backend dropped its event, so nothing was delivered.
+    assert batcher.posted_events == 0
+    assert not batcher.delivered
+
+
+class SlowFake(FakeChatModel):
+    """The fake's answer, one chunk every 50 ms, so a stop lands mid-answer."""
+
+    def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Iterator[Any]:
+        for chunk in super()._stream(messages, *args, **kwargs):
+            time.sleep(0.05)
+            yield chunk
+
+
+def test_a_stop_closes_the_model_stream_posts_the_estimated_usage_and_ends_done(
+    stand_in: StandIn, lib: Library, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: SlowFake(provider=choice.provider))
+    job = claimed(stand_in, ASKED.question, [tier("system", [SRD, PT])])
+    stand_in.stop_after = 1
+
+    outcome = run(stand_in, lib, job)
+
+    assert outcome == Outcome.done()
+    sent = posted(stand_in, job)
+    assert len(sent) == 1
+    assert [event["type"] for event in sent[0]["events"]] == ["delta"]
+    # The stream was closed long before the fake's end: one usage, an estimate, posted after the stop.
+    assert len(stand_in.usage) == 1
+    (usage,) = stand_in.usage.values()
+    assert usage["estimated"] is True
+    assert usage["input"] > 0
+    # Batch 2 was answered stop (not stored); after it, only the usage went out, in a batch of no event.
+    bodies = [json.loads(request["body"]) for request in events_requests(stand_in)]
+    assert [body["batch"] for body in bodies] == [1, 2, 3]
+    assert bodies[-1]["events"] == []
+    assert [item["estimated"] for item in bodies[-1]["usage"]] == [True]
+    assert stand_in.jobs[str(job.job_id)].state == "done"
+    ended = [line for line in log_lines(capsys.readouterr().out) if line["event"] == "answer.ended"]
+    assert len(ended) == 1
+    assert ended[0]["stopped"] is True
+    assert ended[0]["code"] == "none"
 
 
 def events_requests(stand_in: StandIn) -> list[dict[str, str]]:

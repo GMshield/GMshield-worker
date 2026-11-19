@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-MINIMUM_BACKEND_CONTRACT_VERSION = "1.10.0"
+MINIMUM_BACKEND_CONTRACT_VERSION = "1.11.0"
 
 _VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})", re.ASCII)
 
