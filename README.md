@@ -279,15 +279,20 @@ lockfile and the production image:
   keyword fallback's `pending` and retries the failed run alone every 10 minutes, at most 3 times. The worker is the
   only reader and writer of Qdrant.
   - `index.change`: the claim input is `{source, owner, kind, language, tokenKey, passages}`; the run (at most 200
-    passages) is read whole from the input `passages`, JSON Lines `{id, ordinal, page, title, text}`. Sixteen at a
-    time, each passage is embedded by `embeddinggemma:300m` through `POST {GMSHIELD_OLLAMA_URL}/api/embed` (plain
-    httpx; input `title: {title or "none"} | text: {text}`, `truncate: false`). When Ollama refuses an input as longer
-    than the context, the passage is split in two by `ingestion.passages.split`, each half embedded with the same
-    title and split again if refused, at most 4 times deep, and its vector is the L2-normalized mean of its parts:
-    nothing is cut silently. The keyword vector folds the text (NFKC, casefold, diacritics stripped), takes its Unicode
-    word tokens and numbers each by the first 4 bytes, big-endian, of HMAC-SHA256 under the owner's `tokenKey`, valued
-    by its count; Qdrant applies the `idf` modifier. Each passage is upserted as one point (id: the passage id; vectors
-    `dense` and `sparse`; payload exactly `{owner, source, kind, page, language}`). The result is
+    passages) is read whole from the input `passages`, JSON Lines `{id, ordinal, page, title, text}`. Four at a
+    time (`BATCH`), each passage is embedded by `embeddinggemma:300m` through `POST {GMSHIELD_OLLAMA_URL}/api/embed`
+    (plain httpx; input `title: {title or "none"} | text: {text}`, `truncate: false`). Questions go first: within the
+    worker, no index call (a batch, or one passage or one part of a split passage) starts while a question's embedding
+    waits or runs (`QUESTIONS_FIRST`, one gate shared by every `Embedder`), waiting at most 10 s
+    (`INDEX_WAIT_SECONDS`) before it goes anyway. Ollama embeds one request at a time (about 0.6 s a passage), so a
+    question waits behind at most one batch of 4. The gate holds within one worker process: that bound assumes one
+    worker process per Ollama, as deployed. Neither the batch size nor the gate is part of the index recipe. When Ollama
+    refuses an input as longer than the context, the passage is split in two by `ingestion.passages.split`, each half
+    embedded with the same title and split again if refused, at most 4 times deep, and its vector is the L2-normalized
+    mean of its parts: nothing is cut silently. The keyword vector folds the text (NFKC, casefold, diacritics stripped),
+    takes its Unicode word tokens and numbers each by the first 4 bytes, big-endian, of HMAC-SHA256 under the owner's
+    `tokenKey`, valued by its count; Qdrant applies the `idf` modifier. Each passage is upserted as one point (id: the
+    passage id; vectors `dense` and `sparse`; payload exactly `{owner, source, kind, page, language}`). The result is
     `{indexRecipe, points}`.
   - The collection `passages` is created when missing: `dense` (768, cosine), `sparse` (`idf`), a tenant keyword index
     on `owner` and a keyword index on `source`. Qdrant is reached over REST at `GMSHIELD_QDRANT_URL` with its API key,
@@ -329,21 +334,27 @@ lockfile and the production image:
     the tiers' pages in turns (campaign, system, campaign, ..., then the rest of the longer one), under one deadline
     1.5 s (`PENDING_BUDGET_SECONDS`) after the question's first pending read, both tiers together (`read_pending`), so
     the first words stay within NFR-14's 5 s: no page starts after it, and a page not back by it is dropped, never
-    waited for. A page that fails before the deadline fails the search as one read did. Those read that share at least
-    one keyword token with the question are ranked by how many they share, and that ranking is fused with the tier's
+    waited for. A page that fails before the deadline fails the search as one read did. Each page is tokenized as it
+    comes back, in its read's thread and so inside the deadline: each passage keeps only the question's distinct folded
+    tokens of two characters or more (`question_terms`, from `keywords.tokens`, never an HMAC) that it contains. After
+    the deadline only the counting runs: a passage scores the sum, over those tokens, of BM25's weight
+    ln(1 + (N - df + 0.5) / (df + 0.5)), N the pending passages read for the question (both tiers) and df how many
+    contain the token (`rarity`), so a rare name ("tarrasque") outweighs common words ("armor", "class", "the"); a
+    passage scoring 0 is dropped, and ties keep input order (`rank_pending`). That ranking is fused with the tier's
     Qdrant results as a third RRF list (a pending id at rank r scores 1/(r + 2), Qdrant's constant), 8 ids; an id
     found both ways is one entry whose scores add up, as RRF does. The ids not read (past the cap, in pages the
     deadline left out, or in pages it dropped) are skipped and logged as a count per tier
     (`retrieval.pending_skipped`; `pendingFetched` and `pendingSkipped` in `retrieval.search_done`). A question with no
-    keyword token reads no pending passage, since none could match.
+    token of two characters or more reads no pending passage, since none could match.
   - The text of every found id, in rank order, campaign tier first, comes from one passages call: the handed-over list
     is `[{id, tier, text, sectionPath, page}]`. Library text reaches the worker by no other path.
   - Failures: `retrieval.embedding_unavailable` (Ollama), `retrieval.store_unavailable` (Qdrant) and
     `retrieval.passages_unavailable` (the passages route down, or an answer out of the contract) for the backend to
     retry; `retrieval.question_too_long` (refused by the model), `retrieval.input_invalid` and a refusal of the
     passages route with its own code (`scope.passage_refused`, ...), or `retrieval.passages_refused` when it names none,
-    with `retry: false`. Lines carry ids, counts and timings (`retrieval.search_done`), never the question, a text or
-    the key.
+    with `retry: false`. Lines carry ids, counts and timings (`retrieval.search_done`: `embedSeconds`,
+    `searchSeconds`, `pendingSeconds`, `rankSeconds` for the counting after the pending deadline when pending passages
+    were read, and `readSeconds`), never the question, a text or the key.
   - No production kind carries a question until Story 2.4. The test-mode kind `test.question` (`lanes/question.py`)
     runs `find_passages` and reports the handed-over ids, `{ids: [...]}`.
   - Tests (`tests/test_search.py`) use Qdrant's local mode and the real embeddinggemma vectors of a fixed fixture set

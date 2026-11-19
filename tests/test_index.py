@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -114,13 +115,14 @@ def test_a_keyword_vector_numbers_tokens_by_the_owners_key_and_counts_them() -> 
 # --- embedding
 
 
-def test_passages_are_embedded_in_batches_of_16_with_the_title_slot_and_no_truncation() -> None:
+def test_passages_are_embedded_in_batches_of_4_with_the_title_slot_and_no_truncation() -> None:
     fake = FakeOllama()
     passages = [(f"Seção {i}" if i % 2 else "", f"Texto {i}") for i in range(40)]
 
     found = embedder(fake).embed(passages)
 
-    assert [len(call["input"]) for call in fake.calls] == [16, 16, 8]
+    assert embedding.BATCH == 4
+    assert [len(call["input"]) for call in fake.calls] == [4] * 10
     assert all(call["model"] == "embeddinggemma:300m" and call["truncate"] is False for call in fake.calls)
     assert fake.calls[0]["input"][:2] == ["title: none | text: Texto 0", "title: Seção 1 | text: Texto 1"]
     assert len(found) == 40
@@ -128,6 +130,128 @@ def test_passages_are_embedded_in_batches_of_16_with_the_title_slot_and_no_trunc
         assert item.parts == 1
         assert close(item.vector, embedding.normalized(fake.vector(title, text)))
         assert math.isclose(math.sqrt(sum(value * value for value in item.vector)), 1.0)
+
+
+class GatedOllama(FakeOllama):
+    """`FakeOllama`, recording when each call starts; a query waits for `release` before it answers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+        self.query_started = threading.Event()
+        self.order: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        query = body["input"][0].startswith("task: search result")
+        self.order.append("query" if query else "batch")
+        if query:
+            self.query_started.set()
+            self.release.wait(timeout=5)
+            return httpx.Response(200, json={"model": body["model"], "embeddings": [self.raw(body["input"][0])]})
+        return self.index(request)
+
+    def index(self, request: httpx.Request) -> httpx.Response:
+        return super().__call__(request)
+
+
+def test_an_index_batch_waits_while_a_question_embeds_and_starts_once_it_ends() -> None:
+    fake = GatedOllama()
+    gate = embedding.QuestionsFirst()
+    shared = embedding.Embedder("http://stand-in-ollama:11434", transport=httpx.MockTransport(fake), gate=gate)
+    question = threading.Thread(target=shared.embed_query, args=("Qual é a CA do tarrasque?",))
+    question.start()
+    assert fake.query_started.wait(timeout=5)
+    found: list[embedding.Embedded] = []
+    batch = threading.Thread(target=lambda: found.extend(shared.embed([("", "Texto 0"), ("", "Texto 1")])))
+    batch.start()
+
+    # The question runs at Ollama: the batch waits, and has not called Ollama.
+    batch.join(timeout=0.3)
+    assert batch.is_alive()
+    assert fake.order == ["query"]
+    fake.release.set()
+    question.join(timeout=5)
+    batch.join(timeout=5)
+
+    assert fake.order == ["query", "batch"]
+    assert len(found) == 2
+
+
+def test_an_index_batch_goes_after_waiting_at_most_its_cap_for_the_questions() -> None:
+    fake = FakeOllama()
+    gate = embedding.QuestionsFirst()
+    capped = embedding.Embedder(
+        "http://stand-in-ollama:11434", transport=httpx.MockTransport(fake), gate=gate, index_wait=0.2
+    )
+    assert embedding.INDEX_WAIT_SECONDS == 10.0
+    assert embedding.Embedder("http://x").gate is embedding.QUESTIONS_FIRST  # one gate for the whole worker
+
+    # A question holds the gate and never lets go: each batch waits its cap, then goes.
+    with gate.question():
+        started = time.monotonic()
+        found = capped.embed([("", f"Texto {i}") for i in range(5)])
+        spent = time.monotonic() - started
+
+    assert len(found) == 5
+    assert [len(call["input"]) for call in fake.calls] == [4, 1]
+    assert 0.4 <= spent < 3.0  # two batches, each after its 0.2 s wait
+    assert gate.before_batch(0.0)  # free again once the question ended
+
+
+class AskDuringSplit(GatedOllama):
+    """`GatedOllama` with a context `limit`, whose first index call (refused as too long) starts `asking`, a question,
+    and answers only once that question runs at Ollama."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.limit = 120
+        self.asking: threading.Thread | None = None
+
+    def index(self, request: httpx.Request) -> httpx.Response:
+        answer = super().index(request)
+        if self.order == ["batch"] and self.asking is not None:
+            self.asking.start()
+            assert self.query_started.wait(timeout=5)
+        return answer
+
+
+def test_a_question_arriving_during_a_split_goes_before_the_next_index_call() -> None:
+    fake = AskDuringSplit()
+    gate = embedding.QuestionsFirst()
+    shared = embedding.Embedder("http://stand-in-ollama:11434", transport=httpx.MockTransport(fake), gate=gate)
+    fake.asking = threading.Thread(target=shared.embed_query, args=("Qual é a CA do tarrasque?",))
+    long_text = " ".join(f"palavra{i:03d}" for i in range(40))
+    found: list[embedding.Embedded] = []
+    indexing = threading.Thread(target=lambda: found.extend(shared.embed([("A", long_text)])))
+    indexing.start()
+    assert fake.query_started.wait(timeout=5)
+
+    # The question runs at Ollama: the passage's next call (alone, then in parts) waits for it.
+    indexing.join(timeout=0.3)
+    assert indexing.is_alive()
+    assert fake.order == ["batch", "query"]
+    fake.release.set()
+    fake.asking.join(timeout=5)
+    indexing.join(timeout=5)
+
+    assert fake.order[:2] == ["batch", "query"]
+    assert set(fake.order[2:]) == {"batch"}
+    assert len(fake.order) > 3  # refused alone, then split
+    assert len(found) == 1
+    assert found[0].parts > 1
+
+
+def test_a_failed_question_lets_go_of_the_gate() -> None:
+    gate = embedding.QuestionsFirst()
+    down = embedding.Embedder(
+        "http://stand-in-ollama:11434", transport=httpx.MockTransport(FakeOllama(status=500)), gate=gate
+    )
+
+    with pytest.raises(embedding.EmbeddingFailed):
+        down.embed_query("Qual é a CA do tarrasque?")
+
+    assert gate.before_batch(0.0)
 
 
 def test_a_passage_the_model_refuses_is_split_and_its_vector_is_the_normalized_mean_of_its_parts() -> None:
@@ -359,7 +483,7 @@ def test_an_index_change_writes_one_point_per_passage_and_reports_its_recipe(
     assert outcome.result == {"indexRecipe": INDEX_RECIPE, "points": 37}
     assert index_result_valid(outcome.result)
     assert stand_in.stated_recipes == [INDEX_RECIPE]
-    assert [len(call["input"]) for call in fake.calls] == [16, 16, 5]
+    assert [len(call["input"]) for call in fake.calls] == [4] * 9 + [1]
     ids = [item["id"] for item in indexed.passages]
     stored = client.retrieve("passages", ids, with_payload=True, with_vectors=True)
     assert sorted(str(found.id) for found in stored) == sorted(ids)
