@@ -41,6 +41,10 @@
             "format" : "date-time",
             "type" : "string"
           },
+          "model" : {
+            "$ref" : "#/components/schemas/JobModel",
+            "description" : "For a kind that calls a model (contract 1.9.0): the model of this attempt, resolved again at every claim. Absent for every other kind"
+          },
           "renewAt" : {
             "description" : "Renew the claim at this time",
             "format" : "date-time",
@@ -62,8 +66,39 @@
             "maxLength" : 32,
             "pattern" : "^[A-Za-z0-9._-]{1,32}$",
             "type" : "string"
+          },
+          "providers" : {
+            "description" : "The providers the worker holds a key for (contract 1.9.0). A kind that calls a model is refused (409 job.not_offered, the job ends failed with job.provider_unavailable, no attempt used) unless its resolved provider is stated; absent means none",
+            "items" : {
+              "maxLength" : 32,
+              "pattern" : "^[a-z0-9-]{1,32}$",
+              "type" : "string"
+            },
+            "maxItems" : 8,
+            "type" : "array"
           }
         },
+        "type" : "object"
+      },
+      "JobModel" : {
+        "description" : "The model one attempt calls (contract 1.9.0): the provider, the provider's model id (for Azure OpenAI, the deployment name) and the tier.",
+        "properties" : {
+          "model" : {
+            "maxLength" : 128,
+            "type" : "string"
+          },
+          "provider" : {
+            "description" : "azure-openai, anthropic or openai; an open word, so a new provider needs no new contract",
+            "maxLength" : 32,
+            "pattern" : "^[a-z0-9-]{1,32}$",
+            "type" : "string"
+          },
+          "tier" : {
+            "description" : "full or lightweight",
+            "type" : "string"
+          }
+        },
+        "required" : [ "model", "provider", "tier" ],
         "type" : "object"
       },
       "JobOutcome" : {
@@ -233,7 +268,7 @@
   },
   "info" : {
     "title" : "GMshield internal API",
-    "version" : "1.8.0"
+    "version" : "1.9.0"
   },
   "openapi" : "3.1.0",
   "paths" : {
@@ -280,7 +315,7 @@
             "description" : "Any error"
           }
         },
-        "summary" : "Claim an offered job (409 job.claimed, 409 job.not_offered, 400 for an index recipe that is not one)",
+        "summary" : "Claim an offered job (409 job.claimed, 409 job.not_offered, 400 for an index recipe or providers that are not ones)",
         "tags" : [ "jobs" ]
       }
     },

@@ -25,6 +25,11 @@ Since Story 2.3 (contract 1.8.0) it serves `POST .../passages` as the backend's 
 `tiers`, else 403 `scope.passage_refused` with nothing returned; each answered once, in the order asked, labelled
 with the tier whose sources hold it. `passages_status` forces a refusal with `passages_code` instead.
 
+Since Story 2.10 (contract 1.9.0) a claim may state `providers` (at most 8 words of `[a-z0-9-]{1,32}`, else 400), each
+list kept in `stated_providers`. A job offered with `model=` calls a model: its claim answers that `model`, unless the
+worker did not state its provider, when the job ends `failed` with `job.provider_unavailable` (`ended_code`), no
+attempt used, and the claim is answered 409 `job.not_offered`, as the backend does.
+
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
 """
@@ -79,6 +84,8 @@ class StandInJob:
     renewals: int = 0
     inputs: dict[str, bytes] = field(default_factory=dict)
     output_ids: set[str] = field(default_factory=set)
+    model: dict[str, str] | None = None
+    ended_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -95,7 +102,7 @@ class StandInPassage:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.8.0"
+    version: str = "1.9.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -113,6 +120,7 @@ class StandIn:
     output_status: int | None = None
     wrong_sha256: bool = False
     stated_recipes: list[str | None] = field(default_factory=list)
+    stated_providers: list[list[str] | None] = field(default_factory=list)
     passages: dict[str, StandInPassage] = field(default_factory=dict)
     passages_status: int | None = None
     passages_code: str = "scope.passage_refused"
@@ -123,11 +131,14 @@ class StandIn:
         job_input: dict[str, Any] | None = None,
         trace_id: str | None = None,
         inputs: dict[str, bytes] | None = None,
+        model: dict[str, str] | None = None,
     ) -> str:
-        """Records an offered job, as the backend would before adding its message; returns its id."""
+        """Records an offered job, as the backend would before adding its message; returns its id. `model` makes it a
+        kind that calls one (`{"provider", "model", "tier"}`)."""
         job_id = str(uuid.uuid4())
         self.jobs[job_id] = StandInJob(job_id, kind, job_input or {}, trace_id or secrets.token_hex(16))
         self.jobs[job_id].inputs = dict(inputs or {})
+        self.jobs[job_id].model = model
         return job_id
 
     def times(self) -> tuple[str, str, datetime]:
@@ -153,26 +164,51 @@ def problem(status: int, code: str) -> tuple[int, dict[str, Any]]:
 
 
 RECIPE = re.compile(r"[A-Za-z0-9._-]{1,32}")
+PROVIDER = re.compile(r"[a-z0-9-]{1,32}")
+
+
+def _providers_valid(providers: object) -> bool:
+    if providers is None:
+        return True
+    return (
+        isinstance(providers, list)
+        and len(providers) <= 8
+        and all(isinstance(item, str) and PROVIDER.fullmatch(item) for item in providers)
+    )
+
+
+def _claim_refused(job: StandInJob, providers: list[str] | None) -> tuple[int, dict[str, Any]] | None:
+    """409 for a job that is claimed or not offered; a model kind's job without its provider stated ends failed."""
+    if job.state == "running" and job.lapses_at is not None and job.lapses_at > datetime.now(UTC):
+        return problem(409, "job.claimed")
+    if job.state not in ("offered", "running"):
+        return problem(409, "job.not_offered")
+    if job.model is not None and job.model["provider"] not in (providers or []):
+        job.state, job.ended_code = "failed", "job.provider_unavailable"
+        return problem(409, "job.not_offered")
+    return None
 
 
 def _claim(state: StandIn, job_id: str, body: bytes) -> tuple[int, dict[str, Any]]:
-    stated = json.loads(body).get("indexRecipe") if body else None
-    if stated is not None and (not isinstance(stated, str) or not RECIPE.fullmatch(stated)):
+    request = json.loads(body) if body else {}
+    stated, providers = request.get("indexRecipe"), request.get("providers")
+    recipe_valid = stated is None or (isinstance(stated, str) and RECIPE.fullmatch(stated) is not None)
+    if not recipe_valid or not _providers_valid(providers):
         return problem(400, "request.invalid")
     state.stated_recipes.append(stated)
+    state.stated_providers.append(providers)
     if state.claim_status is not None:
         return problem(state.claim_status, "server.unavailable")
     job = state.jobs.get(job_id)
     if job is None:
         return problem(404, "request.not_found")
-    if job.state == "running" and job.lapses_at is not None and job.lapses_at > datetime.now(UTC):
-        return problem(409, "job.claimed")
-    if job.state not in ("offered", "running"):
-        return problem(409, "job.not_offered")
+    refused = _claim_refused(job, providers)
+    if refused is not None:
+        return refused
     renew_at, lapses_text, lapses_at = state.times()
     job.state, job.attempt = "running", job.attempt + 1
     job.claim_id, job.grant, job.lapses_at = str(uuid.uuid4()), secrets.token_urlsafe(32), lapses_at
-    return 201, {
+    answer: dict[str, Any] = {
         "claimId": job.claim_id,
         "attempt": job.attempt,
         "renewAt": renew_at,
@@ -182,6 +218,9 @@ def _claim(state: StandIn, job_id: str, body: bytes) -> tuple[int, dict[str, Any
         "input": job.input,
         "traceparent": f"00-{job.trace_id}-{secrets.token_hex(8)}-01",
     }
+    if job.model is not None:
+        answer["model"] = dict(job.model)
+    return 201, answer
 
 
 def _granted(state: StandIn, job_id: str, claim_id: str, grant: str | None) -> StandInJob | None:
