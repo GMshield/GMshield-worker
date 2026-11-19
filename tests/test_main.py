@@ -139,7 +139,7 @@ def test_old_backend(stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFi
     incompatible = [line for line in lines if line["event"] == "backend.incompatible"]
     assert len(incompatible) == 1
     assert incompatible[0]["backendContractVersion"] == "0.9.0"
-    assert incompatible[0]["minimumContractVersion"] == "1.8.0"
+    assert incompatible[0]["minimumContractVersion"] == "1.9.0"
     assert not any(line["event"] == "worker.ready" for line in lines)
 
 
@@ -148,7 +148,7 @@ def test_an_old_backend_that_is_upgraded_becomes_healthy(stand_in: StandIn, tmp_
     health_file = tmp_path / "healthy"
     with running(mode_env(stand_in, tmp_path), health_file):
         wait_for(lambda: len(stand_in.requests) >= 2)
-        stand_in.version = "1.8.0"
+        stand_in.version = "1.9.0"
         wait_for(lambda: health.is_healthy(health_file))
         stand_in.version = "0.9.0"
         wait_for(lambda: not health_file.exists())
@@ -216,10 +216,12 @@ def test_missing_secret(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
         "GMSHIELD_REDIS_USERNAME",
         "GMSHIELD_OLLAMA_URL",
         "GMSHIELD_QDRANT_URL",
-        "GMSHIELD_ANTHROPIC_API_KEY",
         "GMSHIELD_WORKER_CREDENTIAL",
         "GMSHIELD_REDIS_PASSWORD",
         "GMSHIELD_QDRANT_API_KEY",
+        "GMSHIELD_AZURE_OPENAI_API_KEY",
+        "GMSHIELD_ANTHROPIC_API_KEY",
+        "GMSHIELD_OPENAI_API_KEY",
     ]
     assert "marker-host-123" not in captured.out + captured.err
 
@@ -234,7 +236,35 @@ def test_test_mode_needs_no_secret_and_uses_the_fake_model(
         wait_for(lambda: health.is_healthy(health_file))
     checked = next(line for line in log_lines(capsys.readouterr().out) if line["event"] == "startup.checked")
     assert checked["model"] == "fake"
+    assert checked["providers"] == ["azure-openai", "anthropic", "openai"]
     assert checked["testMode"] is True
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("LANGSMITH_TRACING", "true"),
+        ("LANGCHAIN_TRACING_V2", "1"),
+        ("LANGSMITH_OTEL_ENABLED", "TRUE"),
+        ("LANGSMITH_GATEWAY", "https://gateway.example"),
+        ("OTEL_TRACES_EXPORTER", "otlp"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+        ("ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE", "content"),
+    ],
+)
+def test_any_trace_export_refuses_the_start_even_in_test_mode(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str], variable: str, value: str
+) -> None:
+    environment = {**mode_env(stand_in, tmp_path), variable: value}
+    status = main.run(environment, threading.Event(), health_file=tmp_path / "healthy", lanes_factory=no_lanes)
+    assert status == 78
+    captured = capsys.readouterr()
+    refused = log_lines(captured.err)[-1]
+    assert refused["event"] == "startup.refused"
+    assert refused["reason"] == "tracing.on"
+    assert refused["settings"] == [variable]
+    if "://" in value:
+        assert value not in captured.out + captured.err
 
 
 def test_dirty_work_folder(stand_in: StandIn, tmp_path: Path) -> None:
@@ -336,10 +366,12 @@ def test_the_process_refuses_without_secrets(tmp_path: Path) -> None:
         "GMSHIELD_REDIS_USERNAME",
         "GMSHIELD_OLLAMA_URL",
         "GMSHIELD_QDRANT_URL",
-        "GMSHIELD_ANTHROPIC_API_KEY",
         "GMSHIELD_WORKER_CREDENTIAL",
         "GMSHIELD_REDIS_PASSWORD",
         "GMSHIELD_QDRANT_API_KEY",
+        "GMSHIELD_AZURE_OPENAI_API_KEY",
+        "GMSHIELD_ANTHROPIC_API_KEY",
+        "GMSHIELD_OPENAI_API_KEY",
     ]
 
 
@@ -397,7 +429,7 @@ def test_the_lanes_start_after_the_first_compatible_answer_and_stop_at_the_end(
     with running(mode_env(stand_in, tmp_path), health_file, lanes=lanes):
         wait_for(lambda: len(stand_in.requests) >= 3)
         assert lanes.events == []  # an older backend: nothing is claimed from it
-        stand_in.version = "1.8.0"
+        stand_in.version = "1.9.0"
         wait_for(lambda: health.is_healthy(health_file))
         wait_for(lambda: len(stand_in.requests) >= 6)  # re-checked, never started twice
         assert lanes.events == ["start"]

@@ -4,7 +4,9 @@ Start-up order:
   0. Make the process non-dumpable (`PR_SET_DUMPABLE 0`, Story 1.15): no child it starts can read
      its memory or `/proc/<pid>/environ`, which holds the worker's credential. Refused, the start
      stops with exit status 78.
-  1. Check the settings. Outside test mode a missing secret or setting stops the start with exit
+  1. Refuse any trace export (Story 2.10: LangSmith tracing, its OpenTelemetry export or gateway,
+     any OpenTelemetry exporter, Anthropic content capture), in every mode, then check the settings.
+     Either refusal, like a missing secret or setting outside test mode, stops the start with exit
      status 78 and one `startup.refused` line that names the settings, never a value.
   2. Empty the work folder (its contents, never the folder; links are not followed). A folder
      that is a link or a file, or that cannot be read or created, stops the start with exit
@@ -45,8 +47,7 @@ from gmshield_worker.backend.contract import MINIMUM_BACKEND_CONTRACT_VERSION, m
 from gmshield_worker.ingestion.sandbox import SandboxUnavailable, make_non_dumpable
 from gmshield_worker.lanes import build_lanes
 from gmshield_worker.log import log_event, new_trace_id
-from gmshield_worker.models import select_model_client
-from gmshield_worker.settings import WORK_DIR, Settings, SettingsRefused, check_settings
+from gmshield_worker.settings import WORK_DIR, Settings, SettingsRefused, check_settings, check_tracing
 from gmshield_worker.workdir import WorkDirSweep, WorkDirUnusable, empty_work_dir
 
 UNIT = "worker.supervisor"
@@ -224,19 +225,20 @@ def run(
         return REFUSED_EXIT_STATUS
     health.mark_unhealthy(health_file)
     try:
+        check_tracing(environment)
         settings = check_settings(environment)
     except SettingsRefused as refused:
         log_event("ERROR", UNIT, "startup.refused", trace_id, reason=refused.reason, settings=refused.settings)
         return REFUSED_EXIT_STATUS
 
-    model = select_model_client(settings)
     log_event(
         "INFO",
         UNIT,
         "startup.checked",
         trace_id,
         testMode=settings.test_mode,
-        model=model.kind,
+        model="fake" if settings.test_mode else "provider",
+        providers=list(settings.models.providers),
         minimumContractVersion=MINIMUM_BACKEND_CONTRACT_VERSION,
         interactiveCapacity=settings.interactive_capacity,
         redisTls=settings.redis.tls,

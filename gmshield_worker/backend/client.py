@@ -33,6 +33,7 @@ from gmshield_worker.backend.generated.models import (
     ContractVersion,
     JobClaim,
     JobClaimRequest,
+    JobModel,
     JobOutcome,
     JobOutcomeResult,
     JobPassages,
@@ -40,7 +41,9 @@ from gmshield_worker.backend.generated.models import (
     JobRenewal,
     Problem,
 )
+from gmshield_worker.backend.generated.types import Unset
 from gmshield_worker.log import parse_traceparent, traceparent
+from gmshield_worker.models.providers import ModelChoice
 from gmshield_worker.retrieval.recipe import INDEX_RECIPE
 
 REQUEST_TIMEOUT_SECONDS = 2.0
@@ -94,7 +97,8 @@ def fetch_contract_version(
 @dataclass(frozen=True)
 class ClaimedJob:
     """A live claim, as the backend gave it. The grant and the input (which may hold a token key or a question) are
-    never printed or logged."""
+    never printed or logged. `model` is the provider, model and tier of this attempt for a kind that calls a model
+    (contract 1.9.0), `None` for every other kind."""
 
     job_id: UUID
     claim_id: UUID
@@ -106,6 +110,7 @@ class ClaimedJob:
     # The job's trace: every line about the job, and every later call, carries it.
     trace_id: str
     grant: str = field(repr=False)
+    model: ModelChoice | None = None
 
 
 @dataclass(frozen=True)
@@ -178,26 +183,37 @@ def _code(parsed: object) -> str | None:
     return parsed.code if isinstance(parsed, Problem) else None
 
 
+def _model(parsed: JobModel | Unset) -> ModelChoice | None:
+    if isinstance(parsed, Unset):
+        return None
+    return ModelChoice(provider=parsed.provider, model=parsed.model, tier=parsed.tier)
+
+
 @dataclass(frozen=True)
 class JobsApi:
     """The job routes of the internal API, as the lanes and handlers use them. Every claim states this worker's index
-    recipe (contract 1.7.0, Story 2.1): the backend re-indexes what was indexed under another one. `passages` reads
-    passage text by id under the claim's grant (contract 1.8.0, Story 2.3)."""
+    recipe (contract 1.7.0, Story 2.1): the backend re-indexes what was indexed under another one. Every claim also
+    states the providers this worker holds a key for (contract 1.9.0, Story 2.10): the backend refuses a kind that calls
+    a model through another one. `passages` reads passage text by id under the claim's grant (contract 1.8.0, Story
+    2.3)."""
 
     base_url: str
     credential: str = field(repr=False)
     httpx_args: Mapping[str, Any] | None = None
     index_recipe: str = INDEX_RECIPE
+    providers: tuple[str, ...] = ()
 
     def _client(self, trace_id: str) -> Client:
         return backend_client(self.base_url, trace_id, credential=self.credential, httpx_args=self.httpx_args)
 
     def claim(self, job_id: UUID, trace_id: str) -> ClaimAnswer:
         """`POST /internal/v1/jobs/{id}/claims` under the lane's trace (the job's is not known yet), stating the index
-        recipe."""
+        recipe and the providers."""
         with self._client(trace_id) as client:
             response = claim_job.sync_detailed(
-                job_id, client=client, body=JobClaimRequest(index_recipe=self.index_recipe)
+                job_id,
+                client=client,
+                body=JobClaimRequest(index_recipe=self.index_recipe, providers=list(self.providers)),
             )
         parsed = response.parsed
         if response.status_code == 201 and isinstance(parsed, JobClaim):
@@ -214,6 +230,7 @@ class JobsApi:
                     input=parsed.input_.to_dict(),
                     trace_id=job_trace,
                     grant=parsed.grant,
+                    model=_model(parsed.model),
                 ),
             )
         return ClaimAnswer(status=int(response.status_code), code=_code(parsed))

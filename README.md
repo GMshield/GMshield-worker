@@ -17,7 +17,10 @@ every transitive one, and `[tool.uv] exclude-newer` keeps them all on or before 
 | uv | 0.13.6 (`ghcr.io/astral-sh/uv:0.13.6`, pinned by digest) | `Dockerfile` |
 | Docling | 2.145.0 | `pyproject.toml` |
 | torch, torchvision (CPU builds, from the PyTorch CPU index) | 2.15.0, 0.29.2 | `pyproject.toml` |
-| anthropic | 2.3.0 | `pyproject.toml` |
+| langchain-core, langchain-openai, langchain-anthropic (the chat models, Story 2.10; MIT) | 1.7.3, 1.7.3, 1.7.7 | `pyproject.toml` |
+| langgraph (the agents' graphs, Story 2.10; MIT) | 1.2.19 | `pyproject.toml` |
+| openai, anthropic (the provider SDKs, whose errors `models/output.py` maps; the versions the LangChain packages above lock; both bring `httpx2`, and `opentelemetry-api` without an SDK comes with anthropic) | 3.41.0, 2.3.0 | `pyproject.toml` |
+| httpx2 (the provider SDKs' HTTP client; the tests build its requests and responses) | 2.16.0 | `pyproject.toml` (development) |
 | httpx | 0.28.1 | `pyproject.toml` |
 | redis (redis-py, released 2026-07-30) | 8.1.0 | `pyproject.toml` |
 | attrs (used by the generated client) | 26.1.0 | `pyproject.toml` |
@@ -68,22 +71,25 @@ lockfile and the production image:
 | `gmshield_worker/health.py` | the health file and `python -m gmshield_worker.health` (the image's `HEALTHCHECK`) |
 | `gmshield_worker/workdir.py` | emptying the work folder, each step's own folder and the sweep thread |
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
-| `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
-| `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind), `probe.py` and `question.py` (test mode only; Story 2.3's `test.question`) |
+| `gmshield_worker/models/` | the one way to a model (Story 2.10): `providers.py` (the providers, the claim's `ModelChoice`, base URLs and keys), `chat.py` (`chat_model`: `ChatOpenAI`, `ChatAnthropic` or the fake), `output.py` (the uniform events, the citation markers, the typed failures), `fake.py` (the fake chat model); the only place a provider SDK is imported |
+| `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind), `probe.py`, `question.py` and `model_probe.py` (test mode only; Story 2.3's `test.question`, Story 2.10's `test.model`) |
 | `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.21): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `images.py` (Pillow, pi-heif and pikepdf; Story 1.21), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
 | `gmshield_worker/retrieval/` | the index (Story 2.1): `recipe.py` (`INDEX_RECIPE`), `embedding.py` (embeddinggemma through Ollama), `keywords.py` (the keyed keyword vector), `store.py` (the Qdrant collection `passages`), `indexing.py` (the `index.change` and `index.removal` handlers); the search (Story 2.3): `search.py` (`find_passages`) |
-| `agents/` | empty until its story (its `__init__.py` names it) |
+| `gmshield_worker/agents/` | the agents (Story 2.10): `graphs.py` (`compile_graph`, the only place a LangGraph graph is compiled; `AnswerWithTools`, the model-and-tools node), `tools.py` (`read_passages`, read-only under the job's grant) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
 | `tools/record_embeddings.py` | records (or `--check`s) the real embeddinggemma vectors of the retrieval fixtures (Story 2.3) |
-| `tests/` | unit tests; `tests/image/` runs only inside the production image, `tests/integration/` only beside a Redis (the `integration` stage); `tests/fixtures/retrieval/` the retrieval fixtures and their recorded vectors (SRD 5.2.1 passages, CC-BY-4.0, attribution in `ATTRIBUTION.txt`) |
+| `tools/record_model_responses.py` | records (or `--check`s) the real Azure OpenAI streams of the model fixtures, on roberto-server (Story 2.10) |
+| `tests/` | unit tests; `tests/image/` runs only inside the production image, `tests/integration/` only beside a Redis (the `integration` stage); `tests/fixtures/retrieval/` the retrieval fixtures and their recorded vectors (SRD 5.2.1 passages, CC-BY-4.0, attribution in `ATTRIBUTION.txt`); `tests/fixtures/models/` each provider's HTTP streams, replayed by `tests/model_fixtures.py` |
 
 ## Start-up and behaviour
 
 0. **Non-dumpable** (Story 1.15). `PR_SET_DUMPABLE 0`, before anything else; refused, the start
    stops with exit status 78 (`startup.refused`, reason `process.dumpable`).
-1. **Settings.** Outside test mode a missing or invalid setting stops the start with exit status
-   78 and one `startup.refused` line that names the settings, never a value.
+1. **Tracing, then settings.** Any trace export stops the start, in every mode, with exit status 78
+   (`startup.refused`, reason `tracing.on`, naming the variables; Story 2.10, below). Then, outside
+   test mode, a missing or invalid setting stops the start with exit status 78 and one
+   `startup.refused` line that names the settings, never a value.
 2. **Work folder.** Everything inside `GMSHIELD_WORK_DIR` is removed; the folder itself stays, and
    a symbolic link is removed as a link, never followed. A removal that fails is logged by error
    type and the start continues. A folder that is a link or a file, or that cannot be created or
@@ -105,12 +111,9 @@ lockfile and the production image:
   credential (`Authorization: Bearer`), a W3C `traceparent` with the start-up trace id (a job's own
   for its renewals and outcome) and a new span id, a 2 s timeout, no redirects, and no proxy taken
   from the environment.
-- **Model.** `models/` has one interface, `ModelClient`, with the fake model (deterministic, no
-  network) and the Claude client (Anthropic SDK, default model `claude-sonnet-5-5`, the full tier;
-  `claude-haiku-5-5` is the lightweight tier, and the backend will choose per job under AD-18; the
-  SDK client is created on first use, so building it calls nothing). Test mode always uses the fake
-  model; outside it a missing key is an error, never a silent fake.
-  Nothing calls a model, Qdrant or Ollama in this story.
+- **Model.** Every model call goes through `models/` (Story 2.10, below). The start calls no model,
+  Qdrant or Ollama; `startup.checked` logs `model` (`fake` in test mode, else `provider`) and the
+  `providers` the worker states at each claim.
 - **Logs.** One JSON object per line, ERROR lines on standard error and the rest on standard
   output: `timestamp`, `level`, `traceId`, `unit`, `event`, then ids,
   numbers, versions, status codes, setting names or error types. Never content, never a secret,
@@ -134,8 +137,8 @@ lockfile and the production image:
   - Every line about a job, and every renewal and outcome, carries the job's trace id (the claim's
     `traceparent`): the backend logs the same id for the same job.
   - Handlers: `ingestion` in every mode (Story 1.15, below), the test-mode `probe` (it works
-    `workMs`, fails its first `failTimes` attempts with `probe.failed`) and the test-mode `test.question` (Story 2.3,
-    below).
+    `workMs`, fails its first `failTimes` attempts with `probe.failed`), the test-mode `test.question` (Story 2.3,
+    below) and the test-mode `test.model` (Story 2.10, below).
   - Redis down, restarted or not yet holding the group (`NOGROUP`): the lane logs
     `stream.unavailable` by error type and retries with backoff (1 s doubling up to 30 s). The worker
     never runs `XADD`, `XTRIM` or `XGROUP`; its Redis account allows only `AUTH`, `HELLO`, `PING`,
@@ -292,8 +295,8 @@ lockfile and the production image:
   (`Scopes.questionInput`): `{question, owner, tiers: [{tier, sources, pending}], tokenKey}`, `question` 1 to 4,000
   characters (code points), the tiers in order (campaign, then system), `sources` the allowed version ids, `pending`
   the ids of the tier's passages whose index change has not ended (the backend lists at most the first 100),
-  `tokenKey` Base64 of the owner's 32-byte token key. Provider, model and tier join the input with Story 2.10;
-  nothing here calls a model.
+  `tokenKey` Base64 of the owner's 32-byte token key. Provider, model and tier come with the claim's `model` (Story
+  2.10), never with the input; nothing here calls a model.
   - When no tier has a source the answer is an empty list, with no embedding, no Qdrant query and no passages call.
   - The question is embedded as at indexing (`embeddinggemma:300m`, `truncate: false`, normalized) under the query
     prompt `task: search result | query: {question}`; its keyword vector is `keyword_vector(question, tokenKey)`. The
@@ -329,6 +332,76 @@ lockfile and the production image:
     ```
 
     Ollama is `GMSHIELD_OLLAMA_URL`, else `http://localhost:11434` (the `roberto-server` SSH alias forwards it).
+- **Models through LangGraph, with a switchable provider (Story 2.10, AD-18, backend contract 1.9.0).** The backend
+  chooses the provider, model and tier of each attempt; the worker never chooses one and never falls back to another.
+  - **Claim.** Every claim states `providers`: those the worker holds a key for (test mode: `azure-openai`,
+    `anthropic` and `openai`). A claim of a kind that calls a model answers `model: {provider, model, tier}`
+    (`ClaimedJob.model`; `None` for every other kind). The backend refuses such a job to a worker that did not state
+    its provider: the job ends `failed` with `job.provider_unavailable`, no attempt used, and the claim is answered
+    409 `job.not_offered`. A claim that names a provider the worker has no key for fails the attempt with
+    `model.provider_key_missing`, one it does not know with `model.provider_unknown`, both with `retry: false`.
+  - **Chat models** (`models/chat.py`, `chat_model`). Azure OpenAI and OpenAI: `ChatOpenAI` on Chat Completions,
+    chosen explicitly (`use_responses_api=False`), at an explicit base URL (Azure: `GMSHIELD_AZURE_OPENAI_BASE_URL`,
+    the resource's `https://<host>/openai/v1/`, with the deployment name as the model; OpenAI:
+    `https://api.openai.com/v1`), `store=False`, `stream_usage=True`, no provider-hosted tool, no `api-version`, never
+    `AzureChatOpenAI`. Anthropic: `ChatAnthropic` at `https://api.anthropic.com`. Every model has `max_retries=0` (a
+    job retry is the only retry), a 60 s timeout and at most 4,096 output tokens. Test mode builds the fake model of
+    the claim's provider. Provider SDK and LangChain provider imports appear only in `models/` (a test fails the build
+    otherwise).
+  - **Uniform output** (`models/output.py`, `stream_call`). Each call has a worker-minted call id (a UUIDv7). Its
+    events, in order: `TextDelta` (display text, the citation markers removed), `Citation(passage_id, offset)` (the
+    model writes `[[<passage id>]]` after a statement; the offset is in code points of the display text; only ids
+    given to the model are kept, a marker with another id is removed; a marker split across chunks is held back until
+    the next chunk decides it), one `Usage(call_id, response_id, input, cache_read, cache_write, output, reasoning)`
+    from `usage_metadata` (input includes the cache reads and writes; the provider's response id when it sent one),
+    and `ModelFailed(code)` when the call ended in `model.refused` (a refusal or content filter), `model.unavailable`
+    (connection, timeout, 5xx, 429, an error inside the stream) or `model.truncated` (the length or max-tokens stop,
+    or a prompt past the context window). Deltas may already have gone out before a trailing `ModelFailed`: it ends
+    the answer, and they are not withdrawn.
+    Any other exception propagates (the attempt fails as `worker.handler_failed`).
+  - **Agents** (`agents/`). Every agent is a LangGraph graph compiled by `graphs.compile_graph`: in memory for one
+    job, with no persistence, shared store or pause (a test fails the build otherwise), run with no callback handler of ours and
+    within 10 steps. `AnswerWithTools` calls the model, runs the tools it asks for and gives their results back, at
+    most 4 calls (then `model.truncated`). Tools are read-only internal-API calls under the job's grant:
+    `read_passages` reads passages by id (`JobsApi.passages`) and gives their ids to the citation markers. Library
+    text enters only as tool results or user-turn data, never in the system prompt.
+  - **Fake model** (`models/fake.py`, test mode). A LangChain chat model shaped as its provider's integration
+    (Chat Completions chunks for `azure-openai` and `openai`, Anthropic chunks for `anthropic`), deterministic,
+    streamed in small chunks so markers split, citing the passage ids it was given. Directives in the user turn:
+    `fake:refusal`, `fake:outage`, `fake:truncated` (one `ModelFailed` each) and `fake:tool` (it calls
+    `read_passages` with the user turn's ids, then cites the results).
+  - **`test.model`** (`lanes/model_probe.py`, test mode only). Input `{prompt}` (1 to 4,000 characters); a one-node
+    graph around `AnswerWithTools` with `read_passages`; the result is `{model, events, usage}`. A typed failure fails
+    the attempt with its code (`model.unavailable` retried by the backend, the others with `retry: false`); a claim
+    without a model or a prompt fails with `model.input_invalid`. Lines carry ids, the provider, model and tier,
+    call counts and token totals, never a prompt or a text.
+  - **Tracing is refused.** The worker does not start (`tracing.on`, naming the variables) when
+    `LANGSMITH_` or `LANGCHAIN_` followed by `TRACING`, `TRACING_V2`, `OTEL_ENABLED` or `OTEL_ONLY` (any of the eight)
+    is truthy, `LANGSMITH_GATEWAY` is set,
+    `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER` or `OTEL_LOGS_EXPORTER` is anything but empty or `none`, any
+    `OTEL_EXPORTER_OTLP_*` variable is set, or `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE` is `content`. The image
+    holds no OpenTelemetry SDK or exporter (a test checks the installed packages and the lock).
+  - **Recorded streams** (`tests/fixtures/models/`, replayed over HTTP by `tests/model_fixtures.py` in
+    `tests/test_model_recordings.py`). Each real chat model gets its provider's bytes: an answer (display text, its
+    citation, the usage), a refusal (for Azure also a Chat Completions refusal delta), a 503 and a length stop (and
+    for Anthropic an error inside the stream), mapped
+    to the same codes as the fake's. The requests are checked too: the explicit path, no `api-version`,
+    `store: false`, usage streamed, no tool, one request. The prompt is synthetic, with an invented passage. The
+    Anthropic cases are hand-built from its documented format (no Anthropic key exists). Azure's `answer` and
+    `length` are recorded on roberto-server, inside the worker image, with the server's `worker.env`, so the key
+    never leaves the server; the tool drops every header, replaces the response ids and refuses a body that holds the
+    key or the host, and only the cleaned file is copied back. Its `refusal`, `refusal_delta` and `outage` stay
+    hand-built (a synthetic prompt causes none of them). Each case says `recorded` or `hand-built`.
+
+    ```sh
+    # on roberto-server, in a folder holding a copy of tools/ and tests/ (~/gm2-10-record):
+    docker run --rm --env-file ~/gmshield-ci/secrets/worker.env --user "$(id -u):$(id -g)" \
+        -v ~/gm2-10-record:/record -w /record <worker image> python tools/record_model_responses.py
+    # the same with --check: today's live streams still have the recorded shape
+    ```
+
+  - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
+    `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0.
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.
@@ -341,7 +414,8 @@ lockfile and the production image:
 | Setting | Meaning |
 |---|---|
 | `GMSHIELD_BACKEND_URL` | the backend's address, `http` or `https`, without credentials (required outside test mode) |
-| `GMSHIELD_ANTHROPIC_API_KEY` | the model provider's key (required outside test mode; secret) |
+| `GMSHIELD_AZURE_OPENAI_API_KEY`, `GMSHIELD_AZURE_OPENAI_BASE_URL` | Azure OpenAI (Story 2.10; the key is secret): the key, and the resource's v1 URL `https://<resource>.openai.azure.com/openai/v1/` (https, that path, no query); a key without the URL is refused (`setting.missing`), a URL that is not one too (`setting.invalid`) |
+| `GMSHIELD_ANTHROPIC_API_KEY`, `GMSHIELD_OPENAI_API_KEY` | Anthropic's and OpenAI's keys (Story 2.10; secret) |
 | `GMSHIELD_WORKER_CREDENTIAL` | the worker's credential for `/internal/v1` (required outside test mode; secret): 32 to 512 characters of `A-Z a-z 0-9 . _ ~ + / = -`, the same value as the backend's |
 | `GMSHIELD_REDIS_HOST`, `GMSHIELD_REDIS_PORT` | Redis (the host required outside test mode; port default 6379) |
 | `GMSHIELD_REDIS_USERNAME`, `GMSHIELD_REDIS_PASSWORD` | the worker's Redis account (required outside test mode; `worker` in production; the password is secret) |
@@ -353,7 +427,14 @@ lockfile and the production image:
 | `GMSHIELD_HEALTH_FILE` | for tests that run the worker outside the image only; default `/run/gmshield-worker/healthy` |
 | `GMSHIELD_MODE` | unset, or `test` |
 
-`GMSHIELD_MODE=test` is set only by the pipeline: it needs no secret, uses the fake model, uses
+Each model provider's key is optional, and outside test mode at least one is required: none refuses the start
+(`setting.missing` naming the three). A key must be visible ASCII without spaces (it goes into a header). The worker
+states at each claim the providers it holds a key for; the backend's `GMSHIELD_MODEL_PROVIDER` chooses the provider.
+A placeholder key the worker does not really hold makes it claim jobs it cannot run (they fail with the provider's
+error): leave out every key that is not real.
+
+`GMSHIELD_MODE=test` is set only by the pipeline: it needs no secret, reads no model key, uses the fake model for every
+provider (and states all three), uses
 `http://stand-in-backend:8080` unless `GMSHIELD_BACKEND_URL` is set, Redis at `redis:6379` (or
 `GMSHIELD_REDIS_HOST`/`GMSHIELD_REDIS_PORT`) without an account, a password or TLS, and the fixed,
 public worker credential `gmshield-test-mode-worker-credential-not-a-secret` that the backend's test
