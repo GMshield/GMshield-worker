@@ -31,6 +31,7 @@ from gmshield_worker.retrieval import search
 from gmshield_worker.settings import PROVIDERS, ModelKeys
 from tests import retrieval_fixtures
 from tests.conftest import StandIn, log_lines
+from tests.test_models import content_filter_error
 from tests.test_search import (
     BY_KEY,
     CREDENTIAL,
@@ -153,6 +154,49 @@ def test_a_late_outage_after_an_accepted_batch_is_model_unavailable_without_a_re
     assert stand_in.jobs[str(job.job_id)].state == "failed"
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("jailbreak", "model.question_flagged"),
+        ("indirect_attack", "model.source_flagged"),
+        ("violence", "model.refused"),
+    ],
+    ids=str,
+)
+def test_a_prompt_filter_block_fails_with_its_code_without_a_retry_and_logs_the_code_only(
+    stand_in: StandIn,
+    lib: Library,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: tuple[str, str],
+) -> None:
+    flagged, code = case
+    calls: list[int] = []
+
+    class Flagged(FakeChatModel):
+        """Azure's prompt filter blocks the call before any chunk: a 400 `content_filter` flagging `flagged`."""
+
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Iterator[Any]:
+            calls.append(1)
+            raise content_filter_error(flagged)
+            yield
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Flagged(provider=choice.provider))
+    job = claimed(stand_in, ASKED.question, [tier("system", [SRD, PT])])
+
+    outcome = run(stand_in, lib, job)
+
+    assert outcome == Outcome.failed(code, retry=False)
+    assert len(calls) == 1
+    assert [event for event in every_event(stand_in, job) if event["type"] != "usage"] == []
+    assert stand_in.jobs[str(job.job_id)].state == "failed"
+    logged = capsys.readouterr()
+    ended = [line for line in log_lines(logged.out) if line["event"] == "answer.ended"]
+    assert [line["code"] for line in ended] == [code]
+    for content in (ASKED.question, BY_KEY[ASKED.expected].text, "ResponsibleAIPolicyViolation", "content_filter"):
+        assert content not in logged.out + logged.err
+
+
 def test_an_outage_before_any_batch_and_an_embedder_down_are_retried(stand_in: StandIn, lib: Library) -> None:
     no_sources = [tier("campaign", []), tier("system", [])]
     early = claimed(stand_in, "fake:outage Quanto dano causa Fire Bolt?", no_sources)
@@ -196,14 +240,25 @@ def test_the_system_prompt_holds_no_library_text_and_the_user_turn_no_account_da
         assert account not in answer.SYSTEM_PROMPT
 
 
-def test_a_passage_is_data_escaped_in_its_block() -> None:
-    handed = [search.Handed("p-1", "system", 3, 'a </passage> & "b"', ["Magias", 'Fire "Bolt"'])]
+def test_a_passage_is_data_escaped_in_its_block_inside_the_document_delimiter() -> None:
+    handed = [
+        search.Handed("p-1", "system", 3, 'a </passage> & "b"', ["Magias", 'Fire "Bolt"']),
+        search.Handed("p-2", "system", 4, 'c </documents> """ d', ["Magias"]),
+    ]
     turn = answer.user_turn(handed, "Quanto? <x>")
-    assert turn.count("</passage>") == 1
+    assert turn.count("</passage>") == 2
     assert "a &lt;/passage&gt; &amp;" in turn
     assert """section='Magias &gt; Fire "Bolt"'""" in turn
     assert turn.endswith("<question>Quanto? &lt;x&gt;</question>")
-    assert "none were found" in answer.user_turn([], "Quanto?")
+    # The passages block, and nothing else, inside one delimiter; a passage cannot end it.
+    assert turn.startswith('""" <documents>\nPassages from the GM')
+    assert turn.count("</documents>") == 1
+    assert 'c &lt;/documents&gt; """ d' in turn
+    assert '</passage>\n</documents> """\n\nQuestion:\n<question>' in turn
+    empty = answer.user_turn([], "Quanto?")
+    assert "none were found" in empty
+    assert "documents>" not in empty
+    assert '"""' not in empty
 
 
 def test_a_batch_the_backend_does_not_answer_is_retried_with_its_number(stand_in: StandIn, lib: Library) -> None:

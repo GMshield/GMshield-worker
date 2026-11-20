@@ -19,7 +19,9 @@ from langchain_openai.chat_models.base import OpenAIAPIContextOverflowError, Ope
 from gmshield_worker.models.chat import chat_model
 from gmshield_worker.models.fake import FakeChatModel
 from gmshield_worker.models.output import (
+    QUESTION_FLAGGED,
     REFUSED,
+    SOURCE_FLAGGED,
     TRUNCATED,
     UNAVAILABLE,
     CallResult,
@@ -262,6 +264,26 @@ def _response(status: int) -> httpx2.Response:
     return httpx2.Response(status, request=httpx2.Request("POST", "https://provider.test/v1"))
 
 
+# Azure's prompt-filter categories, as its 400 `content_filter` answer lists them.
+_FILTER_CATEGORIES = ("hate", "jailbreak", "self_harm", "sexual", "violence")
+
+
+def content_filter_error(
+    *flagged: str, key: str = "filtered", inner: bool = True, nested: bool = False
+) -> openai.BadRequestError:
+    """Azure's 400 `content_filter` answer to a blocked prompt, as the OpenAI SDK raises it (its `body` is the error
+    object itself, or under `error` when `nested`): the `flagged` categories `filtered` (or only `detected`) in
+    `innererror.content_filter_result`."""
+    result: dict[str, object] = {name: {"filtered": False, "severity": "safe"} for name in _FILTER_CATEGORIES}
+    result["jailbreak"] = {"filtered": False, "detected": False}
+    for name in flagged:
+        result[name] = {key: True} | ({"detected": True} if key == "filtered" else {"filtered": False})
+    body: dict[str, object] = {"code": "content_filter", "message": "m", "param": "prompt", "status": 400}
+    if inner:
+        body["innererror"] = {"code": "ResponsibleAIPolicyViolation", "content_filter_result": result}
+    return openai.BadRequestError("x", response=_response(400), body={"error": body} if nested else body)
+
+
 @pytest.mark.parametrize(
     ("error", "code"),
     [
@@ -274,6 +296,15 @@ def _response(status: int) -> httpx2.Response:
             openai.BadRequestError("x", response=_response(400), body={"code": "content_filter", "message": "m"}),
             REFUSED,
         ),
+        (content_filter_error("jailbreak"), QUESTION_FLAGGED),
+        (content_filter_error("jailbreak", key="detected"), QUESTION_FLAGGED),
+        (content_filter_error("indirect_attack"), SOURCE_FLAGGED),
+        (content_filter_error("indirect_attack", key="detected"), SOURCE_FLAGGED),
+        (content_filter_error("violence"), REFUSED),
+        (content_filter_error(), REFUSED),
+        (content_filter_error("jailbreak", inner=False), REFUSED),
+        (content_filter_error("jailbreak", nested=True), QUESTION_FLAGGED),
+        (content_filter_error("jailbreak", "indirect_attack"), QUESTION_FLAGGED),
         (anthropic.InternalServerError("x", response=_response(500), body=None), UNAVAILABLE),
         (
             anthropic.APIStatusError(
