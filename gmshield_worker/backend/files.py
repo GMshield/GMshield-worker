@@ -102,6 +102,28 @@ class JobFiles:
             raise FileTransferError(200, "worker.input_truncated")
         return written
 
+    def read(self, job: ClaimedJob, name: str, limit: int) -> bytes:
+        """The input `name` read whole into memory (Story 2.1: an index change's run of passages, bounded by the
+        backend), for inputs too small to need the work folder. A body over `limit` bytes, short or long, raises."""
+        headers = {**self._headers(job), "accept": "application/octet-stream"}
+        body = bytearray()
+        with (
+            self._client() as client,
+            client.stream("GET", self._path(job, f"inputs/{name}"), headers=headers) as response,
+        ):
+            if response.status_code != 200:
+                raise FileTransferError(response.status_code, _problem_code(response))
+            expected = int(response.headers.get("content-length", "-1"))
+            if expected > limit:
+                raise FileTransferError(200, "worker.input_too_large")
+            for chunk in response.iter_raw(CHUNK_BYTES):
+                body.extend(chunk)
+                if len(body) > limit:
+                    raise FileTransferError(200, "worker.input_too_large")
+        if expected >= 0 and len(body) != expected:
+            raise FileTransferError(200, "worker.input_truncated")
+        return bytes(body)
+
     def upload(self, job: ClaimedJob, source: Path) -> StoredOutput:
         """Streams `source` back as an output of the job; the backend's id for it, checked against its size and hash."""
         size = source.stat().st_size

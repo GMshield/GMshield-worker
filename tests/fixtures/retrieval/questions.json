@@ -1,0 +1,88 @@
+{
+  "questions": [
+    {
+      "key": "q-pt-fireball",
+      "case": "pt-en",
+      "language": "pt-BR",
+      "question": "Qual magia lança uma explosão de fogo que atinge todos numa esfera de seis metros de raio?",
+      "expected": "srd-fireball"
+    },
+    {
+      "key": "q-pt-opportunity",
+      "case": "pt-en",
+      "language": "pt-BR",
+      "question": "Como posso evitar um ataque de oportunidade ao sair do alcance de um inimigo?",
+      "expected": "srd-opportunity-attacks"
+    },
+    {
+      "key": "q-pt-exhaustion",
+      "case": "pt-en",
+      "language": "pt-BR",
+      "question": "O que acontece com um personagem quando o nível de exaustão chega a seis?",
+      "expected": "srd-exhaustion"
+    },
+    {
+      "key": "q-pt-bag",
+      "case": "pt-en",
+      "language": "pt-BR",
+      "question": "Quanto peso cabe dentro de uma bolsa mágica que é maior por dentro do que por fora?",
+      "expected": "srd-bag-of-holding"
+    },
+    {
+      "key": "q-pt-falling",
+      "case": "pt-en",
+      "language": "pt-BR",
+      "question": "Quanto dano um personagem sofre ao cair de uma grande altura?",
+      "expected": "srd-falling"
+    },
+    {
+      "key": "q-en-tavern",
+      "case": "en-pt",
+      "language": "en",
+      "question": "Who sells information about the smugglers at the harbour, and for how much?",
+      "expected": "pt-taverna"
+    },
+    {
+      "key": "q-en-gate",
+      "case": "en-pt",
+      "language": "en",
+      "question": "What do travellers need to be let in through the north gate of the city?",
+      "expected": "pt-portao"
+    },
+    {
+      "key": "q-en-werewolves",
+      "case": "en-pt",
+      "language": "en",
+      "question": "Do werewolves heal during the full moon, and what stops it?",
+      "expected": "pt-lobisomens"
+    },
+    {
+      "key": "q-en-crown",
+      "case": "en-pt",
+      "language": "en",
+      "question": "Which cursed crown keeps its wearer from sleeping?",
+      "expected": "pt-coroa"
+    },
+    {
+      "key": "q-en-maps",
+      "case": "en-pt",
+      "language": "en",
+      "question": "How much does a map of the abandoned mines cost?",
+      "expected": "pt-guilda"
+    },
+    {
+      "key": "q-vorpal",
+      "case": "exact-name",
+      "language": "en",
+      "question": "Vorpal Sword",
+      "expected": "srd-vorpal-sword"
+    },
+    {
+      "key": "q-pending",
+      "case": "pending",
+      "language": "pt-BR",
+      "question": "Quem é Osvaldo Brandão?",
+      "expected": "pt-taverna"
+    }
+  ]
+}

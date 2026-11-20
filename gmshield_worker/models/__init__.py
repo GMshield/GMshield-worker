@@ -1,40 +1,18 @@
-"""Model clients: one interface, two implementations.
+"""The one way to a model (Story 2.10, AD-18). Provider SDKs and LangChain's provider packages are imported here and
+nowhere else in the worker (a boundary test fails the build otherwise).
 
-- `FakeModelClient` (`fake.py`): deterministic, no network. Test mode always selects it.
-- `ClaudeModelClient` (`claude.py`): the Anthropic SDK. Building it calls nothing.
+- `providers.py`: the providers (`azure-openai`, `anthropic`, `openai`), the claim's `ModelChoice`, and each
+  provider's explicit base URL and key. A provider without a key or unknown fails the attempt, never retried.
+- `chat.py`: `chat_model(choice, keys)` builds `ChatOpenAI` (Azure OpenAI, OpenAI) or `ChatAnthropic`, or the fake
+  model in test mode. No fallback provider, no retry inside a call.
+- `output.py`: the uniform output of every provider: text deltas without citation markers, citations by passage id
+  and code-point offset, usage once per call under a worker-minted call id, and the typed failures `model.refused`,
+  `model.question_flagged`, `model.source_flagged` (a prompt filter flagged the question or a passage),
+  `model.unavailable` and `model.truncated`.
+- `fake.py`: the fake chat model for any provider, with its directives (`fake:refusal`, `fake:outage`,
+  `fake:truncated`, `fake:tool`).
+
+The backend chooses the provider, model and tier per attempt; the worker states the providers it holds a key for at
+every claim (`ModelKeys.providers`). Agents (`gmshield_worker.agents`) call models only through `chat_model` and
+`output.stream_call`.
 """
-
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Protocol
-
-if TYPE_CHECKING:
-    from gmshield_worker.settings import Settings
-
-
-class ModelClient(Protocol):
-    """What the worker asks of a language model."""
-
-    @property
-    def kind(self) -> str:
-        """`fake` or `claude`: logged at start, never a secret."""
-        ...
-
-    def complete(self, system: str, prompt: str, *, max_tokens: int = 1024) -> str:
-        """The model's text answer to one prompt."""
-        ...
-
-
-def select_model_client(settings: Settings) -> ModelClient:
-    """The fake model in test mode; the Claude client otherwise. Neither calls anything here.
-
-    Raises `ValueError` outside test mode without a key: the fake model never stands in silently.
-    """
-    from gmshield_worker.models.claude import ClaudeModelClient  # noqa: PLC0415
-    from gmshield_worker.models.fake import FakeModelClient  # noqa: PLC0415
-
-    if settings.test_mode:
-        return FakeModelClient()
-    if settings.anthropic_api_key is None:
-        raise ValueError("The Claude client needs an API key outside test mode")
-    return ClaudeModelClient(api_key=settings.anthropic_api_key)

@@ -15,7 +15,34 @@ A failed outcome with `retry: false` ends the job at once, as the backend does. 
 outcome is checked against the backend's rules for a step report (`ingestion_result_valid`) and
 answered 400 `job.result_invalid` otherwise, so a renamed field fails the worker's tests. Since Story 1.18 that
 includes a next step over every text file (`input: "texts"`), and the passages and outline a report carries; since
-Story 1.19, the page views (`pageViews`), each picture an output of this job.
+Story 1.19, the page views (`pageViews`), each picture an output of this job. Since Story 2.1 a claim's body, when
+it has one, must state a recipe as the backend reads it (else 400), and each one is kept in `stated_recipes`; a done
+`index.change` outcome must report `indexRecipe` (`index_result_valid`). An index change's passages are an input like
+any other (`offer(inputs={"passages": ...})`).
+
+Since Story 2.3 (contract 1.8.0) it serves `POST .../passages` as the backend's scope does: 1 to 100 ids (else 400
+`job.passages_invalid`), each a passage of `passages` (`StandInPassage`) whose source is in one of the job input's
+`tiers`, else 403 `scope.passage_refused` with nothing returned; each answered once, in the order asked, labelled
+with the tier whose sources hold it. `passages_status` forces a refusal with `passages_code` instead.
+
+Since Story 2.10 (contract 1.9.0) a claim may state `providers` (at most 8 words of `[a-z0-9-]{1,32}`, else 400), each
+list kept in `stated_providers`. A job offered with `model=` calls a model: its claim answers that `model`, unless the
+worker did not state its provider, when the job ends `failed` with `job.provider_unavailable` (`ended_code`), no
+attempt used, and the claim is answered 409 `job.not_offered`, as the backend does.
+
+Since Story 2.4 (contract 1.10.0) it serves `POST .../events` as the backend does: a batch number from 1 per claim, a
+repeated number accepted and recorded once, a gap 409 `job.batch_out_of_order`; each accepted batch is kept in
+`batches` under its job (`{claimId, batch, events, usage}`), and each call's usage once in `usage` by call id.
+`events_status` forces an answer (for example 503) `events_failures` times (or always when `None`). A failed outcome of
+a job with an accepted batch holding an event ends it at once (no splice), as the backend does.
+
+Since Story 2.6 (contract 1.11.0) a usage may say `estimated` (a boolean, else 400). `stop_after` plays the GM's stop:
+once a job has that many accepted batches, every later batch of it stores no event, only its usage, and is answered
+`{"stop": true}`, as the backend does after a stop.
+
+Since contract 1.12.0 it serves `PUT /internal/v1/index-recipe` as the backend does: a body `{indexRecipe}` with a
+recipe as the backend reads it is answered 204 and kept in `recipe_statements`; anything else 400 `request.invalid`.
+`recipe_status` forces an answer (for example 503).
 
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
@@ -42,7 +69,9 @@ import pytest
 PR_SET_DUMPABLE = 4
 PIPELINE_VERSION = re.compile(r"[A-Za-z0-9._-]{1,32}")
 CLAIMS = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims")
-CLAIM_ROUTE = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs)")
+CLAIM_ROUTE = re.compile(
+    r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs|passages|events)"
+)
 INPUT_ROUTE = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/inputs/([^/]+)")
 
 
@@ -69,13 +98,25 @@ class StandInJob:
     renewals: int = 0
     inputs: dict[str, bytes] = field(default_factory=dict)
     output_ids: set[str] = field(default_factory=set)
+    model: dict[str, str] | None = None
+    ended_code: str | None = None
+
+
+@dataclass(frozen=True)
+class StandInPassage:
+    """A passage the backend holds: its source (a version id), text, section path and page."""
+
+    source: str
+    text: str
+    section_path: list[str]
+    page: int
 
 
 @dataclass
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.6.0"
+    version: str = "1.11.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -92,6 +133,18 @@ class StandIn:
     outputs: dict[str, bytes] = field(default_factory=dict)
     output_status: int | None = None
     wrong_sha256: bool = False
+    stated_recipes: list[str | None] = field(default_factory=list)
+    stated_providers: list[list[str] | None] = field(default_factory=list)
+    passages: dict[str, StandInPassage] = field(default_factory=dict)
+    passages_status: int | None = None
+    passages_code: str = "scope.passage_refused"
+    batches: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    usage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    events_status: int | None = None
+    events_failures: int | None = None
+    stop_after: int | None = None
+    recipe_statements: list[str] = field(default_factory=list)
+    recipe_status: int | None = None
 
     def offer(
         self,
@@ -99,11 +152,14 @@ class StandIn:
         job_input: dict[str, Any] | None = None,
         trace_id: str | None = None,
         inputs: dict[str, bytes] | None = None,
+        model: dict[str, str] | None = None,
     ) -> str:
-        """Records an offered job, as the backend would before adding its message; returns its id."""
+        """Records an offered job, as the backend would before adding its message; returns its id. `model` makes it a
+        kind that calls one (`{"provider", "model", "tier"}`)."""
         job_id = str(uuid.uuid4())
         self.jobs[job_id] = StandInJob(job_id, kind, job_input or {}, trace_id or secrets.token_hex(16))
         self.jobs[job_id].inputs = dict(inputs or {})
+        self.jobs[job_id].model = model
         return job_id
 
     def times(self) -> tuple[str, str, datetime]:
@@ -128,20 +184,52 @@ def problem(status: int, code: str) -> tuple[int, dict[str, Any]]:
     }
 
 
-def _claim(state: StandIn, job_id: str) -> tuple[int, dict[str, Any]]:
+RECIPE = re.compile(r"[A-Za-z0-9._-]{1,32}")
+PROVIDER = re.compile(r"[a-z0-9-]{1,32}")
+
+
+def _providers_valid(providers: object) -> bool:
+    if providers is None:
+        return True
+    return (
+        isinstance(providers, list)
+        and len(providers) <= 8
+        and all(isinstance(item, str) and PROVIDER.fullmatch(item) for item in providers)
+    )
+
+
+def _claim_refused(job: StandInJob, providers: list[str] | None) -> tuple[int, dict[str, Any]] | None:
+    """409 for a job that is claimed or not offered; a model kind's job without its provider stated ends failed."""
+    if job.state == "running" and job.lapses_at is not None and job.lapses_at > datetime.now(UTC):
+        return problem(409, "job.claimed")
+    if job.state not in ("offered", "running"):
+        return problem(409, "job.not_offered")
+    if job.model is not None and job.model["provider"] not in (providers or []):
+        job.state, job.ended_code = "failed", "job.provider_unavailable"
+        return problem(409, "job.not_offered")
+    return None
+
+
+def _claim(state: StandIn, job_id: str, body: bytes) -> tuple[int, dict[str, Any]]:
+    request = json.loads(body) if body else {}
+    stated, providers = request.get("indexRecipe"), request.get("providers")
+    recipe_valid = stated is None or (isinstance(stated, str) and RECIPE.fullmatch(stated) is not None)
+    if not recipe_valid or not _providers_valid(providers):
+        return problem(400, "request.invalid")
+    state.stated_recipes.append(stated)
+    state.stated_providers.append(providers)
     if state.claim_status is not None:
         return problem(state.claim_status, "server.unavailable")
     job = state.jobs.get(job_id)
     if job is None:
         return problem(404, "request.not_found")
-    if job.state == "running" and job.lapses_at is not None and job.lapses_at > datetime.now(UTC):
-        return problem(409, "job.claimed")
-    if job.state not in ("offered", "running"):
-        return problem(409, "job.not_offered")
+    refused = _claim_refused(job, providers)
+    if refused is not None:
+        return refused
     renew_at, lapses_text, lapses_at = state.times()
     job.state, job.attempt = "running", job.attempt + 1
     job.claim_id, job.grant, job.lapses_at = str(uuid.uuid4()), secrets.token_urlsafe(32), lapses_at
-    return 201, {
+    answer: dict[str, Any] = {
         "claimId": job.claim_id,
         "attempt": job.attempt,
         "renewAt": renew_at,
@@ -151,6 +239,9 @@ def _claim(state: StandIn, job_id: str) -> tuple[int, dict[str, Any]]:
         "input": job.input,
         "traceparent": f"00-{job.trace_id}-{secrets.token_hex(8)}-01",
     }
+    if job.model is not None:
+        answer["model"] = dict(job.model)
+    return 201, answer
 
 
 def _granted(state: StandIn, job_id: str, claim_id: str, grant: str | None) -> StandInJob | None:
@@ -185,7 +276,7 @@ def _input(state: StandIn, route: re.Match[str], headers: dict[str, str]) -> tup
 def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tuple[int, Any]:
     claims = CLAIMS.fullmatch(path)
     if claims:
-        return _claim(state, claims[1])
+        return _claim(state, claims[1], body)
     route = CLAIM_ROUTE.fullmatch(path)
     if route is None:
         return problem(404, "request.not_found")
@@ -196,9 +287,88 @@ def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tu
     job = _granted(state, job_id, claim_id, headers.get("x-job-grant"))
     if job is None:
         return problem(403, "job.grant_refused")
-    if action == "outputs":
-        return _output(state, job, body)
-    return _renewal(state, job) if action == "renewals" else _outcome(state, job, body)
+    answers = {"outputs": _output, "passages": _passages, "outcome": _outcome, "events": _events}
+    return _renewal(state, job) if action == "renewals" else answers[action](state, job, body)
+
+
+def _tier_of(job: StandInJob, source: str) -> str | None:
+    tiers = job.input.get("tiers")
+    for tier in tiers if isinstance(tiers, list) else []:
+        if isinstance(tier, dict) and source in (tier.get("sources") or []):
+            return str(tier.get("tier"))
+    return None
+
+
+def _passages(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
+    ids = json.loads(body).get("ids")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 100 or any(not isinstance(item, str) for item in ids):
+        return problem(400, "job.passages_invalid")
+    if state.passages_status is not None:
+        return problem(state.passages_status, state.passages_code)
+    wanted = list(dict.fromkeys(ids))
+    found = []
+    for passage_id in wanted:
+        passage = state.passages.get(passage_id)
+        tier = _tier_of(job, passage.source) if passage is not None else None
+        if passage is None or tier is None:
+            return problem(403, "scope.passage_refused")
+        found.append(
+            {
+                "id": passage_id,
+                "tier": tier,
+                "text": passage.text,
+                "sectionPath": passage.section_path,
+                "page": passage.page,
+            }
+        )
+    return 200, {"passages": found}
+
+
+EVENT_TYPES = ("delta", "citation")
+
+
+def _events_valid(body: dict[str, Any]) -> bool:
+    events, usage = body.get("events"), body.get("usage") or []
+    if type(body.get("batch")) is not int or body["batch"] < 1 or not isinstance(events, list) or len(events) > 500:
+        return False
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") not in EVENT_TYPES:
+            return False
+        if event["type"] == "delta" and not (isinstance(event.get("text"), str) and event["text"]):
+            return False
+        if event["type"] == "citation" and not (type(event.get("offset")) is int and event["offset"] >= 0):
+            return False
+    keys = ("input", "cacheRead", "cacheWrite", "output", "reasoning")
+    return isinstance(usage, list) and all(
+        isinstance(item, dict)
+        and isinstance(item.get("callId"), str)
+        and all(type(item.get(k)) is int for k in keys)
+        and type(item.get("estimated", False)) is bool
+        for item in usage
+    )
+
+
+def _events(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
+    if state.events_status is not None and (state.events_failures is None or state.events_failures > 0):
+        if state.events_failures is not None:
+            state.events_failures -= 1
+        return problem(state.events_status, "server.unavailable" if state.events_status >= 500 else "job.refused")
+    request = json.loads(body)
+    if not _events_valid(request):
+        return problem(400, "job.events_invalid")
+    stored = state.batches.setdefault(job.job_id, [])
+    if state.stop_after is not None and len(stored) >= state.stop_after:
+        for item in request.get("usage") or []:
+            state.usage.setdefault(item["callId"], item)
+        return 200, {"stop": True}
+    last = max((item["batch"] for item in stored if item["claimId"] == job.claim_id), default=0)
+    if request["batch"] > last + 1:
+        return problem(409, "job.batch_out_of_order")
+    if request["batch"] == last + 1:
+        stored.append({"claimId": job.claim_id, **request})
+        for item in request.get("usage") or []:
+            state.usage.setdefault(item["callId"], item)
+    return 200, {"stop": False}
 
 
 def _renewal(state: StandIn, job: StandInJob) -> tuple[int, Any]:
@@ -430,17 +600,26 @@ def ingestion_result_valid(job: StandInJob, result: object) -> bool:
     )
 
 
+def index_result_valid(result: object) -> bool:
+    """The backend's rule for a done `index.change` (`IndexChanges.completed`): the recipe it was indexed with."""
+    return (
+        isinstance(result, dict)
+        and isinstance(result.get("indexRecipe"), str)
+        and bool(RECIPE.fullmatch(result["indexRecipe"]))
+    )
+
+
 def _outcome(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     outcome = json.loads(body)
-    if (
-        outcome["outcome"] == "done"
-        and job.kind == "ingestion"
-        and not ingestion_result_valid(job, outcome.get("result"))
-    ):
+    done = outcome["outcome"] == "done"
+    if done and job.kind == "ingestion" and not ingestion_result_valid(job, outcome.get("result")):
+        return problem(400, "job.result_invalid")
+    if done and job.kind == "index.change" and not index_result_valid(outcome.get("result")):
         return problem(400, "job.result_invalid")
     job.outcomes.append(outcome)
     if outcome["outcome"] == "failed":
-        last = outcome.get("retry") is False or job.attempt >= state.max_attempts
+        delivered = any(batch["events"] for batch in state.batches.get(job.job_id, []))
+        last = outcome.get("retry") is False or job.attempt >= state.max_attempts or delivered
         job.state = "failed" if last else "offered"
     else:
         job.state = "done"
@@ -448,16 +627,31 @@ def _outcome(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     return 204, None
 
 
+def _recipe(state: StandIn, body: bytes) -> tuple[int, Any]:
+    if state.recipe_status is not None:
+        return problem(state.recipe_status, "server.unavailable")
+    try:
+        statement = json.loads(body)
+    except ValueError:
+        return problem(400, "request.invalid")
+    recipe = statement.get("indexRecipe") if isinstance(statement, dict) else None
+    if not isinstance(recipe, str) or not RECIPE.fullmatch(recipe):
+        return problem(400, "request.invalid")
+    with state.lock:
+        state.recipe_statements.append(recipe)
+    return 204, None
+
+
 def _route(state: StandIn, method: str, path: str, headers: dict[str, str], body: bytes) -> tuple[int, Any]:
     if state.credential is not None and headers.get("authorization") != f"Bearer {state.credential}":
         return problem(401, "service.unauthenticated")
     if method == "GET" and path == "/internal/v1/version":
-        if state.body is not None:
-            return state.status, state.body
-        return state.status, {"version": state.version}
+        return state.status, state.body if state.body is not None else {"version": state.version}
     inputs = INPUT_ROUTE.fullmatch(path)
     if method == "GET" and inputs is not None:
         return _input(state, inputs, headers)
+    if method == "PUT" and path == "/internal/v1/index-recipe":
+        return _recipe(state, body)
     if method != "POST":
         return problem(404, "request.not_found")
     with state.lock:
@@ -493,6 +687,9 @@ def stand_in() -> Iterator[StandIn]:
 
         def do_POST(self) -> None:
             self._answer("POST")
+
+        def do_PUT(self) -> None:
+            self._answer("PUT")
 
         def _send(self, status: int, content_type: str, body: bytes) -> None:
             self.send_response(status)

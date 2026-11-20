@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import signal
 import socket
@@ -19,7 +20,9 @@ import httpx
 import pytest
 
 from gmshield_worker import health, main
-from gmshield_worker.backend.client import VersionAnswer, fetch_contract_version
+from gmshield_worker.backend import contract
+from gmshield_worker.backend.client import RecipeAnswer, VersionAnswer, fetch_contract_version
+from gmshield_worker.retrieval.recipe import INDEX_RECIPE
 from tests.conftest import StandIn, log_lines
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -139,7 +142,7 @@ def test_old_backend(stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFi
     incompatible = [line for line in lines if line["event"] == "backend.incompatible"]
     assert len(incompatible) == 1
     assert incompatible[0]["backendContractVersion"] == "0.9.0"
-    assert incompatible[0]["minimumContractVersion"] == "1.6.0"
+    assert incompatible[0]["minimumContractVersion"] == "1.11.0"
     assert not any(line["event"] == "worker.ready" for line in lines)
 
 
@@ -148,7 +151,7 @@ def test_an_old_backend_that_is_upgraded_becomes_healthy(stand_in: StandIn, tmp_
     health_file = tmp_path / "healthy"
     with running(mode_env(stand_in, tmp_path), health_file):
         wait_for(lambda: len(stand_in.requests) >= 2)
-        stand_in.version = "1.6.0"
+        stand_in.version = "1.11.0"
         wait_for(lambda: health.is_healthy(health_file))
         stand_in.version = "0.9.0"
         wait_for(lambda: not health_file.exists())
@@ -214,9 +217,14 @@ def test_missing_secret(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert lines[-1]["settings"] == [
         "GMSHIELD_REDIS_HOST",
         "GMSHIELD_REDIS_USERNAME",
-        "GMSHIELD_ANTHROPIC_API_KEY",
+        "GMSHIELD_OLLAMA_URL",
+        "GMSHIELD_QDRANT_URL",
         "GMSHIELD_WORKER_CREDENTIAL",
         "GMSHIELD_REDIS_PASSWORD",
+        "GMSHIELD_QDRANT_API_KEY",
+        "GMSHIELD_AZURE_OPENAI_API_KEY",
+        "GMSHIELD_ANTHROPIC_API_KEY",
+        "GMSHIELD_OPENAI_API_KEY",
     ]
     assert "marker-host-123" not in captured.out + captured.err
 
@@ -231,7 +239,35 @@ def test_test_mode_needs_no_secret_and_uses_the_fake_model(
         wait_for(lambda: health.is_healthy(health_file))
     checked = next(line for line in log_lines(capsys.readouterr().out) if line["event"] == "startup.checked")
     assert checked["model"] == "fake"
+    assert checked["providers"] == ["azure-openai", "anthropic", "openai"]
     assert checked["testMode"] is True
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("LANGSMITH_TRACING", "true"),
+        ("LANGCHAIN_TRACING_V2", "1"),
+        ("LANGSMITH_OTEL_ENABLED", "TRUE"),
+        ("LANGSMITH_GATEWAY", "https://gateway.example"),
+        ("OTEL_TRACES_EXPORTER", "otlp"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+        ("ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE", "content"),
+    ],
+)
+def test_any_trace_export_refuses_the_start_even_in_test_mode(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str], variable: str, value: str
+) -> None:
+    environment = {**mode_env(stand_in, tmp_path), variable: value}
+    status = main.run(environment, threading.Event(), health_file=tmp_path / "healthy", lanes_factory=no_lanes)
+    assert status == 78
+    captured = capsys.readouterr()
+    refused = log_lines(captured.err)[-1]
+    assert refused["event"] == "startup.refused"
+    assert refused["reason"] == "tracing.on"
+    assert refused["settings"] == [variable]
+    if "://" in value:
+        assert value not in captured.out + captured.err
 
 
 def test_dirty_work_folder(stand_in: StandIn, tmp_path: Path) -> None:
@@ -331,9 +367,14 @@ def test_the_process_refuses_without_secrets(tmp_path: Path) -> None:
     assert refused["settings"] == [
         "GMSHIELD_BACKEND_URL",
         "GMSHIELD_REDIS_USERNAME",
-        "GMSHIELD_ANTHROPIC_API_KEY",
+        "GMSHIELD_OLLAMA_URL",
+        "GMSHIELD_QDRANT_URL",
         "GMSHIELD_WORKER_CREDENTIAL",
         "GMSHIELD_REDIS_PASSWORD",
+        "GMSHIELD_QDRANT_API_KEY",
+        "GMSHIELD_AZURE_OPENAI_API_KEY",
+        "GMSHIELD_ANTHROPIC_API_KEY",
+        "GMSHIELD_OPENAI_API_KEY",
     ]
 
 
@@ -391,7 +432,7 @@ def test_the_lanes_start_after_the_first_compatible_answer_and_stop_at_the_end(
     with running(mode_env(stand_in, tmp_path), health_file, lanes=lanes):
         wait_for(lambda: len(stand_in.requests) >= 3)
         assert lanes.events == []  # an older backend: nothing is claimed from it
-        stand_in.version = "1.6.0"
+        stand_in.version = "1.11.0"
         wait_for(lambda: health.is_healthy(health_file))
         wait_for(lambda: len(stand_in.requests) >= 6)  # re-checked, never started twice
         assert lanes.events == ["start"]
@@ -420,6 +461,105 @@ def test_a_wrong_credential_is_an_unexpected_answer_and_never_logged(
     assert unexpected
     assert unexpected[0]["status"] == 401
     assert "not-a-secret" not in output
+
+
+# ---- Indexing at worker start: the recipe stated at every check (contract 1.12.0)
+
+
+def recipe_requests(stand_in: StandIn) -> list[dict[str, str]]:
+    return [request for request in stand_in.requests if request["path"] == "/internal/v1/index-recipe"]
+
+
+def test_the_recipe_is_stated_at_every_compatible_check_of_a_backend_at_1_12_0_with_no_job_claimed(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stand_in.version = "1.12.0"
+    stand_in.credential = "gmshield-test-mode-worker-credential-not-a-secret"
+    lanes = FakeLanes()
+    health_file = tmp_path / "healthy"
+    with running(mode_env(stand_in, tmp_path), health_file, lanes=lanes):
+        wait_for(lambda: len(stand_in.recipe_statements) >= 3)
+        assert health.is_healthy(health_file)
+    # Matrix rows "Deploy" and "Same recipe again": the first check states it, and every check after it.
+    assert set(stand_in.recipe_statements) == {INDEX_RECIPE}
+    assert all(json.loads(request["body"]) == {"indexRecipe": INDEX_RECIPE} for request in recipe_requests(stand_in))
+    assert all(request["method"] == "PUT" for request in recipe_requests(stand_in))
+    assert all(
+        request["authorization"] == "Bearer gmshield-test-mode-worker-credential-not-a-secret"
+        and "x-job-grant" not in request
+        for request in recipe_requests(stand_in)
+    )
+    # Each statement follows a compatible version answer; no job was claimed, and the lanes started once.
+    paths = [request["path"] for request in stand_in.requests]
+    assert paths[:2] == ["/internal/v1/version", "/internal/v1/index-recipe"]
+    assert not any("/jobs/" in path for path in paths)
+    assert lanes.events == ["start", "stop"]
+    lines = log_lines(capsys.readouterr().out)
+    stated = [line for line in lines if line["event"] == "index.recipe_stated"]
+    assert len(stated) == 1
+    assert stated[0]["recipe"] == INDEX_RECIPE
+    assert not any(line["event"] == "index.recipe_unstated" for line in lines)
+
+
+@pytest.mark.parametrize("version", ["1.11.0", "1.11.9"])
+def test_an_older_backend_is_never_told_the_recipe_and_works_as_before(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str], version: str
+) -> None:
+    # Matrix row "Old backend": the minimum stays 1.11.0, and the route is never called.
+    stand_in.version = version
+    health_file = tmp_path / "healthy"
+    with running(mode_env(stand_in, tmp_path), health_file):
+        wait_for(lambda: health.is_healthy(health_file))
+        wait_for(lambda: len(stand_in.requests) >= 4)
+    assert recipe_requests(stand_in) == []
+    assert contract.MINIMUM_BACKEND_CONTRACT_VERSION == "1.11.0"
+    events = [line["event"] for line in log_lines(capsys.readouterr().out)]
+    assert "index.recipe_stated" not in events
+    assert "index.recipe_unstated" not in events
+
+
+def test_a_failed_statement_is_logged_changes_neither_health_nor_lanes_and_is_stated_again_at_the_next_check(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stand_in.version = "1.12.0"
+    stand_in.recipe_status = 503
+    lanes = FakeLanes()
+    health_file = tmp_path / "healthy"
+    with running(mode_env(stand_in, tmp_path), health_file, lanes=lanes):
+        wait_for(lambda: len(recipe_requests(stand_in)) >= 2)
+        assert health.is_healthy(health_file)
+        assert lanes.events == ["start"]
+        stand_in.recipe_status = None
+        wait_for(lambda: len(stand_in.recipe_statements) >= 2)
+        assert health.is_healthy(health_file)
+    lines = log_lines(capsys.readouterr().out)
+    unstated = [line for line in lines if line["event"] == "index.recipe_unstated"]
+    assert unstated
+    assert (unstated[0]["level"], unstated[0]["status"], unstated[0]["errorType"]) == ("WARN", 503, "unexpected_answer")
+    assert [line["event"] for line in lines].count("index.recipe_stated") == 1
+    assert not any(line["event"] == "worker.unhealthy" for line in lines)
+
+
+def test_a_statement_that_raises_is_logged_by_error_type_only(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stand_in.version = "1.12.0"
+    calls = 0
+
+    def unreachable(_url: str, _trace_id: str) -> RecipeAnswer:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("[Errno 111] Connection refused to http://secret-host")
+
+    health_file = tmp_path / "healthy"
+    with running(mode_env(stand_in, tmp_path), health_file, state_recipe=unreachable):
+        wait_for(lambda: calls >= 2)
+        assert health.is_healthy(health_file)
+    output = capsys.readouterr().out
+    unstated = [line for line in log_lines(output) if line["event"] == "index.recipe_unstated"]
+    assert unstated[0]["errorType"] == "ConnectError"
+    assert set(unstated[0]) == {"timestamp", "level", "traceId", "unit", "event", "errorType"}
+    assert "secret-host" not in output
 
 
 # ---- Story 1.15: non-dumpable, and the work folder's sweep

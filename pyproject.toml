@@ -9,6 +9,14 @@ dependencies = [
     "docling==2.145.0",
     "torch==2.15.0",
     "torchvision==0.29.2",
+    # Models (Story 2.10): every call goes through LangChain chat models, agents are LangGraph graphs. Only
+    # gmshield_worker/models imports the provider packages. No OpenTelemetry SDK comes with them.
+    "langchain-core==1.7.3",
+    "langchain-openai==1.7.3",
+    "langchain-anthropic==1.7.7",
+    "langgraph==1.2.19",
+    # models/output.py maps the provider SDKs' own errors: the versions langchain-openai and langchain-anthropic lock.
+    "openai==3.41.0",
     "anthropic==2.3.0",
     "httpx==0.28.1",
     "attrs==26.1.0",  # imported by the generated client
@@ -22,6 +30,9 @@ dependencies = [
     # The images stage (Story 1.21) decodes HEIC with it. BSD-3-Clause binding; its wheel bundles libheif and libde265
     # (LGPL-3.0, decode only, no x265). Never pillow-heif, whose wheel bundles x265 (GPL).
     "pi-heif==1.4.0",
+    # The index (Story 2.1): Apache-2.0, released 2026-10-22, the Qdrant server's own version. REST only: its gRPC and
+    # protobuf dependencies come along unused.
+    "qdrant-client==1.20.0",
 ]
 
 [dependency-groups]
@@ -31,6 +42,7 @@ dev = [
     "pytest-cov==7.1.0",
     "ruff==0.17.3",
     "mypy==2.4.1",
+    "httpx2==2.16.0",  # tests/test_models.py builds the provider SDKs' errors; the version the SDKs lock
 ]
 
 [tool.uv]

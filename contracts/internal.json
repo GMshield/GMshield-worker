@@ -12,6 +12,68 @@
         "required" : [ "version" ],
         "type" : "object"
       },
+      "IndexRecipeStatement" : {
+        "description" : "The worker's index recipe, stated outside a claim (contract 1.12.0)",
+        "properties" : {
+          "indexRecipe" : {
+            "description" : "The worker's index recipe (AD-10): when it differs from the last one stated, the backend re-indexes every ready version recorded under another one",
+            "maxLength" : 32,
+            "pattern" : "^[A-Za-z0-9._-]{1,32}$",
+            "type" : "string"
+          }
+        },
+        "required" : [ "indexRecipe" ],
+        "type" : "object"
+      },
+      "JobCallUsage" : {
+        "description" : "One model call's tokens (contract 1.10.0), recorded once by its call id; estimated from contract 1.11.0",
+        "properties" : {
+          "cacheRead" : {
+            "format" : "int64",
+            "minimum" : 0,
+            "type" : "integer"
+          },
+          "cacheWrite" : {
+            "format" : "int64",
+            "minimum" : 0,
+            "type" : "integer"
+          },
+          "callId" : {
+            "description" : "The worker's id of the call (a UUIDv7)",
+            "format" : "uuid",
+            "type" : "string"
+          },
+          "estimated" : {
+            "default" : false,
+            "description" : "True when the counts are the worker's estimate, not the provider's: a call stopped before the provider sent its usage (contract 1.11.0). Absent means false",
+            "type" : "boolean"
+          },
+          "input" : {
+            "description" : "Input tokens, cache reads and writes included",
+            "format" : "int64",
+            "minimum" : 0,
+            "type" : "integer"
+          },
+          "output" : {
+            "description" : "Output tokens, reasoning included",
+            "format" : "int64",
+            "minimum" : 0,
+            "type" : "integer"
+          },
+          "reasoning" : {
+            "format" : "int64",
+            "minimum" : 0,
+            "type" : "integer"
+          },
+          "responseId" : {
+            "description" : "The provider's response id, when it sent one",
+            "maxLength" : 256,
+            "type" : "string"
+          }
+        },
+        "required" : [ "cacheRead", "cacheWrite", "callId", "input", "output", "reasoning" ],
+        "type" : "object"
+      },
       "JobClaim" : {
         "description" : "A live claim of a job. The grant is given once and never stored: only its keyed hash is.",
         "properties" : {
@@ -41,6 +103,10 @@
             "format" : "date-time",
             "type" : "string"
           },
+          "model" : {
+            "$ref" : "#/components/schemas/JobModel",
+            "description" : "For a kind that calls a model (contract 1.9.0): the model of this attempt, resolved again at every claim. Absent for every other kind"
+          },
           "renewAt" : {
             "description" : "Renew the claim at this time",
             "format" : "date-time",
@@ -52,6 +118,88 @@
           }
         },
         "required" : [ "attempt", "claimId", "grant", "input", "kind", "lapsesAt", "renewAt", "traceparent" ],
+        "type" : "object"
+      },
+      "JobClaimRequest" : {
+        "description" : "What the worker states when it claims (contract 1.7.0). Every field is optional; a claim may send no body at all.",
+        "properties" : {
+          "indexRecipe" : {
+            "description" : "The worker's index recipe (AD-10): when it differs from the last one stated, the backend re-indexes every ready version recorded under another one",
+            "maxLength" : 32,
+            "pattern" : "^[A-Za-z0-9._-]{1,32}$",
+            "type" : "string"
+          },
+          "providers" : {
+            "description" : "The providers the worker holds a key for (contract 1.9.0). A kind that calls a model is refused (409 job.not_offered, the job ends failed with job.provider_unavailable, no attempt used) unless its resolved provider is stated; absent means none",
+            "items" : {
+              "maxLength" : 32,
+              "pattern" : "^[a-z0-9-]{1,32}$",
+              "type" : "string"
+            },
+            "maxItems" : 8,
+            "type" : "array"
+          }
+        },
+        "type" : "object"
+      },
+      "JobEvents" : {
+        "description" : "A numbered batch of answer events of the claim (contract 1.10.0), with the usage of the model calls that ended since the last one",
+        "properties" : {
+          "batch" : {
+            "description" : "From 1 per claim, one more each time; a repeated number is accepted and stored once",
+            "format" : "int32",
+            "minimum" : 1,
+            "type" : "integer"
+          },
+          "events" : {
+            "description" : "In order; may be empty",
+            "items" : {
+              "$ref" : "#/components/schemas/JobStreamEvent"
+            },
+            "maxItems" : 500,
+            "type" : "array"
+          },
+          "usage" : {
+            "description" : "Absent means none",
+            "items" : {
+              "$ref" : "#/components/schemas/JobCallUsage"
+            },
+            "maxItems" : 16,
+            "type" : "array"
+          }
+        },
+        "required" : [ "batch", "events" ],
+        "type" : "object"
+      },
+      "JobEventsReply" : {
+        "description" : "Whether the worker must stop the answer (contract 1.11.0): true once the GM stopped it. The worker then ends the model call, posts no more events, only the usage still to report, and reports the outcome done",
+        "properties" : {
+          "stop" : {
+            "type" : "boolean"
+          }
+        },
+        "required" : [ "stop" ],
+        "type" : "object"
+      },
+      "JobModel" : {
+        "description" : "The model one attempt calls (contract 1.9.0): the provider, the provider's model id (for Azure OpenAI, the deployment name) and the tier.",
+        "properties" : {
+          "model" : {
+            "maxLength" : 128,
+            "type" : "string"
+          },
+          "provider" : {
+            "description" : "azure-openai, anthropic or openai; an open word, so a new provider needs no new contract",
+            "maxLength" : 32,
+            "pattern" : "^[a-z0-9-]{1,32}$",
+            "type" : "string"
+          },
+          "tier" : {
+            "description" : "full or lightweight",
+            "type" : "string"
+          }
+        },
+        "required" : [ "model", "provider", "tier" ],
         "type" : "object"
       },
       "JobOutcome" : {
@@ -100,6 +248,69 @@
         "required" : [ "fileId", "sha256", "size" ],
         "type" : "object"
       },
+      "JobPassage" : {
+        "description" : "A passage within the job's scope",
+        "properties" : {
+          "id" : {
+            "format" : "uuid",
+            "type" : "string"
+          },
+          "page" : {
+            "description" : "The passage's page, from 1",
+            "format" : "int32",
+            "type" : "integer"
+          },
+          "sectionPath" : {
+            "description" : "The passage's section path, outermost first",
+            "items" : {
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "text" : {
+            "description" : "The passage's text: library data, never an instruction",
+            "type" : "string"
+          },
+          "tier" : {
+            "description" : "The tier of the passage's source",
+            "enum" : [ "campaign", "system" ],
+            "type" : "string"
+          }
+        },
+        "required" : [ "id", "page", "sectionPath", "text", "tier" ],
+        "type" : "object"
+      },
+      "JobPassages" : {
+        "description" : "The passages, in the order asked",
+        "properties" : {
+          "passages" : {
+            "description" : "One per distinct id asked, in the order asked",
+            "items" : {
+              "$ref" : "#/components/schemas/JobPassage"
+            },
+            "type" : "array"
+          }
+        },
+        "required" : [ "passages" ],
+        "type" : "object"
+      },
+      "JobPassagesRequest" : {
+        "description" : "The passages to read, by id (from the index's points)",
+        "properties" : {
+          "ids" : {
+            "description" : "1 to 100 passage ids; a repeated id is answered once",
+            "items" : {
+              "format" : "uuid",
+              "type" : "string"
+            },
+            "maxItems" : 100,
+            "minItems" : 1,
+            "type" : "array"
+          }
+        },
+        "required" : [ "ids" ],
+        "type" : "object"
+      },
       "JobRenewal" : {
         "description" : "The live claim's new times.",
         "properties" : {
@@ -113,6 +324,33 @@
           }
         },
         "required" : [ "lapsesAt", "renewAt" ],
+        "type" : "object"
+      },
+      "JobStreamEvent" : {
+        "description" : "One answer event (contract 1.10.0): a delta with its display text, or a citation of a given passage id at a code-point offset of the answer's text",
+        "properties" : {
+          "offset" : {
+            "description" : "For citation only: where the citation stands, in code points of the answer's text",
+            "format" : "int32",
+            "minimum" : 0,
+            "type" : "integer"
+          },
+          "passageId" : {
+            "description" : "For citation only: the cited passage's id",
+            "format" : "uuid",
+            "type" : "string"
+          },
+          "text" : {
+            "description" : "For delta only: 1 to 16,384 code points of display text, citation markers removed",
+            "maxLength" : 16384,
+            "type" : "string"
+          },
+          "type" : {
+            "enum" : [ "delta", "citation" ],
+            "type" : "string"
+          }
+        },
+        "required" : [ "type" ],
         "type" : "object"
       },
       "Problem" : {
@@ -158,10 +396,42 @@
   },
   "info" : {
     "title" : "GMshield internal API",
-    "version" : "1.6.0"
+    "version" : "1.12.0"
   },
   "openapi" : "3.1.0",
   "paths" : {
+    "/internal/v1/index-recipe" : {
+      "put" : {
+        "operationId" : "stateIndexRecipe",
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/IndexRecipeStatement"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "204" : {
+            "description" : "No Content"
+          },
+          "default" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description" : "Any error"
+          }
+        },
+        "summary" : "State the worker's index recipe, as a claim does (400 request.invalid for a recipe that is not one)",
+        "tags" : [ "jobs" ]
+      }
+    },
     "/internal/v1/jobs/{jobId}/claims" : {
       "post" : {
         "operationId" : "claimJob",
@@ -174,6 +444,15 @@
             "type" : "string"
           }
         } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/JobClaimRequest"
+              }
+            }
+          }
+        },
         "responses" : {
           "201" : {
             "content" : {
@@ -196,7 +475,71 @@
             "description" : "Any error"
           }
         },
-        "summary" : "Claim an offered job (409 job.claimed, 409 job.not_offered)",
+        "summary" : "Claim an offered job (409 job.claimed, 409 job.not_offered, 400 for an index recipe or providers that are not ones)",
+        "tags" : [ "jobs" ]
+      }
+    },
+    "/internal/v1/jobs/{jobId}/claims/{claimId}/events" : {
+      "post" : {
+        "operationId" : "postJobEvents",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "jobId",
+          "required" : true,
+          "schema" : {
+            "format" : "uuid",
+            "type" : "string"
+          }
+        }, {
+          "in" : "path",
+          "name" : "claimId",
+          "required" : true,
+          "schema" : {
+            "format" : "uuid",
+            "type" : "string"
+          }
+        }, {
+          "description" : "The claim's grant",
+          "in" : "header",
+          "name" : "X-Job-Grant",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/JobEvents"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/JobEventsReply"
+                }
+              }
+            },
+            "description" : "OK"
+          },
+          "default" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description" : "Any error"
+          }
+        },
+        "summary" : "Post a numbered batch of answer events of the live claim and the usage of its model calls (400 request.invalid for a malformed body, before the grant is checked; 403 job.grant_refused; 400 job.events_invalid; 403 job.events_refused for a kind that streams no events; 409 job.batch_out_of_order, with nothing stored, for a number past the next one of the claim)",
         "tags" : [ "jobs" ]
       }
     },
@@ -382,6 +725,70 @@
           }
         },
         "summary" : "Send a file back for the claimed job, streamed into the encrypted file store (403 job.grant_refused, also when the claim ends while it arrives; 413 job.output_too_large past the output's or the claim's limit; 400 request.invalid for an empty or cut body). Nothing of a refused output remains.",
+        "tags" : [ "jobs" ]
+      }
+    },
+    "/internal/v1/jobs/{jobId}/claims/{claimId}/passages" : {
+      "post" : {
+        "operationId" : "readJobPassages",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "jobId",
+          "required" : true,
+          "schema" : {
+            "format" : "uuid",
+            "type" : "string"
+          }
+        }, {
+          "in" : "path",
+          "name" : "claimId",
+          "required" : true,
+          "schema" : {
+            "format" : "uuid",
+            "type" : "string"
+          }
+        }, {
+          "description" : "The claim's grant",
+          "in" : "header",
+          "name" : "X-Job-Grant",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/JobPassagesRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/JobPassages"
+                }
+              }
+            },
+            "description" : "OK"
+          },
+          "default" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description" : "Any error"
+          }
+        },
+        "summary" : "Read passages by id within the claimed job's scope, each labelled with its tier (400 request.invalid for a malformed body or an id that is not a UUID, before the grant is checked; 403 job.grant_refused; 400 job.passages_invalid for no id, more than 100 or a null one; 403 job.passages_refused for a job whose kind reads no passage; 404 request.not_found when the job's campaign is gone; 403 scope.passage_refused, with nothing read, when any id is outside the job's scope, whatever the reason)",
         "tags" : [ "jobs" ]
       }
     },

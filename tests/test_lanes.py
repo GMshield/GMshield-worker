@@ -395,8 +395,15 @@ def test_the_probe_stops_when_cancelled_and_refuses_bad_input() -> None:
             probe.run(claimed(bad), threading.Event())
 
 
-def test_ingestion_runs_in_every_mode_and_the_probe_in_test_mode_only() -> None:
-    assert set(handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))) == {"ingestion", "probe"}
+def test_ingestion_runs_in_every_mode_and_the_probes_in_test_mode_only() -> None:
+    always = {"index.change", "index.removal", "question.answer"}
+    assert set(handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))) == {
+        "ingestion",
+        "probe",
+        "test.question",
+        "test.model",
+        *always,
+    }
     production = check_settings(
         {
             "GMSHIELD_BACKEND_URL": "http://b:8080",
@@ -405,9 +412,12 @@ def test_ingestion_runs_in_every_mode_and_the_probe_in_test_mode_only() -> None:
             "GMSHIELD_REDIS_HOST": "redis",
             "GMSHIELD_REDIS_USERNAME": "worker",
             "GMSHIELD_REDIS_PASSWORD": "p",
+            "GMSHIELD_OLLAMA_URL": "http://172.30.5.1:11434",
+            "GMSHIELD_QDRANT_URL": "https://qdrant:6333",
+            "GMSHIELD_QDRANT_API_KEY": "q",
         }
     )
-    assert set(handlers.handlers_for(production)) == {"ingestion"}
+    assert set(handlers.handlers_for(production)) == {"ingestion", *always}
 
 
 def test_both_lanes_start_interactive_first_and_stop_together() -> None:
@@ -459,4 +469,37 @@ def test_build_lanes_puts_the_interactive_lane_first_with_its_capacity() -> None
     assert second.stream.name == "gmshield:work:ingestion"
     assert first.consumer == second.consumer
     assert first.stop_event is second.stop_event is built.stop_event
-    assert set(first.handlers) == {"ingestion", "probe"}
+    assert set(first.handlers) == {
+        "ingestion",
+        "probe",
+        "test.question",
+        "test.model",
+        "index.change",
+        "index.removal",
+        "question.answer",
+    }
+    # Story 2.10: every claim states the providers; test mode states all three.
+    assert first.api is second.api
+    assert isinstance(first.api, JobsApi)
+    assert first.api.providers == ("azure-openai", "anthropic", "openai")
+
+
+def test_build_lanes_states_only_the_providers_this_worker_holds_a_key_for() -> None:
+    settings = check_settings(
+        {
+            "GMSHIELD_BACKEND_URL": "http://b:8080",
+            "GMSHIELD_ANTHROPIC_API_KEY": "anthropic-key",
+            "GMSHIELD_WORKER_CREDENTIAL": CREDENTIAL,
+            "GMSHIELD_REDIS_HOST": "redis",
+            "GMSHIELD_REDIS_USERNAME": "worker",
+            "GMSHIELD_REDIS_PASSWORD": "p",
+            "GMSHIELD_REDIS_TLS": "false",
+            "GMSHIELD_OLLAMA_URL": "http://172.30.5.1:11434",
+            "GMSHIELD_QDRANT_URL": "https://qdrant:6333",
+            "GMSHIELD_QDRANT_API_KEY": "q",
+        }
+    )
+    first, second = build_lanes(settings, new_trace_id()).lanes
+    assert isinstance(first.api, JobsApi)
+    assert first.api is second.api
+    assert first.api.providers == ("anthropic",)

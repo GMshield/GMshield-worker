@@ -52,7 +52,7 @@ def consumer_name() -> str:
 def build_lanes(settings: Settings, trace_id: str) -> Lanes:
     """Both lanes on one Redis client and the backend's job routes. Connects nothing until started."""
     redis = connect(settings.redis)
-    api = JobsApi(settings.backend_url, settings.worker_credential)
+    api = JobsApi(settings.backend_url, settings.worker_credential, providers=settings.models.providers)
     handlers = handlers_for(settings)
     consumer = consumer_name()
     stop = threading.Event()

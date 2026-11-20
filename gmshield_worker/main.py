@@ -4,7 +4,9 @@ Start-up order:
   0. Make the process non-dumpable (`PR_SET_DUMPABLE 0`, Story 1.15): no child it starts can read
      its memory or `/proc/<pid>/environ`, which holds the worker's credential. Refused, the start
      stops with exit status 78.
-  1. Check the settings. Outside test mode a missing secret or setting stops the start with exit
+  1. Refuse any trace export (Story 2.10: LangSmith tracing, its OpenTelemetry export or gateway,
+     any OpenTelemetry exporter, Anthropic content capture), in every mode, then check the settings.
+     Either refusal, like a missing secret or setting outside test mode, stops the start with exit
      status 78 and one `startup.refused` line that names the settings, never a value.
   2. Empty the work folder (its contents, never the folder; links are not followed). A folder
      that is a link or a file, or that cannot be read or created, stops the start with exit
@@ -13,6 +15,12 @@ Start-up order:
      with exponential backoff (1 s up to 30 s, with jitter, 2 s per attempt) until it answers.
   4. After the first compatible answer, start both work lanes (Story 1.12): the interactive lane,
      then the ingestion lane (`gmshield_worker.lanes`).
+  5. After every compatible answer from a backend at internal contract 1.12.0 or later, state the
+     worker's index recipe (`PUT /internal/v1/index-recipe`): the backend re-indexes what was indexed
+     under another recipe at once, so a deploy starts indexing before any job is claimed, and a
+     backend redeployed while the worker runs hears it again within one check. A failed statement
+     is logged (`index.recipe_unstated`, by error type or status) and changes neither the health
+     nor the lanes; the first success is logged once (`index.recipe_stated`).
 
 From step 2 on, a sweep thread removes, every 2 minutes, what no running step holds in the work
 folder and was last changed more than 10 minutes ago (`workdir.WorkDirSweep`).
@@ -40,13 +48,18 @@ from types import FrameType
 from typing import Any, Protocol
 
 from gmshield_worker import health
-from gmshield_worker.backend.client import VersionAnswer, fetch_contract_version
-from gmshield_worker.backend.contract import MINIMUM_BACKEND_CONTRACT_VERSION, meets_minimum, parse_version
+from gmshield_worker.backend.client import RecipeAnswer, VersionAnswer, fetch_contract_version, state_index_recipe
+from gmshield_worker.backend.contract import (
+    INDEX_RECIPE_CONTRACT_VERSION,
+    MINIMUM_BACKEND_CONTRACT_VERSION,
+    meets_minimum,
+    parse_version,
+)
 from gmshield_worker.ingestion.sandbox import SandboxUnavailable, make_non_dumpable
 from gmshield_worker.lanes import build_lanes
 from gmshield_worker.log import log_event, new_trace_id
-from gmshield_worker.models import select_model_client
-from gmshield_worker.settings import WORK_DIR, Settings, SettingsRefused, check_settings
+from gmshield_worker.retrieval.recipe import INDEX_RECIPE
+from gmshield_worker.settings import WORK_DIR, Settings, SettingsRefused, check_settings, check_tracing
 from gmshield_worker.workdir import WorkDirSweep, WorkDirUnusable, empty_work_dir
 
 UNIT = "worker.supervisor"
@@ -58,6 +71,7 @@ BACKOFF_MAX_SECONDS = 30.0
 RECHECK_SECONDS = 30.0
 
 type Fetch = Callable[[str, str], VersionAnswer]
+type StateRecipe = Callable[[str, str], RecipeAnswer]
 
 
 class Startable(Protocol):
@@ -135,7 +149,10 @@ class Supervisor:
     recheck_seconds: float = RECHECK_SECONDS
     # Called once, after the first compatible answer: starts the lanes.
     on_ready: Callable[[], None] | None = None
+    # Called after every compatible answer of a backend at INDEX_RECIPE_CONTRACT_VERSION or later: states the recipe.
+    state_recipe: StateRecipe | None = None
     ready: bool = field(default=False, init=False)
+    _recipe_stated: bool = field(default=False, init=False)
     _started: bool = field(default=False, init=False)
     _failures: int = field(default=0, init=False)
     _incompatible: str | None = field(default=None, init=False)
@@ -178,6 +195,8 @@ class Supervisor:
             if not self._started and self.on_ready is not None:
                 self._started = True
                 self.on_ready()
+            if self.state_recipe is not None and meets_minimum(answer.version, INDEX_RECIPE_CONTRACT_VERSION):
+                self._state_recipe(self.state_recipe)
             return self.recheck_seconds
 
         self._unhealthy()
@@ -195,6 +214,28 @@ class Supervisor:
         self._incompatible = reported
         return self.recheck_seconds
 
+    def _state_recipe(self, state: StateRecipe) -> None:
+        """States the index recipe; a failure is logged and tried again at the next check, never the check's."""
+        try:
+            answer = state(self.backend_url, self.trace_id)
+        except Exception as error:  # logged by type only, then stated again at the next check
+            log_event("WARN", UNIT, "index.recipe_unstated", self.trace_id, errorType=type(error).__name__)
+            return
+        if not answer.stated:
+            log_event(
+                "WARN",
+                UNIT,
+                "index.recipe_unstated",
+                self.trace_id,
+                errorType="unexpected_answer",
+                status=answer.status,
+                code=answer.code,
+            )
+            return
+        if not self._recipe_stated:
+            self._recipe_stated = True
+            log_event("INFO", UNIT, "index.recipe_stated", self.trace_id, recipe=INDEX_RECIPE)
+
     def run(self) -> None:
         while not self.stop.is_set():
             delay = self.check_once()
@@ -208,6 +249,7 @@ def run(
     *,
     health_file: Path = health.HEALTH_FILE,
     fetch: Fetch | None = None,
+    state_recipe: StateRecipe | None = None,
     rng: Callable[[], float] = random.random,
     backoff_initial: float = BACKOFF_INITIAL_SECONDS,
     recheck_seconds: float = RECHECK_SECONDS,
@@ -224,19 +266,20 @@ def run(
         return REFUSED_EXIT_STATUS
     health.mark_unhealthy(health_file)
     try:
+        check_tracing(environment)
         settings = check_settings(environment)
     except SettingsRefused as refused:
         log_event("ERROR", UNIT, "startup.refused", trace_id, reason=refused.reason, settings=refused.settings)
         return REFUSED_EXIT_STATUS
 
-    model = select_model_client(settings)
     log_event(
         "INFO",
         UNIT,
         "startup.checked",
         trace_id,
         testMode=settings.test_mode,
-        model=model.kind,
+        model="fake" if settings.test_mode else "provider",
+        providers=list(settings.models.providers),
         minimumContractVersion=MINIMUM_BACKEND_CONTRACT_VERSION,
         interactiveCapacity=settings.interactive_capacity,
         redisTls=settings.redis.tls,
@@ -257,6 +300,7 @@ def run(
             stop=stop,
             health_file=health_file,
             fetch=fetch or partial(fetch_contract_version, credential=settings.worker_credential),
+            state_recipe=state_recipe or partial(state_index_recipe, credential=settings.worker_credential),
             rng=rng,
             backoff_initial=backoff_initial,
             recheck_seconds=recheck_seconds,

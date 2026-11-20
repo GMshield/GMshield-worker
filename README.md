@@ -17,13 +17,17 @@ every transitive one, and `[tool.uv] exclude-newer` keeps them all on or before 
 | uv | 0.13.6 (`ghcr.io/astral-sh/uv:0.13.6`, pinned by digest) | `Dockerfile` |
 | Docling | 2.145.0 | `pyproject.toml` |
 | torch, torchvision (CPU builds, from the PyTorch CPU index) | 2.15.0, 0.29.2 | `pyproject.toml` |
-| anthropic | 2.3.0 | `pyproject.toml` |
+| langchain-core, langchain-openai, langchain-anthropic (the chat models, Story 2.10; MIT) | 1.7.3, 1.7.3, 1.7.7 | `pyproject.toml` |
+| langgraph (the agents' graphs, Story 2.10; MIT) | 1.2.19 | `pyproject.toml` |
+| openai, anthropic (the provider SDKs, whose errors `models/output.py` maps; the versions the LangChain packages above lock; both bring `httpx2`, and `opentelemetry-api` without an SDK comes with anthropic) | 3.41.0, 2.3.0 | `pyproject.toml` |
+| httpx2 (the provider SDKs' HTTP client; the tests build its requests and responses) | 2.16.0 | `pyproject.toml` (development) |
 | httpx | 0.28.1 | `pyproject.toml` |
 | redis (redis-py, released 2026-07-30) | 8.1.0 | `pyproject.toml` |
 | attrs (used by the generated client) | 26.1.0 | `pyproject.toml` |
 | pikepdf (the clean stage, Story 1.15; MPL-2.0, released 2026-10-11, qpdf 12.4.2 inside) | 10.17.0 | `pyproject.toml` |
 | pypdfium2 (the triage stage, Story 1.16; already installed by Docling, released 2026-10-04) | 5.14.0 | `pyproject.toml` |
 | pi-heif (the images stage's HEIC decoder, Story 1.21; released 2026-06-10). The binding is BSD-3-Clause; its wheel bundles libheif and libde265 (LGPL-3.0, decode only, no x265 encoder). Never pillow-heif, whose wheel bundles x265 (GPL) | 1.4.0 | `pyproject.toml` |
+| qdrant-client (the index, Story 2.1; Apache-2.0, released 2026-10-22; REST only, its gRPC and protobuf dependencies come along unused) | 1.20.0 | `pyproject.toml` |
 | openapi-python-client (client generator) | 0.29.1 | `pyproject.toml` (development) |
 | pytest, pytest-cov | 9.2.0, 7.1.0 | `pyproject.toml` (development) |
 | ruff | 0.17.3 | `pyproject.toml` (development) |
@@ -67,20 +71,25 @@ lockfile and the production image:
 | `gmshield_worker/health.py` | the health file and `python -m gmshield_worker.health` (the image's `HEALTHCHECK`) |
 | `gmshield_worker/workdir.py` | emptying the work folder, each step's own folder and the sweep thread |
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
-| `gmshield_worker/models/` | the model-client interface, the fake model and the Claude client |
-| `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind) and `probe.py` (test mode only) |
-| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.21): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `images.py` (Pillow, pi-heif and pikepdf; Story 1.21), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
-| `retrieval/`, `agents/` | empty until their stories (each `__init__.py` names it) |
+| `gmshield_worker/models/` | the one way to a model (Story 2.10): `providers.py` (the providers, the claim's `ModelChoice`, base URLs and keys), `chat.py` (`chat_model`: `ChatOpenAI`, `ChatAnthropic` or the fake), `output.py` (the uniform events, the citation markers, the typed failures), `fake.py` (the fake chat model); the only place a provider SDK is imported |
+| `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind), `answer.py` (Story 2.4's `question.answer`) and `batches.py` (its event batches), `probe.py`, `question.py` and `model_probe.py` (test mode only; Story 2.3's `test.question`, Story 2.10's `test.model`) |
+| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.21): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `images.py` (Pillow, pi-heif and pikepdf; Story 1.21), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter; a PDF's bookmarks come from `clean.py bookmarks`), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
+| `gmshield_worker/retrieval/` | the index (Story 2.1): `recipe.py` (`INDEX_RECIPE`), `embedding.py` (embeddinggemma through Ollama), `keywords.py` (the keyed keyword vector), `store.py` (the Qdrant collection `passages`), `indexing.py` (the `index.change` and `index.removal` handlers); the search (Story 2.3): `search.py` (`find_passages`) |
+| `gmshield_worker/agents/` | the agents (Story 2.10): `graphs.py` (`compile_graph`, the only place a LangGraph graph is compiled; `AnswerWithTools`, the model-and-tools node), `tools.py` (`read_passages`, read-only under the job's grant) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
 | `tools/generate_client.py` | generates the client from `contracts/internal.json` |
-| `tests/` | unit tests; `tests/image/` runs only inside the production image, `tests/integration/` only beside a Redis (the `integration` stage) |
+| `tools/record_embeddings.py` | records (or `--check`s) the real embeddinggemma vectors of the retrieval fixtures (Story 2.3) |
+| `tools/record_model_responses.py` | records (or `--check`s) the real Azure OpenAI streams of the model fixtures, on roberto-server (Story 2.10) |
+| `tests/` | unit tests; `tests/image/` runs only inside the production image, `tests/integration/` only beside a Redis (the `integration` stage); `tests/fixtures/retrieval/` the retrieval fixtures and their recorded vectors (SRD 5.2.1 passages, CC-BY-4.0, attribution in `ATTRIBUTION.txt`); `tests/fixtures/models/` each provider's HTTP streams, replayed by `tests/model_fixtures.py` |
 
 ## Start-up and behaviour
 
 0. **Non-dumpable** (Story 1.15). `PR_SET_DUMPABLE 0`, before anything else; refused, the start
    stops with exit status 78 (`startup.refused`, reason `process.dumpable`).
-1. **Settings.** Outside test mode a missing or invalid setting stops the start with exit status
-   78 and one `startup.refused` line that names the settings, never a value.
+1. **Tracing, then settings.** Any trace export stops the start, in every mode, with exit status 78
+   (`startup.refused`, reason `tracing.on`, naming the variables; Story 2.10, below). Then, outside
+   test mode, a missing or invalid setting stops the start with exit status 78 and one
+   `startup.refused` line that names the settings, never a value.
 2. **Work folder.** Everything inside `GMSHIELD_WORK_DIR` is removed; the folder itself stays, and
    a symbolic link is removed as a link, never followed. A removal that fails is logged by error
    type and the start continues. A folder that is a link or a file, or that cannot be created or
@@ -90,6 +99,20 @@ lockfile and the production image:
    is logged by attempt and error type only.
 4. **Lanes.** After the first compatible answer the supervisor starts the interactive lane, then
    the ingestion lane; SIGTERM stops both.
+5. **Index recipe.** After every compatible answer of a backend at internal contract 1.12.0 or later
+   (at the start, then every 30 s), the worker states its `INDEX_RECIPE` with
+   `PUT /internal/v1/index-recipe` (`backend.client.state_index_recipe`, the worker's credential, no
+   grant). The backend reacts as to a recipe stated at a claim: what was indexed under another
+   recipe, or not at all, gets new index changes at once, so a deploy starts indexing within one
+   check, before any question or job. The backend keeps the last recipe in memory only, so stating it
+   at every check also covers a backend redeployed while the worker runs; the same recipe again
+   changes nothing. A failed statement is logged (`index.recipe_unstated`, by error type, or
+   `unexpected_answer` with the status) and changes neither the health nor the lanes; the next check
+   states it again. The first success is logged once (`index.recipe_stated`). Against a backend
+   before 1.12.0 the route is never called and the worker works as before
+   (`MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.11.0; the gate is `INDEX_RECIPE_CONTRACT_VERSION`). Deploy order:
+   the backend (internal contract 1.12.0, public 1.16.0), then the frontend, then this worker; the worker and the
+   frontend do not depend on each other here. A rollback goes the other way.
 
 - **Contract version.** `MINIMUM_BACKEND_CONTRACT_VERSION` in `gmshield_worker/backend/contract.py`
   is the oldest backend contract the worker accepts. After a compatible answer the worker logs
@@ -102,12 +125,9 @@ lockfile and the production image:
   credential (`Authorization: Bearer`), a W3C `traceparent` with the start-up trace id (a job's own
   for its renewals and outcome) and a new span id, a 2 s timeout, no redirects, and no proxy taken
   from the environment.
-- **Model.** `models/` has one interface, `ModelClient`, with the fake model (deterministic, no
-  network) and the Claude client (Anthropic SDK, default model `claude-sonnet-5-5`, the full tier;
-  `claude-haiku-5-5` is the lightweight tier, and the backend will choose per job under AD-18; the
-  SDK client is created on first use, so building it calls nothing). Test mode always uses the fake
-  model; outside it a missing key is an error, never a silent fake.
-  Nothing calls a model, Qdrant or Ollama in this story.
+- **Model.** Every model call goes through `models/` (Story 2.10, below). The start calls no model,
+  Qdrant or Ollama; `startup.checked` logs `model` (`fake` in test mode, else `provider`) and the
+  `providers` the worker states at each claim.
 - **Logs.** One JSON object per line, ERROR lines on standard error and the rest on standard
   output: `timestamp`, `level`, `traceId`, `unit`, `event`, then ids,
   numbers, versions, status codes, setting names or error types. Never content, never a secret,
@@ -130,8 +150,10 @@ lockfile and the production image:
     a kind without a handler `worker.unknown_kind`.
   - Every line about a job, and every renewal and outcome, carries the job's trace id (the claim's
     `traceparent`): the backend logs the same id for the same job.
-  - Handlers: `ingestion` in every mode (Story 1.15, below) and the test-mode `probe` (it works
-    `workMs`, fails its first `failTimes` attempts with `probe.failed`).
+  - Handlers: `ingestion` in every mode (Story 1.15, below), `index.change` and `index.removal` (Story 2.1) and
+    `question.answer` (Story 2.4, below) in every mode, the test-mode `probe` (it works
+    `workMs`, fails its first `failTimes` attempts with `probe.failed`), the test-mode `test.question` (Story 2.3,
+    below) and the test-mode `test.model` (Story 2.10, below).
   - Redis down, restarted or not yet holding the group (`NOGROUP`): the lane logs
     `stream.unavailable` by error type and retries with backoff (1 s doubling up to 30 s). The worker
     never runs `XADD`, `XTRIM` or `XGROUP`; its Redis account allows only `AUTH`, `HELLO`, `PING`,
@@ -165,7 +187,7 @@ lockfile and the production image:
   - Logs carry the job's trace id, the sizes, counts and times, and the child's and the worker's
     peak RSS (`childMaxRssKib`, `workerMaxRssKib`). A generated 1 GiB PDF is cleaned with a child
     peak under 512 MiB (`tests/test_clean.py`).
-- **Reading pages (Stories 1.16 and 1.17; `PIPELINE_VERSION` "3", now "6").** The clean report asks one `triage` step per
+- **Reading pages (Stories 1.16 and 1.17; `PIPELINE_VERSION` "3", now "7").** The clean report asks one `triage` step per
   batch. Triage (`triage.py`, pypdfium2) gives each page a layer: `text` when its text layer has at
   least 16 characters other than whitespace, unless it has fewer than 200 and one image covers at least
   half of the page, else `image`; its report gives the `layers`, one `layout` step per run of text pages,
@@ -181,8 +203,9 @@ lockfile and the production image:
   - OCR (`ocr.py`, Story 1.17) renders each image page at 216 DPI (smaller when its longer side would
     pass 10,000 pixels), turns it upright with Tesseract's orientation detection (`--psm 0 -l osd`),
     checked by reading (Story 1.22: the detection was half a turn wrong on every page of an 1892 scan): Tesseract
-    reads a band across the middle of the page as detected and half a turn further, and the turn with more words
-    read at 60 or more confidence wins (a tie keeps the detection; about 1 s more per page on roberto-server),
+    reads a band across the middle of the page as detected and half a turn further, and half a turn further wins
+    only when it reads at least 10 more words at 60 or more confidence (about 1 s more per page on roberto-server;
+    Docling's own detection is switched off, since the page reaches it upright),
     straightens a skew within ±20° with OpenCV (from 0.5°, white fill), and reads it with Docling and
     Tesseract (`por`+`eng`, full page, tables and heading levels) into layout's page shape, its lines
     being Tesseract's words. Each page is `read_by_ocr`, or `unreadable` when OCR finds fewer than 16
@@ -196,9 +219,9 @@ lockfile and the production image:
   report end their `next` with `{"stage": "passages", "firstPage": 1, "lastPage": <pageTotal>, "input": "texts"}`:
   a step over every text file of the version, which the backend holds with no job until every page has an outcome.
   Its claim input names those files in page order (`texts: [{name: "text-<fileId>", firstPage, lastPage}]`). The
-  stage runs in-process, with no child (it reads only our own JSON): it downloads one text file at a time
-  (`GET …/inputs/text-<fileId>`) and feeds its page records to `passages.py`, which carries the heading stack across
-  files.
+  stage cuts in-process (it reads only our own JSON): it downloads one text file at a time
+  (`GET …/inputs/text-<fileId>`) and feeds its page records to `passages.py`, which carries the section across files
+  (from pipeline "7", a PDF's bookmarks come first; see below).
   - PDF records: blocks in reading order; a heading block (`headingLevel` set) closes the open sections at its level
     or deeper and opens its own; the section path is the open headings, outermost first, and every heading with text
     is an outline entry `{level, title, page}`. Text records: `headingPath` is the section path, and each heading a
@@ -213,6 +236,24 @@ lockfile and the production image:
   - The report gives `passages: [{page, sectionPath, text, boxes | range}]` in reading order (`boxes`: the blocks'
     boxes on the page; `range`: `[start, end)` in code points of the page's text) and `outline`. The backend mints
     the passage ids and stores both encrypted; a version with no text file (every page unreadable) reports none.
+  - **Since `PIPELINE_VERSION` "7" (the retrieval-quality fix).** It reaches new uploads only: an accepted version
+    keeps the passages and paths pipeline "6" gave it (AD-15) until its material is uploaded again. Docling ranks
+    heading styles per batch and per page retry, so its levels no longer nest headings. When the claim input of a PDF's passages step names the version's
+    cleaned original (`original: "original"`; backends that serve it to a `texts` step), the step downloads it and
+    runs `clean.py bookmarks` in the sandbox, which writes the outline as `[{title, depth, page}]` (depth from 0, page
+    from 1; named destinations resolved; an entry whose page does not resolve, or with no title, dropped and its
+    children lifted; the document-title root dropped when it is the only entry at depth 0). The original is deleted
+    before the text files come; a child that fails leaves no bookmarks (`ingestion.bookmarks_unread`), and the paths
+    then come from the headings alone. A PDF passage's section path is the path of the last bookmark entered, plus
+    the last Docling heading after it: every heading replaces the one before it, and a heading whose title is already
+    in the path (the current heading, or any bookmark's title; compared after NFKC, casefold, and punctuation and
+    whitespace as one space) is read as an ordinary block. A bookmark is entered on its page just before the first
+    block that carries its title (a heading first), else with the next bookmark of its page that matches, else at
+    the page's start (none of the page's matches) or end. The outline lists every bookmark (level: its depth from 1)
+    and every heading kept (one level under its bookmark path). A new passage starts at every bookmark and heading;
+    blocks join a passage only while it stays within `PASSAGE_TARGET` (1,200 code points), except the passage that
+    opens its section, which joins up to the 3,000 limit (a stat block stays whole); a single larger block is a
+    passage of its own. Text pages join their paragraphs by the same rule. Tables keep their rules.
 - **Page views (Story 1.19, `PIPELINE_VERSION` "5", backend contract 1.5.0 or later).** Every page a reading child
   reads gets a page view in its step's report, `pageViews: [{page, picture: {fileId, width, height}, lines: [{text,
   box}]}]`, or for a text page `{page, text}`. A page whose child fails, crashes or times out gets none.
@@ -248,6 +289,236 @@ lockfile and the production image:
     `input: "source"`, the assembled PDF, which is cleaned and split again as `clean` does.
   - The in-image check decodes `tests/image/two-colours.heic` (provenance in `tests/image/test_image.py`) in the
     sandbox and reads two photographed pages, one of them lying on its side with its EXIF orientation, by OCR.
+- **Index an accepted material (Story 2.1, AD-10, backend contract 1.7.0 or later).** Every claim states the
+  worker's `INDEX_RECIPE` (`retrieval/recipe.py`; bump it on any change to the model, the embedding input, the
+  splitting or the keyword scheme): the backend re-indexes each source recorded under another one. From backend
+  contract 1.12.0 the supervisor also states it at every check (start-up step 5), so indexing starts right after a
+  deploy, not at the first job claimed. A run that fails stays not indexed: the backend keeps its passages in the
+  keyword fallback's `pending` and retries the failed run alone every 10 minutes, at most 3 times. The worker is the
+  only reader and writer of Qdrant.
+  - `index.change`: the claim input is `{source, owner, kind, language, tokenKey, passages}`; the run (at most 200
+    passages) is read whole from the input `passages`, JSON Lines `{id, ordinal, page, title, text}`. Four at a
+    time (`BATCH`), each passage is embedded by `embeddinggemma:300m` through `POST {GMSHIELD_OLLAMA_URL}/api/embed`
+    (plain httpx; input `title: {title or "none"} | text: {text}`, `truncate: false`). Questions go first: within the
+    worker, no index call (a batch, or one passage or one part of a split passage) starts while a question's embedding
+    waits or runs (`QUESTIONS_FIRST`, one gate shared by every `Embedder`), waiting at most 10 s
+    (`INDEX_WAIT_SECONDS`) before it goes anyway. Ollama embeds one request at a time (about 0.6 s a passage), so a
+    question waits behind at most one batch of 4. The gate holds within one worker process: that bound assumes one
+    worker process per Ollama, as deployed. Neither the batch size nor the gate is part of the index recipe. When Ollama
+    refuses an input as longer than the context, the passage is split in two by `ingestion.passages.split`, each half
+    embedded with the same title and split again if refused, at most 4 times deep, and its vector is the L2-normalized
+    mean of its parts: nothing is cut silently. The keyword vector folds the text (NFKC, casefold, diacritics stripped),
+    takes its Unicode word tokens and numbers each by the first 4 bytes, big-endian, of HMAC-SHA256 under the owner's
+    `tokenKey`, valued by BM25's term weight `tf·(k1+1) / (tf + k1·(1 - b + b·L/AVG))` (k1 = 1.2, b = 0.75, L the
+    passage's token count, AVG = 250, a fixed, corpus-independent average) under index recipe "2"; under "1" each
+    token was valued by its count. Qdrant applies the `idf` modifier. While a deploy's recipe "2" re-indexes, the
+    points still under "1" carry raw counts, so a search may mix the two weightings until every source is re-indexed. Each passage is upserted as one point (id: the
+    passage id; vectors `dense` and `sparse`; payload exactly `{owner, source, kind, page, language}`). The result is
+    `{indexRecipe, points}`.
+  - The collection `passages` is created when missing: `dense` (768, cosine), `sparse` (`idf`), a tenant keyword index
+    on `owner` and a keyword index on `source`. Qdrant is reached over REST at `GMSHIELD_QDRANT_URL` with its API key,
+    an https URL verified against `/run/gmshield/certs/ca.crt`, one client per job.
+  - `index.removal`: the claim input is `{source, owner}`; the points go by a filter on both, never by ids. Safe to
+    repeat.
+  - Failures: `index.input_invalid` and `index.passage_too_long` with `retry: false`; `index.embedding_unavailable`
+    (Ollama), `index.store_unavailable` (Qdrant) and `index.input_unavailable` (the backend's input route) for the
+    backend to retry; a re-run upserts the same ids. Lines carry ids, counts and codes only; the token key is held with
+    `repr=False` and no text, title or token reaches Qdrant, Redis or a log.
+  - Deploy the backend first: an older backend fails the claim body's contract check (`backend.incompatible`).
+- **Passages by id (backend contract 1.8.0, Story 2.2).** `contracts/internal.json` carries
+  `POST /internal/v1/jobs/{jobId}/claims/{claimId}/passages` (`readJobPassages`): with the claim's `X-Job-Grant` and
+  `{ids}` (1 to 100 passage ids), the backend answers `{passages: [{id, tier, text, sectionPath, page}]}` in the order
+  asked, each id once, `tier` being `campaign` or `system`. It checks every id against the job's resolved scope before
+  decrypting anything. The refusals: 400 `request.invalid` for a malformed body or an id that is not a UUID (before
+  the grant); 403 `job.grant_refused` for a wrong, ended or lapsed grant; 400 `job.passages_invalid` for no id, more
+  than 100 or a null one; 403 `job.passages_refused` for a kind that reads no passage; 404 `request.not_found` when the
+  job's campaign is gone; 403 `scope.passage_refused`, naming no id, when any id is out of the scope. The worker calls
+  it through `JobsApi.passages` since Story 2.3, so `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.8.0.
+- **Find the passages that answer a question (Story 2.3, AD-10, backend contract 1.8.0).**
+  `retrieval/search.py` `find_passages` runs for an interactive job whose claim input is the backend's question input
+  (`Scopes.questionInput`): `{question, owner, tiers: [{tier, sources, pending}], tokenKey}`, `question` 1 to 4,000
+  characters (code points), the tiers in order (campaign, then system), `sources` the allowed version ids, `pending`
+  the ids of the tier's passages that are not indexed (their index change has not ended or failed; the backend lists
+  at most the first 5,000, 100 before backend contract 1.12.0),
+  `tokenKey` Base64 of the owner's 32-byte token key. Provider, model and tier come with the claim's `model` (Story
+  2.10), never with the input; nothing here calls a model.
+  - When no tier has a source the answer is an empty list, with no embedding, no Qdrant query and no passages call.
+  - The question is embedded as at indexing (`embeddinggemma:300m`, `truncate: false`, normalized) under the query
+    prompt `task: search result | query: {question}`; its keyword vector is `query_vector(question, tokenKey)`, the
+    same token numbers each valued 1. The query side is not part of the index recipe.
+  - Per tier with sources, one `query_points` call: a dense and a sparse prefetch (40 each) fused by Qdrant's RRF
+    (`FusionQuery(Fusion.RRF)`), 8 points, the filter `owner == the job's owner AND source IN the tier's sources` on
+    the query and on each prefetch. A question with no keyword token has no sparse prefetch. No payload or vector is
+    read back.
+  - Pending: once every tier is searched, the first 5,000 (`MAX_PENDING`) `pending` ids of each tier, in input order,
+    are read by id in pages of 100 (`PAGE`, the backend's most per passages call), at most 8 at a time (`PARALLEL`),
+    the tiers' pages in turns (campaign, system, campaign, ..., then the rest of the longer one), under one deadline
+    1.5 s (`PENDING_BUDGET_SECONDS`) after the question's first pending read, both tiers together (`read_pending`), so
+    the first words stay within NFR-14's 5 s: no page starts after it, and a page not back by it is dropped, never
+    waited for. A page that fails before the deadline fails the search as one read did. Each page is tokenized as it
+    comes back, in its read's thread and so inside the deadline: each passage keeps only the question's distinct folded
+    tokens of two characters or more (`question_terms`, from `keywords.tokens`, never an HMAC) that it contains. After
+    the deadline only the counting runs: each token weighs BM25's ln(1 + (N - df + 0.5) / (df + 0.5)), N the pending
+    passages read for the question (both tiers) and df how many contain it (`rarity`); passages are ordered by the
+    weight of the rarest question token they contain, then by the sum of their tokens' weights, so the passage naming
+    what the question is about ("tarrasque") comes before those sharing several commoner words ("challenge",
+    "rating"); a passage with no token is dropped, and ties keep input order (`rank_pending`). That ranking is fused with the tier's
+    Qdrant results as a third RRF list (a pending id at rank r scores 1/(r + 2), Qdrant's constant), 8 ids; an id
+    found both ways is one entry whose scores add up, as RRF does. The ids not read (past the cap, in pages the
+    deadline left out, or in pages it dropped) are skipped and logged as a count per tier
+    (`retrieval.pending_skipped`; `pendingFetched` and `pendingSkipped` in `retrieval.search_done`). A question with no
+    token of two characters or more reads no pending passage, since none could match.
+  - The text of every found id, in rank order, campaign tier first, comes from one passages call: the handed-over list
+    is `[{id, tier, text, sectionPath, page}]`. Library text reaches the worker by no other path.
+  - Failures: `retrieval.embedding_unavailable` (Ollama), `retrieval.store_unavailable` (Qdrant) and
+    `retrieval.passages_unavailable` (the passages route down, or an answer out of the contract) for the backend to
+    retry; `retrieval.question_too_long` (refused by the model), `retrieval.input_invalid` and a refusal of the
+    passages route with its own code (`scope.passage_refused`, ...), or `retrieval.passages_refused` when it names none,
+    with `retry: false`. Lines carry ids, counts and timings (`retrieval.search_done`: `embedSeconds`,
+    `searchSeconds`, `pendingSeconds`, `rankSeconds` for the counting after the pending deadline when pending passages
+    were read, and `readSeconds`), never the question, a text or the key.
+  - No production kind carries a question until Story 2.4. The test-mode kind `test.question` (`lanes/question.py`)
+    runs `find_passages` and reports the handed-over ids, `{ids: [...]}`.
+  - Tests (`tests/test_search.py`) use Qdrant's local mode and the real embeddinggemma vectors of a fixed fixture set
+    (`tests/fixtures/retrieval/`: SRD 5.2.1 passages in English, Portuguese passages written for the tests, and their
+    questions), recorded once through the Ollama tunnel (rounded to 7 decimals) and committed; an input that was not
+    recorded fails the test. Re-record after changing a fixture, the prompts or the model, and check the recording
+    against the live model:
+
+    ```sh
+    uv run python tools/record_embeddings.py           # rewrites tests/fixtures/retrieval/vectors.json
+    uv run python tools/record_embeddings.py --check   # expected: the largest difference is within 1e-4
+    ```
+
+    Ollama is `GMSHIELD_OLLAMA_URL`, else `http://localhost:11434` (the `roberto-server` SSH alias forwards it).
+- **Models through LangGraph, with a switchable provider (Story 2.10, AD-18, backend contract 1.9.0).** The backend
+  chooses the provider, model and tier of each attempt; the worker never chooses one and never falls back to another.
+  - **Claim.** Every claim states `providers`: those the worker holds a key for (test mode: `azure-openai`,
+    `anthropic` and `openai`). A claim of a kind that calls a model answers `model: {provider, model, tier}`
+    (`ClaimedJob.model`; `None` for every other kind). The backend refuses such a job to a worker that did not state
+    its provider: the job ends `failed` with `job.provider_unavailable`, no attempt used, and the claim is answered
+    409 `job.not_offered`. A claim that names a provider the worker has no key for fails the attempt with
+    `model.provider_key_missing`, one it does not know with `model.provider_unknown`, both with `retry: false`.
+  - **Chat models** (`models/chat.py`, `chat_model`). Azure OpenAI and OpenAI: `ChatOpenAI` on Chat Completions,
+    chosen explicitly (`use_responses_api=False`), at an explicit base URL (Azure: `GMSHIELD_AZURE_OPENAI_BASE_URL`,
+    the resource's `https://<host>/openai/v1/`, with the deployment name as the model; OpenAI:
+    `https://api.openai.com/v1`), `store=False`, `stream_usage=True`, no provider-hosted tool, no `api-version`, never
+    `AzureChatOpenAI`. Anthropic: `ChatAnthropic` at `https://api.anthropic.com`. Every model has `max_retries=0` (a
+    job retry is the only retry), a 60 s timeout and at most 4,096 output tokens. Test mode builds the fake model of
+    the claim's provider. Provider SDK and LangChain provider imports appear only in `models/` (a test fails the build
+    otherwise).
+  - **Uniform output** (`models/output.py`, `stream_call`). Each call has a worker-minted call id (a UUIDv7). Its
+    events, in order: `TextDelta` (display text, the citation markers removed), `Citation(passage_id, offset)` (the
+    model writes `[[<passage id>]]` after a statement; the offset is in code points of the display text; only ids
+    given to the model are kept, a marker with another id is removed; a marker split across chunks is held back until
+    the next chunk decides it), one `Usage(call_id, response_id, input, cache_read, cache_write, output, reasoning)`
+    from `usage_metadata` (input includes the cache reads and writes; the provider's response id when it sent one),
+    and `ModelFailed(code)` when the call ended in `model.refused` (a refusal or content filter),
+    `model.question_flagged` or `model.source_flagged` (Azure's 400 `content_filter` whose
+    `innererror.content_filter_result` has `jailbreak`, or `indirect_attack`, filtered; any other filtered category is
+    `model.refused`, and only when none is filtered does a `detected` one name the cause), `model.unavailable`
+    (connection, timeout, 5xx, 429, an error inside the stream) or `model.truncated` (the length or max-tokens stop,
+    or a prompt past the context window). Deltas may already have gone out before a trailing `ModelFailed`: it ends
+    the answer, and they are not withdrawn. Story 2.6: `stream_call(..., should_stop=)` asks `should_stop` before it
+    takes each chunk; once it is true, the provider's stream is closed, the held-back marker text is flushed as text,
+    the usage the provider sent is emitted, or else an estimate marked `estimated=True` (input: the code points of the
+    messages' text ÷ 4; output: the code points of the text emitted ÷ 4; both rounded up), and the call ends
+    `CallResult(stopped=True)` with no failure. `AnswerWithTools` passes its `should_stop` into every call.
+    Any other exception propagates (the attempt fails as `worker.handler_failed`).
+  - **Agents** (`agents/`). Every agent is a LangGraph graph compiled by `graphs.compile_graph`: in memory for one
+    job, with no persistence, shared store or pause (a test fails the build otherwise), run with no callback handler of ours and
+    within 10 steps. `AnswerWithTools` calls the model, runs the tools it asks for and gives their results back, at
+    most 4 calls (then `model.truncated`). Tools are read-only internal-API calls under the job's grant:
+    `read_passages` reads passages by id (`JobsApi.passages`) and gives their ids to the citation markers. Library
+    text enters only as tool results or user-turn data, never in the system prompt.
+  - **Fake model** (`models/fake.py`, test mode). A LangChain chat model shaped as its provider's integration
+    (Chat Completions chunks for `azure-openai` and `openai`, Anthropic chunks for `anthropic`), deterministic,
+    streamed in small chunks so markers split, citing the passage ids it was given. Directives in the user turn:
+    `fake:refusal`, `fake:outage`, `fake:truncated` (one `ModelFailed` each) and `fake:tool` (it calls
+    `read_passages` with the user turn's ids, then cites the results).
+  - **`test.model`** (`lanes/model_probe.py`, test mode only). Input `{prompt}` (1 to 4,000 characters); a one-node
+    graph around `AnswerWithTools` with `read_passages`; the result is `{model, events, usage}`. A typed failure fails
+    the attempt with its code (`model.unavailable` retried by the backend, the others with `retry: false`); a claim
+    without a model or a prompt fails with `model.input_invalid`. Lines carry ids, the provider, model and tier,
+    call counts and token totals, never a prompt or a text.
+  - **Tracing is refused.** The worker does not start (`tracing.on`, naming the variables) when
+    `LANGSMITH_` or `LANGCHAIN_` followed by `TRACING`, `TRACING_V2`, `OTEL_ENABLED` or `OTEL_ONLY` (any of the eight)
+    is truthy, `LANGSMITH_GATEWAY` is set,
+    `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER` or `OTEL_LOGS_EXPORTER` is anything but empty or `none`, any
+    `OTEL_EXPORTER_OTLP_*` variable is set, or `ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE` is `content`. The image
+    holds no OpenTelemetry SDK or exporter (a test checks the installed packages and the lock).
+  - **Recorded streams** (`tests/fixtures/models/`, replayed over HTTP by `tests/model_fixtures.py` in
+    `tests/test_model_recordings.py`). Each real chat model gets its provider's bytes: an answer (display text, its
+    citation, the usage), a refusal (for Azure also a Chat Completions refusal delta), a 503 and a length stop (and
+    for Anthropic an error inside the stream), mapped
+    to the same codes as the fake's. The requests are checked too: the explicit path, no `api-version`,
+    `store: false`, usage streamed, no tool, one request. The prompt is synthetic, with an invented passage. The
+    Anthropic cases are hand-built from its documented format (no Anthropic key exists). Azure's `answer` and
+    `length` are recorded on roberto-server, inside the worker image, with the server's `worker.env`, so the key
+    never leaves the server; the tool drops every header, replaces the response ids and refuses a body that holds the
+    key or the host, and only the cleaned file is copied back. Its `refusal`, `refusal_delta` and `outage` stay
+    hand-built (a synthetic prompt causes none of them). Each case says `recorded` or `hand-built`.
+
+    ```sh
+    # on roberto-server, in a folder holding a copy of tools/ and tests/ (~/gm2-10-record):
+    docker run --rm --env-file ~/gmshield-ci/secrets/worker.env --user "$(id -u):$(id -g)" \
+        -v ~/gm2-10-record:/record -w /record <worker image> python tools/record_model_responses.py
+    # the same with --check: today's live streams still have the recorded shape
+    ```
+
+  - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
+    `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4, 1.11.0 from Story 2.6).
+- **The answer to a question (Story 2.4, `question.answer`, backend contract 1.10.0).** Registered in every mode
+  (`lanes/answer.py`), on the interactive lane.
+  - The claim's input is the backend's question input (`retrieval.search.question_input`; else
+    `retrieval.input_invalid`, no retry) and its `model` the attempt's provider, model and tier (none:
+    `model.input_invalid`, no retry; a provider this worker cannot call: its code, no retry).
+  - `find_passages` finds the passages (Story 2.3, its failures as there). Then one model call through a one-node
+    LangGraph graph (`agents.graphs.answer_graph` around `AnswerWithTools` with no tools, compiled by `compile_graph`)
+    with `models.chat.chat_model(job.model)`. The `SystemMessage` holds instructions only: answer only from the
+    passages, write `[[<passage id>]]` after each statement, answer in the question's language, and say so in one
+    sentence when the passages do not answer. The one `HumanMessage` holds the passages as data blocks
+    (`<passage id="…" section="Magias > Fire Bolt">text</passage>`, XML-escaped) inside Azure's document delimiter
+    (`""" <documents>` … `</documents> """`, sent to every provider; none when no passage was found), then
+    `<question>…</question>`. Azure's Prompt Shields jailbreak check then reads only the question, so an
+    instruction-like passage no longer blocks an honest question. The documents get Prompt Shields' indirect-attack
+    check only when it is enabled in the Azure deployment's content filter (it is optional; the 2026-11-20 probe's
+    wrapped calls showed no document annotations).
+    The handed ids go to `CitationMarkers.give`, so only they can be cited. Nothing of the account (owner, token key,
+    grant) is sent.
+  - Every event goes to `lanes/batches.EventBatcher`, whose sender thread posts numbered batches to
+    `POST …/claims/{claimId}/events` (`JobsApi.events`, from 1 per claim): the first text delta at once and alone,
+    then at most every 100 ms or 32 events; a call's usage rides in the next batch. A 5xx or a transport error is
+    retried with the same number while the claim lives; any other refusal stops the answer (`failed` with its code, no
+    retry). The final batch is flushed before the outcome.
+  - A model failure is reported with its code (`model.refused`, `model.question_flagged`, `model.source_flagged`,
+    `model.truncated`, `model.unavailable`); a prompt filter's block is never retried and no passage is dropped to get
+    past it, and the log line carries its code only. Only an unavailable store, embedder, passages route or model
+    before any event was accepted may be retried: once the GM has seen words, the attempt fails with `retry: false`
+    (the backend refuses a splice too).
+  - **The GM's stop (Story 2.6, backend contract 1.11.0).** A batch's answer `{stop: true}` sets the batcher's `stop`.
+    From then on the batcher posts no event (those waiting and any emitted later are dropped), only the usage still to
+    report, sent with `estimated` (`JobsApi.events`). The model stream is closed before its next chunk (`should_stop`
+    is `cancel` or the batcher halted), and the outcome is `done`: a stop is the GM's choice, not a failure.
+    `answer.ended` says `stopped=true`. Deploy order for this story: backend, then worker, then frontend.
+  - Deploy order for the prompt-filter codes (Story 2.8): the frontend before or with the worker. The frontend's
+    change is backward compatible, while an older frontend shows `model.question_flagged` and `model.source_flagged`
+    as an outage with "Tentar de novo".
+  - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
+- **Text in a material is never an instruction (Story 2.8).** The passages go inside Azure's document delimiter
+  (above); `tests/test_planted_instructions.py` pins the defences against one planted material,
+  `tests/fixtures/planted/planted-instructions.md` (invented game content in pt-BR and en with a canary `ABACAXI-42`,
+  "ignore your rules", a fake `SYSTEM:` line, a `</passage><question>` break-out, a `</documents> """` break-out, a
+  deletion request, another passage's id to cite, and `<script>`, `<img onerror>`, `<iframe>`, Markdown images and
+  links, an autolink and a `javascript:` link; never a `fake:` directive). Handed all of its passages, the answer's
+  system message is `SYSTEM_PROMPT` exactly, the user turn has one `<passage>` element per passage, all inside one
+  document delimiter that no planted text ends, only handed ids are cited, the worker calls only the passages, events
+  and outcome routes, and no planted line or question reaches the logs. The tools each lane hands `AnswerWithTools`
+  are captured: none for the answer, only the read-only `read_passages` for the test-mode probe; no other module names
+  that node, and none but `agents/graphs.py` and the fake model's own `bind_tools` gives a model tools (`bind_tools`,
+  `bind(tools=…)`, `ToolNode`, `create_react_agent`).
+  The same file went through the real Azure model by hand (`docs/_bmad-output/implementation-artifacts/
+  2-8-planted-instructions-run.md`).
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.
@@ -260,21 +531,33 @@ lockfile and the production image:
 | Setting | Meaning |
 |---|---|
 | `GMSHIELD_BACKEND_URL` | the backend's address, `http` or `https`, without credentials (required outside test mode) |
-| `GMSHIELD_ANTHROPIC_API_KEY` | the model provider's key (required outside test mode; secret) |
+| `GMSHIELD_AZURE_OPENAI_API_KEY`, `GMSHIELD_AZURE_OPENAI_BASE_URL` | Azure OpenAI (Story 2.10; the key is secret): the key, and the resource's v1 URL `https://<resource>.openai.azure.com/openai/v1/` (https, that path, no query); a key without the URL is refused (`setting.missing`), a URL that is not one too (`setting.invalid`) |
+| `GMSHIELD_ANTHROPIC_API_KEY`, `GMSHIELD_OPENAI_API_KEY` | Anthropic's and OpenAI's keys (Story 2.10; secret) |
 | `GMSHIELD_WORKER_CREDENTIAL` | the worker's credential for `/internal/v1` (required outside test mode; secret): 32 to 512 characters of `A-Z a-z 0-9 . _ ~ + / = -`, the same value as the backend's |
 | `GMSHIELD_REDIS_HOST`, `GMSHIELD_REDIS_PORT` | Redis (the host required outside test mode; port default 6379) |
 | `GMSHIELD_REDIS_USERNAME`, `GMSHIELD_REDIS_PASSWORD` | the worker's Redis account (required outside test mode; `worker` in production; the password is secret) |
 | `GMSHIELD_REDIS_TLS` | `true` (default): TLS verified, chain and host name, against `/run/gmshield/certs/ca.crt`; `false` only in the development setup |
 | `GMSHIELD_INTERACTIVE_CAPACITY` | interactive jobs at once, 1 to 16 (default 2); the ingestion lane runs one |
+| `GMSHIELD_OLLAMA_URL` | Ollama, for the embeddings (Story 2.1), `http` or `https` without credentials (required outside test mode; production: `http://172.30.5.1:11434`, the `gmshield-model` gateway, set in `.gmshield/pipeline.toml`) |
+| `GMSHIELD_QDRANT_URL`, `GMSHIELD_QDRANT_API_KEY` | Qdrant (Story 2.1; both required outside test mode, the key is secret; production: `https://qdrant:6333`, written with the key by GMshield-pipeline `deploy/data-credentials.sh`); an https URL is verified against `/run/gmshield/certs/ca.crt` |
 | `GMSHIELD_WORK_DIR` | optional, absolute; default `/var/lib/gmshield-worker/work`, where production mounts the named volume `gmshield-worker-work` (on the encrypted volume) |
 | `GMSHIELD_HEALTH_FILE` | for tests that run the worker outside the image only; default `/run/gmshield-worker/healthy` |
 | `GMSHIELD_MODE` | unset, or `test` |
 
-`GMSHIELD_MODE=test` is set only by the pipeline: it needs no secret, uses the fake model, uses
+Each model provider's key is optional, and outside test mode at least one is required: none refuses the start
+(`setting.missing` naming the three). A key must be visible ASCII without spaces (it goes into a header). The worker
+states at each claim the providers it holds a key for; the backend's `GMSHIELD_MODEL_PROVIDER` chooses the provider.
+A placeholder key the worker does not really hold makes it claim jobs it cannot run (they fail with the provider's
+error): leave out every key that is not real.
+
+`GMSHIELD_MODE=test` is set only by the pipeline: it needs no secret, reads no model key, uses the fake model for every
+provider (and states all three), uses
 `http://stand-in-backend:8080` unless `GMSHIELD_BACKEND_URL` is set, Redis at `redis:6379` (or
 `GMSHIELD_REDIS_HOST`/`GMSHIELD_REDIS_PORT`) without an account, a password or TLS, and the fixed,
 public worker credential `gmshield-test-mode-worker-credential-not-a-secret` that the backend's test
-mode knows. A worker credential that is the test-mode value is refused outside test mode.
+mode knows, and the stand-ins `http://stand-in-ollama:11434` and `http://stand-in-qdrant:6333` (no key)
+unless `GMSHIELD_OLLAMA_URL` or `GMSHIELD_QDRANT_URL` is set. A worker credential that is the test-mode
+value is refused outside test mode.
 
 ## Internal API client
 

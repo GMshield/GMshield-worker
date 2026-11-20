@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 from uuid import UUID
 
+import httpx
 import pytest
 
 from gmshield_worker.backend.client import ClaimedJob, JobsApi
@@ -97,6 +98,33 @@ def test_an_answer_that_does_not_match_what_was_sent_or_a_refusal_raises(stand_i
     with pytest.raises(FileTransferError) as refused:
         files.upload(job, tmp_path / "batch.pdf")
     assert (refused.value.status, refused.value.code) == (413, "job.output_too_large")
+
+
+def test_an_input_read_into_memory_keeps_to_its_limit_and_its_length(stand_in: StandIn) -> None:
+    job = claimed(stand_in, {"passages": b"0123456789"})
+    files = JobFiles(stand_in.url, CREDENTIAL)
+
+    assert files.read(job, "passages", 10) == b"0123456789"
+    # Content-Length over the limit: refused before the body is read.
+    with pytest.raises(FileTransferError) as declared:
+        files.read(job, "passages", 9)
+    assert (declared.value.status, declared.value.code) == (200, "worker.input_too_large")
+    with pytest.raises(FileTransferError) as missing:
+        files.read(job, "other", 10)
+    assert (missing.value.status, missing.value.code) == (404, "request.not_found")
+
+    def answer(body: httpx.Response) -> JobFiles:
+        return JobFiles("http://stand-in-backend:8080", CREDENTIAL, {"transport": httpx.MockTransport(lambda _: body)})
+
+    # A body with no length that grows past the limit, and one shorter than its declared length.
+    with pytest.raises(FileTransferError) as grown:
+        answer(httpx.Response(200, content=iter([b"01234", b"56789", b"x"]))).read(job, "passages", 10)
+    assert grown.value.code == "worker.input_too_large"
+    with pytest.raises(FileTransferError) as short:
+        answer(httpx.Response(200, headers={"content-length": "10"}, stream=httpx.ByteStream(b"01234"))).read(
+            job, "passages", 10
+        )
+    assert (short.value.status, short.value.code) == (200, "worker.input_truncated")
 
 
 def test_file_calls_have_their_own_timeouts() -> None:
