@@ -267,9 +267,10 @@ def failure_code(error: BaseException) -> str | None:
 
 
 def _filter_failure(body: object) -> str:
-    """The code of a content-filter block: `model.question_flagged` when its jailbreak check flagged the prompt,
-    `model.source_flagged` when its indirect-attack check flagged a document, else `model.refused`. The details are
-    `innererror.content_filter_result` (the OpenAI SDK's `body` is the error object itself; under `error` too)."""
+    """The code of a content-filter block, from `innererror.content_filter_result` (the OpenAI SDK's `body` is the
+    error object itself; under `error` too). The categories that are `filtered` decide: jailbreak first
+    (`model.question_flagged`), then indirect attack (`model.source_flagged`), any other `model.refused`. Only when none
+    is filtered does a category that is only `detected` (annotated) name the cause, in the same order."""
     if not isinstance(body, Mapping):
         return REFUSED
     nested = body.get("error")
@@ -278,11 +279,17 @@ def _filter_failure(body: object) -> str:
         result = inner.get("content_filter_result") if isinstance(inner, Mapping) else None
         if not isinstance(result, Mapping):
             continue
+        filtered = {name for name, verdict in result.items() if _verdict(verdict, "filtered")}
+        named = filtered or {name for name, verdict in result.items() if _verdict(verdict, "detected")}
         for category, code in _FLAGGED_CATEGORIES:
-            verdict = result.get(category)
-            if isinstance(verdict, Mapping) and (verdict.get("filtered") is True or verdict.get("detected") is True):
+            if category in named:
                 return code
+        return REFUSED
     return REFUSED
+
+
+def _verdict(verdict: object, key: str) -> bool:
+    return isinstance(verdict, Mapping) and verdict.get(key) is True
 
 
 def _status_failure(status: int, body: object) -> str | None:

@@ -55,7 +55,8 @@ MODEL_INPUT_INVALID = "model.input_invalid"
 FLUSH_SECONDS = 30.0
 SECTION_SEPARATOR = " > "
 # Azure's document delimiter around the passages: its jailbreak check reads only the rest of the user turn (the
-# question), and the documents get its indirect-attack check. Plain text to any other provider.
+# question); the documents get its indirect-attack check only when the deployment's content filter enables it. Plain
+# text to any other provider.
 DOCUMENTS_OPEN = '""" <documents>'
 DOCUMENTS_CLOSE = '</documents> """'
 # Instructions only: library text never goes in here (it comes in the user turn, as data).

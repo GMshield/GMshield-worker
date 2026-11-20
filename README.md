@@ -414,9 +414,10 @@ lockfile and the production image:
     the next chunk decides it), one `Usage(call_id, response_id, input, cache_read, cache_write, output, reasoning)`
     from `usage_metadata` (input includes the cache reads and writes; the provider's response id when it sent one),
     and `ModelFailed(code)` when the call ended in `model.refused` (a refusal or content filter),
-    `model.question_flagged` or `model.source_flagged` (Azure's 400 `content_filter` with
-    `innererror.content_filter_result.jailbreak`, or `.indirect_attack`, filtered or detected; any other filter block
-    stays `model.refused`), `model.unavailable` (connection, timeout, 5xx, 429, an error inside the stream) or `model.truncated` (the length or max-tokens stop,
+    `model.question_flagged` or `model.source_flagged` (Azure's 400 `content_filter` whose
+    `innererror.content_filter_result` has `jailbreak`, or `indirect_attack`, filtered; any other filtered category is
+    `model.refused`, and only when none is filtered does a `detected` one name the cause), `model.unavailable`
+    (connection, timeout, 5xx, 429, an error inside the stream) or `model.truncated` (the length or max-tokens stop,
     or a prompt past the context window). Deltas may already have gone out before a trailing `ModelFailed`: it ends
     the answer, and they are not withdrawn. Story 2.6: `stream_call(..., should_stop=)` asks `should_stop` before it
     takes each chunk; once it is true, the provider's stream is closed, the held-back marker text is flushed as text,
@@ -479,8 +480,10 @@ lockfile and the production image:
     sentence when the passages do not answer. The one `HumanMessage` holds the passages as data blocks
     (`<passage id="…" section="Magias > Fire Bolt">text</passage>`, XML-escaped) inside Azure's document delimiter
     (`""" <documents>` … `</documents> """`, sent to every provider; none when no passage was found), then
-    `<question>…</question>`. Azure's Prompt Shields jailbreak check then reads only the question, and the passages
-    get its indirect-attack check instead: an instruction-like passage no longer blocks an honest question.
+    `<question>…</question>`. Azure's Prompt Shields jailbreak check then reads only the question, so an
+    instruction-like passage no longer blocks an honest question. The documents get Prompt Shields' indirect-attack
+    check only when it is enabled in the Azure deployment's content filter (it is optional; the 2026-11-20 probe's
+    wrapped calls showed no document annotations).
     The handed ids go to `CitationMarkers.give`, so only they can be cited. Nothing of the account (owner, token key,
     grant) is sent.
   - Every event goes to `lanes/batches.EventBatcher`, whose sender thread posts numbered batches to
@@ -498,6 +501,9 @@ lockfile and the production image:
     report, sent with `estimated` (`JobsApi.events`). The model stream is closed before its next chunk (`should_stop`
     is `cancel` or the batcher halted), and the outcome is `done`: a stop is the GM's choice, not a failure.
     `answer.ended` says `stopped=true`. Deploy order for this story: backend, then worker, then frontend.
+  - Deploy order for the prompt-filter codes (Story 2.8): the frontend before or with the worker. The frontend's
+    change is backward compatible, while an older frontend shows `model.question_flagged` and `model.source_flagged`
+    as an outage with "Tentar de novo".
   - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
 - **Text in a material is never an instruction (Story 2.8).** The passages go inside Azure's document delimiter
   (above); `tests/test_planted_instructions.py` pins the defences against one planted material,
