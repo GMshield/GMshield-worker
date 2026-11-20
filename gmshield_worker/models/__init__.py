@@ -7,6 +7,7 @@ nowhere else in the worker (a boundary test fails the build otherwise).
   model in test mode. No fallback provider, no retry inside a call.
 - `output.py`: the uniform output of every provider: text deltas without citation markers, citations by passage id
   and code-point offset, usage once per call under a worker-minted call id, and the typed failures `model.refused`,
+  `model.question_flagged`, `model.source_flagged` (a prompt filter flagged the question or a passage),
   `model.unavailable` and `model.truncated`.
 - `fake.py`: the fake chat model for any provider, with its directives (`fake:refusal`, `fake:outage`,
   `fake:truncated`, `fake:tool`).

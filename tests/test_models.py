@@ -19,7 +19,9 @@ from langchain_openai.chat_models.base import OpenAIAPIContextOverflowError, Ope
 from gmshield_worker.models.chat import chat_model
 from gmshield_worker.models.fake import FakeChatModel
 from gmshield_worker.models.output import (
+    QUESTION_FLAGGED,
     REFUSED,
+    SOURCE_FLAGGED,
     TRUNCATED,
     UNAVAILABLE,
     CallResult,
@@ -43,6 +45,7 @@ from gmshield_worker.models.providers import (
     endpoint,
 )
 from gmshield_worker.settings import ModelKeys
+from tests.model_fixtures import content_filter_error
 
 A = "019a0000-0000-7000-8000-00000000000a"
 B = "019a0000-0000-7000-8000-00000000000b"
@@ -274,6 +277,17 @@ def _response(status: int) -> httpx2.Response:
             openai.BadRequestError("x", response=_response(400), body={"code": "content_filter", "message": "m"}),
             REFUSED,
         ),
+        (content_filter_error("jailbreak"), QUESTION_FLAGGED),
+        (content_filter_error(detected=("jailbreak",)), QUESTION_FLAGGED),
+        (content_filter_error("indirect_attack"), SOURCE_FLAGGED),
+        (content_filter_error(detected=("indirect_attack",)), SOURCE_FLAGGED),
+        (content_filter_error("violence"), REFUSED),
+        (content_filter_error("violence", detected=("jailbreak",)), REFUSED),
+        (content_filter_error("indirect_attack", detected=("jailbreak",)), SOURCE_FLAGGED),
+        (content_filter_error(), REFUSED),
+        (content_filter_error("jailbreak", inner=False), REFUSED),
+        (content_filter_error("jailbreak", nested=True), QUESTION_FLAGGED),
+        (content_filter_error("jailbreak", "indirect_attack"), QUESTION_FLAGGED),
         (anthropic.InternalServerError("x", response=_response(500), body=None), UNAVAILABLE),
         (
             anthropic.APIStatusError(

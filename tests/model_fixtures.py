@@ -8,7 +8,8 @@ the provider's documented format). Recorded cases keep no header, no key and no 
 `OPENAI_RESPONSE_ID` and `ANTHROPIC_RESPONSE_ID`.
 
 The prompt is synthetic, with an invented passage (no library text): `SYSTEM_PROMPT` and `USER_PROMPT`, whose passage
-id is `PASSAGE_ID`. This module uses the standard library only, so the recording tool can run in the production image.
+id is `PASSAGE_ID`. This module imports the standard library only, so the recording tool can run in the production
+image (`content_filter_error` imports the OpenAI SDK when it is called).
 """
 
 from __future__ import annotations
@@ -21,7 +22,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import openai
 
 FOLDER = Path(__file__).resolve().parent / "fixtures" / "models"
 PROVIDER_FILES = {"azure-openai": "azure-openai.json", "anthropic": "anthropic.json"}
@@ -134,3 +138,36 @@ def replay(provider: str) -> Iterator[Replay]:
     finally:
         server.shutdown()
         server.server_close()
+
+
+# Azure's prompt-filter categories, as its 400 `content_filter` answer lists them.
+FILTER_CATEGORIES = ("hate", "jailbreak", "self_harm", "sexual", "violence")
+
+
+def content_filter_body(*filtered: str, detected: tuple[str, ...] = (), inner: bool = True) -> dict[str, Any]:
+    """Azure's 400 `content_filter` error object for a blocked prompt: the `filtered` categories filtered (and
+    detected), the `detected` ones only annotated, in `innererror.content_filter_result`."""
+    result: dict[str, Any] = {name: {"filtered": False, "severity": "safe"} for name in FILTER_CATEGORIES}
+    result["jailbreak"] = {"filtered": False, "detected": False}
+    for name in detected:
+        result[name] = {"filtered": False, "detected": True}
+    for name in filtered:
+        result[name] = {"filtered": True, "detected": True}
+    body: dict[str, Any] = {"code": "content_filter", "message": "m", "param": "prompt", "status": 400}
+    if inner:
+        body["innererror"] = {"code": "ResponsibleAIPolicyViolation", "content_filter_result": result}
+    return body
+
+
+def content_filter_error(
+    *filtered: str, detected: tuple[str, ...] = (), inner: bool = True, nested: bool = False
+) -> openai.BadRequestError:
+    """`content_filter_body` as the OpenAI SDK raises it: an `openai.BadRequestError` whose `body` is the error object
+    itself, or holds it under `error` when `nested`."""
+    # Imported here, not at the top: the recording tool imports this module with the standard library only.
+    import httpx2
+    import openai
+
+    body = content_filter_body(*filtered, detected=detected, inner=inner)
+    response = httpx2.Response(400, request=httpx2.Request("POST", "https://provider.test/v1"))
+    return openai.BadRequestError("x", response=response, body={"error": body} if nested else body)

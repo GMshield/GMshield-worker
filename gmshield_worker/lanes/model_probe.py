@@ -4,10 +4,11 @@ compiled by `agents.graphs.compile_graph`, the `read_passages` tool under the jo
 
 Its input is `{"prompt": "<1 to 4,000 characters>"}`; the fake model's directives (`fake:tool`, `fake:refusal`,
 `fake:outage`, `fake:truncated`) go in the prompt. Its result holds the model it called, the events in order (`delta`,
-`citation`, `usage`) and the usage of each call. A typed failure fails the attempt with its code: `model.refused` and
-`model.truncated` without a retry, `model.unavailable` retried by the backend while attempts remain. A claim without a
-model, or a prompt that is not one, fails with `model.input_invalid` and no retry; a provider this worker cannot call
-fails with `model.provider_key_missing` or `model.provider_unknown`, also without a retry.
+`citation`, `usage`) and the usage of each call. A typed failure fails the attempt with its code: `model.refused`,
+`model.question_flagged`, `model.source_flagged` and `model.truncated` without a retry, `model.unavailable` retried by
+the backend while attempts remain. A claim without a model, or a prompt that is not one, fails with
+`model.input_invalid` and no retry; a provider this worker cannot call fails with `model.provider_key_missing` or
+`model.provider_unknown`, also without a retry.
 """
 
 from __future__ import annotations

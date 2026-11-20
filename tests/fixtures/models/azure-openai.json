@@ -1,7 +1,7 @@
 {
   "provider": "azure-openai",
   "model": "gpt-6.1-terra",
-  "note": "Chat Completions streams of the Azure OpenAI v1 API. answer and length were recorded by tools/record_model_responses.py on roberto-server (headers dropped, response ids replaced); refusal, refusal_delta (a Chat Completions refusal delta) and outage are hand-built from the documented format (a synthetic prompt causes none of them).",
+  "note": "Chat Completions streams of the Azure OpenAI v1 API. answer and length were recorded by tools/record_model_responses.py on roberto-server (headers dropped, response ids replaced); refusal, refusal_delta (a Chat Completions refusal delta), outage, prompt_filter_jailbreak and prompt_filter_indirect_attack (a 400 content_filter whose innererror flags that Prompt Shields category, the shape the 2026-11-20 probe saw) are hand-built from the documented format (a synthetic prompt causes none of them).",
   "cases": {
     "answer": {
       "source": "recorded",
@@ -167,6 +167,86 @@
         "data: [DONE]",
         ""
       ]
+    },
+    "prompt_filter_jailbreak": {
+      "source": "hand-built",
+      "status": 400,
+      "contentType": "application/json",
+      "body": {
+        "error": {
+          "code": "content_filter",
+          "message": "The response was filtered due to the prompt triggering Azure OpenAI's content management policy.",
+          "param": "prompt",
+          "status": 400,
+          "innererror": {
+            "code": "ResponsibleAIPolicyViolation",
+            "content_filter_result": {
+              "hate": {
+                "filtered": false,
+                "severity": "safe"
+              },
+              "jailbreak": {
+                "filtered": true,
+                "detected": true
+              },
+              "self_harm": {
+                "filtered": false,
+                "severity": "safe"
+              },
+              "sexual": {
+                "filtered": false,
+                "severity": "safe"
+              },
+              "violence": {
+                "filtered": false,
+                "severity": "safe"
+              }
+            }
+          }
+        }
+      }
+    },
+    "prompt_filter_indirect_attack": {
+      "source": "hand-built",
+      "status": 400,
+      "contentType": "application/json",
+      "body": {
+        "error": {
+          "code": "content_filter",
+          "message": "The response was filtered due to the prompt triggering Azure OpenAI's content management policy.",
+          "param": "prompt",
+          "status": 400,
+          "innererror": {
+            "code": "ResponsibleAIPolicyViolation",
+            "content_filter_result": {
+              "hate": {
+                "filtered": false,
+                "severity": "safe"
+              },
+              "jailbreak": {
+                "filtered": false,
+                "detected": false
+              },
+              "self_harm": {
+                "filtered": false,
+                "severity": "safe"
+              },
+              "sexual": {
+                "filtered": false,
+                "severity": "safe"
+              },
+              "violence": {
+                "filtered": false,
+                "severity": "safe"
+              },
+              "indirect_attack": {
+                "filtered": true,
+                "detected": true
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

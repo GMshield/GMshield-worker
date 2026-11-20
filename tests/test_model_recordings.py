@@ -12,7 +12,9 @@ import pytest
 
 from gmshield_worker.models.chat import build_chat_model
 from gmshield_worker.models.output import (
+    QUESTION_FLAGGED,
     REFUSED,
+    SOURCE_FLAGGED,
     TRUNCATED,
     UNAVAILABLE,
     Citation,
@@ -123,6 +125,8 @@ CASES = [
     ("azure-openai", "refusal_delta", REFUSED),
     ("azure-openai", "outage", UNAVAILABLE),
     ("azure-openai", "length", TRUNCATED),
+    ("azure-openai", "prompt_filter_jailbreak", QUESTION_FLAGGED),
+    ("azure-openai", "prompt_filter_indirect_attack", SOURCE_FLAGGED),
     ("anthropic", "refusal", REFUSED),
     ("anthropic", "outage", UNAVAILABLE),
     ("anthropic", "length", TRUNCATED),
@@ -139,7 +143,7 @@ def test_a_recorded_failure_is_one_typed_failure(provider: str, case: str, code:
     assert [event for event in events if isinstance(event, ModelFailed)] == [ModelFailed(code)]
     assert events[-1] == ModelFailed(code)
     assert KEY not in repr(events)
-    if code == REFUSED:
+    if code in {REFUSED, QUESTION_FLAGGED, SOURCE_FLAGGED}:
         assert not any(isinstance(event, TextDelta) for event in events)
 
 

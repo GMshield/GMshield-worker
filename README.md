@@ -413,7 +413,10 @@ lockfile and the production image:
     given to the model are kept, a marker with another id is removed; a marker split across chunks is held back until
     the next chunk decides it), one `Usage(call_id, response_id, input, cache_read, cache_write, output, reasoning)`
     from `usage_metadata` (input includes the cache reads and writes; the provider's response id when it sent one),
-    and `ModelFailed(code)` when the call ended in `model.refused` (a refusal or content filter), `model.unavailable`
+    and `ModelFailed(code)` when the call ended in `model.refused` (a refusal or content filter),
+    `model.question_flagged` or `model.source_flagged` (Azure's 400 `content_filter` whose
+    `innererror.content_filter_result` has `jailbreak`, or `indirect_attack`, filtered; any other filtered category is
+    `model.refused`, and only when none is filtered does a `detected` one name the cause), `model.unavailable`
     (connection, timeout, 5xx, 429, an error inside the stream) or `model.truncated` (the length or max-tokens stop,
     or a prompt past the context window). Deltas may already have gone out before a trailing `ModelFailed`: it ends
     the answer, and they are not withdrawn. Story 2.6: `stream_call(..., should_stop=)` asks `should_stop` before it
@@ -475,7 +478,12 @@ lockfile and the production image:
     with `models.chat.chat_model(job.model)`. The `SystemMessage` holds instructions only: answer only from the
     passages, write `[[<passage id>]]` after each statement, answer in the question's language, and say so in one
     sentence when the passages do not answer. The one `HumanMessage` holds the passages as data blocks
-    (`<passage id="…" section="Magias > Fire Bolt">text</passage>`, XML-escaped), then `<question>…</question>`.
+    (`<passage id="…" section="Magias > Fire Bolt">text</passage>`, XML-escaped) inside Azure's document delimiter
+    (`""" <documents>` … `</documents> """`, sent to every provider; none when no passage was found), then
+    `<question>…</question>`. Azure's Prompt Shields jailbreak check then reads only the question, so an
+    instruction-like passage no longer blocks an honest question. The documents get Prompt Shields' indirect-attack
+    check only when it is enabled in the Azure deployment's content filter (it is optional; the 2026-11-20 probe's
+    wrapped calls showed no document annotations).
     The handed ids go to `CitationMarkers.give`, so only they can be cited. Nothing of the account (owner, token key,
     grant) is sent.
   - Every event goes to `lanes/batches.EventBatcher`, whose sender thread posts numbered batches to
@@ -483,15 +491,34 @@ lockfile and the production image:
     then at most every 100 ms or 32 events; a call's usage rides in the next batch. A 5xx or a transport error is
     retried with the same number while the claim lives; any other refusal stops the answer (`failed` with its code, no
     retry). The final batch is flushed before the outcome.
-  - A model failure is reported with its code (`model.refused`, `model.truncated`, `model.unavailable`). Only an
-    unavailable store, embedder, passages route or model before any event was accepted may be retried: once the GM
-    has seen words, the attempt fails with `retry: false` (the backend refuses a splice too).
+  - A model failure is reported with its code (`model.refused`, `model.question_flagged`, `model.source_flagged`,
+    `model.truncated`, `model.unavailable`); a prompt filter's block is never retried and no passage is dropped to get
+    past it, and the log line carries its code only. Only an unavailable store, embedder, passages route or model
+    before any event was accepted may be retried: once the GM has seen words, the attempt fails with `retry: false`
+    (the backend refuses a splice too).
   - **The GM's stop (Story 2.6, backend contract 1.11.0).** A batch's answer `{stop: true}` sets the batcher's `stop`.
     From then on the batcher posts no event (those waiting and any emitted later are dropped), only the usage still to
     report, sent with `estimated` (`JobsApi.events`). The model stream is closed before its next chunk (`should_stop`
     is `cancel` or the batcher halted), and the outcome is `done`: a stop is the GM's choice, not a failure.
     `answer.ended` says `stopped=true`. Deploy order for this story: backend, then worker, then frontend.
+  - Deploy order for the prompt-filter codes (Story 2.8): the frontend before or with the worker. The frontend's
+    change is backward compatible, while an older frontend shows `model.question_flagged` and `model.source_flagged`
+    as an outage with "Tentar de novo".
   - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
+- **Text in a material is never an instruction (Story 2.8).** The passages go inside Azure's document delimiter
+  (above); `tests/test_planted_instructions.py` pins the defences against one planted material,
+  `tests/fixtures/planted/planted-instructions.md` (invented game content in pt-BR and en with a canary `ABACAXI-42`,
+  "ignore your rules", a fake `SYSTEM:` line, a `</passage><question>` break-out, a `</documents> """` break-out, a
+  deletion request, another passage's id to cite, and `<script>`, `<img onerror>`, `<iframe>`, Markdown images and
+  links, an autolink and a `javascript:` link; never a `fake:` directive). Handed all of its passages, the answer's
+  system message is `SYSTEM_PROMPT` exactly, the user turn has one `<passage>` element per passage, all inside one
+  document delimiter that no planted text ends, only handed ids are cited, the worker calls only the passages, events
+  and outcome routes, and no planted line or question reaches the logs. The tools each lane hands `AnswerWithTools`
+  are captured: none for the answer, only the read-only `read_passages` for the test-mode probe; no other module names
+  that node, and none but `agents/graphs.py` and the fake model's own `bind_tools` gives a model tools (`bind_tools`,
+  `bind(tools=…)`, `ToolNode`, `create_react_agent`).
+  The same file went through the real Azure model by hand (`docs/_bmad-output/implementation-artifacts/
+  2-8-planted-instructions-run.md`).
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.

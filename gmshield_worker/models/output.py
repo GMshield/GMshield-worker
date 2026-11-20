@@ -12,9 +12,12 @@ hands its events, in order, to `emit`:
   counts them. A call stopped before the provider sent its usage reports an estimate instead (`estimated=True`, Story
   2.6): input is the code points of the messages' text ÷ 4, output the code points of the text emitted ÷ 4, both
   rounded up;
-- `ModelFailed(code)`: `model.refused` (a refusal or a content filter), `model.unavailable` (connection, timeout, 5xx,
-  429, an error inside the stream) or `model.truncated` (the length or max-tokens stop, or a prompt past the context
-  window).
+- `ModelFailed(code)`: `model.refused` (a refusal or a content filter), `model.question_flagged` (a prompt filter's
+  jailbreak check flagged the user turn outside the documents: the question), `model.source_flagged` (its
+  indirect-attack check flagged a document: a passage), `model.unavailable` (connection, timeout, 5xx, 429, an error
+  inside the stream) or `model.truncated` (the length or max-tokens stop, or a prompt past the context window). The
+  two prompt-filter codes come from Azure's 400 `content_filter` answer, `innererror.content_filter_result`; a filter
+  block that flags neither is `model.refused`.
 
 The markers are parsed across chunks: a chunk that ends inside a possible marker holds that part back until the next
 chunk decides it. A provider's own citation feature may be used inside `models/` only; outside, a citation is always
@@ -52,9 +55,11 @@ from langchain_core.messages import AIMessageChunk, BaseMessage
 from langchain_core.runnables import Runnable
 
 REFUSED = "model.refused"
+QUESTION_FLAGGED = "model.question_flagged"
+SOURCE_FLAGGED = "model.source_flagged"
 UNAVAILABLE = "model.unavailable"
 TRUNCATED = "model.truncated"
-FAILURE_CODES: tuple[str, ...] = (REFUSED, UNAVAILABLE, TRUNCATED)
+FAILURE_CODES: tuple[str, ...] = (REFUSED, QUESTION_FLAGGED, SOURCE_FLAGGED, UNAVAILABLE, TRUNCATED)
 
 OPEN = "[["
 CLOSE = "]]"
@@ -66,6 +71,9 @@ _PARTIAL_MARKER = re.compile(r"[A-Za-z0-9-]{0,64}\]?", re.ASCII)
 # The stop reasons of each provider's stream (Chat Completions `finish_reason`, Anthropic `stop_reason`).
 _TRUNCATED_STOPS = frozenset({"length", "max_tokens", "model_context_window_exceeded"})
 _REFUSED_STOPS = frozenset({"content_filter", "refusal"})
+_CONTENT_FILTER = "content_filter"
+# The prompt filter's categories with a code of their own, in the order they are checked (Azure's Prompt Shields).
+_FLAGGED_CATEGORIES = (("jailbreak", QUESTION_FLAGGED), ("indirect_attack", SOURCE_FLAGGED))
 # Anthropic's error events inside a stream that are the provider's own failure.
 _UNAVAILABLE_ERRORS = frozenset({"overloaded_error", "api_error", "rate_limit_error", "timeout_error"})
 _TOO_MANY_REQUESTS = 429
@@ -105,7 +113,8 @@ class Usage:
 
 @dataclass(frozen=True)
 class ModelFailed:
-    """The call ended without a usable answer: `model.refused`, `model.unavailable` or `model.truncated`."""
+    """The call ended without a usable answer: `model.refused`, `model.question_flagged`, `model.source_flagged`,
+    `model.unavailable` or `model.truncated`."""
 
     code: str
 
@@ -243,7 +252,7 @@ def failure_code(error: BaseException) -> str | None:
     if isinstance(error, ContextOverflowError):
         return TRUNCATED
     if isinstance(error, openai.APIStatusError | anthropic.APIStatusError):
-        return _status_failure(error.status_code, _error_code(error.body))
+        return _status_failure(error.status_code, error.body)
     unreachable = (
         ModelRateLimitError,
         ModelAPIError,
@@ -257,13 +266,41 @@ def failure_code(error: BaseException) -> str | None:
     return UNAVAILABLE if isinstance(error, unreachable) else None
 
 
-def _status_failure(status: int, code: str | None) -> str | None:
-    """A provider's error answer: 429 and 5xx are outages, a content filter a refusal, and an error event inside an
-    Anthropic stream (status 200) an outage when it is the provider's own failure."""
+def _filter_failure(body: object) -> str:
+    """The code of a content-filter block, from `innererror.content_filter_result` (the OpenAI SDK's `body` is the
+    error object itself; under `error` too). The categories that are `filtered` decide: jailbreak first
+    (`model.question_flagged`), then indirect attack (`model.source_flagged`), any other `model.refused`. Only when none
+    is filtered does a category that is only `detected` (annotated) name the cause, in the same order."""
+    if not isinstance(body, Mapping):
+        return REFUSED
+    nested = body.get("error")
+    for found in (body, nested if isinstance(nested, Mapping) else {}):
+        inner = found.get("innererror")
+        result = inner.get("content_filter_result") if isinstance(inner, Mapping) else None
+        if not isinstance(result, Mapping):
+            continue
+        filtered = {name for name, verdict in result.items() if _verdict(verdict, "filtered")}
+        named = filtered or {name for name, verdict in result.items() if _verdict(verdict, "detected")}
+        for category, code in _FLAGGED_CATEGORIES:
+            if category in named:
+                return code
+        return REFUSED
+    return REFUSED
+
+
+def _verdict(verdict: object, key: str) -> bool:
+    return isinstance(verdict, Mapping) and verdict.get(key) is True
+
+
+def _status_failure(status: int, body: object) -> str | None:
+    """A provider's error answer: 429 and 5xx are outages, a content filter a refusal (or a flagged question or
+    source), and an error event inside an Anthropic stream (status 200) an outage when it is the provider's own
+    failure."""
     if status == _TOO_MANY_REQUESTS or status >= _SERVER_ERROR:
         return UNAVAILABLE
-    if code == "content_filter":
-        return REFUSED
+    code = _error_code(body)
+    if code == _CONTENT_FILTER:
+        return _filter_failure(body)
     if status < _FIRST_ERROR_STATUS and code in _UNAVAILABLE_ERRORS:
         return UNAVAILABLE
     return None
