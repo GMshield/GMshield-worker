@@ -492,6 +492,19 @@ lockfile and the production image:
     is `cancel` or the batcher halted), and the outcome is `done`: a stop is the GM's choice, not a failure.
     `answer.ended` says `stopped=true`. Deploy order for this story: backend, then worker, then frontend.
   - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
+- **Text in a material is never an instruction (Story 2.8).** No code change: `tests/test_planted_instructions.py`
+  pins the defences against one planted material, `tests/fixtures/planted/planted-instructions.md` (invented game
+  content in pt-BR and en with a canary `ABACAXI-42`, "ignore your rules", a fake `SYSTEM:` line, a
+  `</passage><question>` break-out, a deletion request, another passage's id to cite, and `<script>`, `<img onerror>`,
+  `<iframe>`, Markdown images and links, an autolink and a `javascript:` link; never a `fake:` directive). Handed all of
+  its passages, the answer's system message is `SYSTEM_PROMPT` exactly, the user turn has one `<passage>` element per
+  passage, only handed ids are cited, the worker calls only the passages, events and outcome routes, and no planted
+  line or question reaches the logs. The tools each lane hands `AnswerWithTools` are captured: none for the answer,
+  only the read-only `read_passages` for the test-mode probe; no other module names that node, and none but
+  `agents/graphs.py` and the fake model's own `bind_tools` gives a model tools (`bind_tools`, `bind(tools=…)`,
+  `ToolNode`, `create_react_agent`).
+  The same file went through the real Azure model by hand (`docs/_bmad-output/implementation-artifacts/
+  2-8-planted-instructions-run.md`).
 - **Shutdown.** SIGTERM or SIGINT stops the lanes (a running job is abandoned unreported and the
   backend takes it back when its claim lapses) and ends the process with exit status 0, whether it
   is retrying or ready.
