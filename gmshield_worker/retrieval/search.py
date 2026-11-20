@@ -7,7 +7,7 @@ each tier), and `tokenKey` Base64 of the owner's 32-byte token key.
 
 1. When no tier has a source, nothing is asked of Ollama, Qdrant or the backend: the list is empty.
 2. The question is embedded with the indexing model under embeddinggemma's query prompt (`Embedder.embed_query`), and
-   its keyword vector is `keyword_vector(question, tokenKey)`.
+   its keyword vector is `query_vector(question, tokenKey)` (each distinct token valued 1).
 3. Per tier with sources, one Qdrant search (`PassageStore.search`): dense and sparse prefetches fused by RRF, `LIMIT`
    points, the owner and source filters always on. A tier without sources issues no query.
 4. Pending: once every tier is searched, the first `MAX_PENDING` ids of each tier's `pending`, in input order, are read
@@ -59,7 +59,7 @@ from gmshield_worker.backend.client import ClaimedJob, PassagesAnswer, ReadPassa
 from gmshield_worker.log import TraceLog
 from gmshield_worker.retrieval.embedding import Embedder, EmbeddingFailed
 from gmshield_worker.retrieval.indexing import StoreFactory
-from gmshield_worker.retrieval.keywords import KEY_BYTES, keyword_vector, tokens
+from gmshield_worker.retrieval.keywords import KEY_BYTES, query_vector, tokens
 from gmshield_worker.retrieval.store import RRF_K, Found, StoreFailed
 
 TIERS = ("campaign", "system")
@@ -378,7 +378,7 @@ def find_passages(
         dense = embedder.embed_query(checked.question)
     except EmbeddingFailed as error:
         raise SearchFailed(EMBEDDING_UNAVAILABLE if error.retry else error.code, retry=error.retry) from error
-    sparse = keyword_vector(checked.question, checked.token_key)
+    sparse = query_vector(checked.question, checked.token_key)
     timings.lap("embedSeconds")
     found: list[tuple[TierScope, list[Found]]] = []
     try:

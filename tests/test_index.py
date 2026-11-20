@@ -94,12 +94,23 @@ def test_keyword_tokens_fold_width_case_and_diacritics_into_unicode_words() -> N
     assert keywords.tokens("—!?") == []
 
 
-def test_a_keyword_vector_numbers_tokens_by_the_owners_key_and_counts_them() -> None:
+def bm25(tf: int, length: int) -> float:
+    norm = 1.2 * (1 - 0.75 + 0.75 * length / 250)
+    return tf * 2.2 / (tf + norm)
+
+
+def test_a_keyword_vector_numbers_tokens_by_the_owners_key_and_weighs_them_by_bm25() -> None:
     vector = keywords.keyword_vector("Vorpal vórpal espada", KEY)
     vorpal = keywords.token_number(KEY, "vorpal")
     espada = keywords.token_number(KEY, "espada")
     assert vorpal == int.from_bytes(__import__("hmac").new(KEY, b"vorpal", hashlib.sha256).digest()[:4], "big")
-    assert dict(zip(vector.indices, vector.values, strict=True)) == {vorpal: 2.0, espada: 1.0}
+    values = dict(zip(vector.indices, vector.values, strict=True))
+    assert values.keys() == {vorpal, espada}
+    assert values[vorpal] == pytest.approx(bm25(2, 3))
+    assert values[espada] == pytest.approx(bm25(1, 3))
+    assert math.isclose(keywords.K1, 1.2)
+    assert math.isclose(keywords.B, 0.75)
+    assert keywords.KEYWORD_AVG_TOKENS == 250
     assert vector.indices == sorted(vector.indices)
     assert all(0 <= index < 2**32 for index in vector.indices)
     # The same text under the same key gives the same numbers; another owner's key gives others.
@@ -110,6 +121,95 @@ def test_a_keyword_vector_numbers_tokens_by_the_owners_key_and_counts_them() -> 
     assert keywords.keyword_vector("", KEY) == keywords.Sparse([], [])
     with pytest.raises(ValueError, match="32 bytes"):
         keywords.keyword_vector("x", b"short")
+
+
+def test_a_question_vector_has_the_same_numbers_each_valued_one() -> None:
+    question = keywords.query_vector("Onde fica a Universidade? A universidade de Coimbra", KEY)
+    passage = keywords.keyword_vector("Onde fica a Universidade? A universidade de Coimbra", KEY)
+    assert question.indices == passage.indices
+    assert question.values == pytest.approx([1.0] * 6)
+    assert keywords.query_vector("", KEY) == keywords.Sparse([], [])
+    with pytest.raises(ValueError, match="32 bytes"):
+        keywords.query_vector("x", b"short")
+
+
+def test_a_long_page_of_common_words_no_longer_outweighs_a_short_passage_on_them() -> None:
+    # Matrix row "Long passage, common words": a 2,800-character page with "de" 37 times against a 500-character
+    # passage with "de" 3 times. Raw counts made the page's "de" 12 times the passage's; BM25 saturates and normalizes.
+    filler = [f"pal{index:03d}" for index in range(400)]
+    long_words = filler[:363] + ["de"] * 37
+    short_words = filler[:72] + ["de"] * 3
+    long_text, short_text = " ".join(long_words), " ".join(short_words)
+    assert 2600 <= len(long_text) <= 3000
+    assert 450 <= len(short_text) <= 600
+    de = keywords.token_number(KEY, "de")
+
+    def value(text: str) -> float:
+        vector = keywords.keyword_vector(text, KEY)
+        return vector.values[vector.indices.index(de)]
+
+    assert value(long_text) == pytest.approx(bm25(37, 400))
+    assert value(short_text) == pytest.approx(bm25(3, 75))
+    assert value(long_text) / value(short_text) < 1.5
+    # Never past k1 + 1, however often a word recurs.
+    assert value(" ".join(["de"] * 1000)) < 2.2
+
+
+def raw_counts(text: str) -> keywords.Sparse:
+    """Recipe "1"'s keyword vector: each token number valued by its count."""
+    counts: dict[int, int] = {}
+    for token in keywords.tokens(text):
+        number = keywords.token_number(KEY, token)
+        counts[number] = counts.get(number, 0) + 1
+    numbers = sorted(counts)
+    return keywords.Sparse(numbers, [float(counts[number]) for number in numbers])
+
+
+def sparse_ranking(vector: Any, texts: list[str], question: str) -> list[int]:
+    """The texts' indices as the collection's sparse prefetch ranks them for the question (Qdrant's `idf` modifier)."""
+    client = QdrantClient(":memory:")
+    passages = store.PassageStore(client)
+    passages.ensure_collection()
+    ids = [str(uuid.uuid4()) for _ in texts]
+    dense = [1.0] + [0.0] * (embedding.DIMENSIONS - 1)
+    passages.upsert(
+        [
+            store.Point(passage_id, dense, vector(text), OWNER, "0195a3c0-0000-7000-8000-0000000000e1", None, 1, None)
+            for passage_id, text in zip(ids, texts, strict=True)
+        ]
+    )
+    asked = keywords.query_vector(question, KEY)
+    found = client.query_points(
+        store.COLLECTION,
+        query=models.SparseVector(indices=asked.indices, values=asked.values),
+        using=store.SPARSE,
+        limit=len(texts),
+    ).points
+    return [ids.index(str(point.id)) for point in found]
+
+
+def test_a_short_passage_with_the_rare_question_words_outranks_a_long_page_of_common_ones() -> None:
+    # The Coimbra founding question: a long page full of "de", "foi", "onde" and "universidade" against the short
+    # passage that names the founding. Under recipe "2" the short passage comes first; under raw counts it did not.
+    question = "Quando e onde foi fundada a Universidade de Coimbra"
+    sentence = (
+        "A universidade foi onde o reitor de Lisboa e o bispo de Braga viveram, e foi de facto a sede de um estudo"
+    )
+    long_page = " ".join([sentence] * 26)
+    assert 2700 <= len(long_page) <= 2900
+    short = "Universidade de Coimbra fundada em 1290 por D. Dinis."
+    fillers = [
+        f"Capitulo {i}: a cidade de Lisboa e o rio de onde veio o rei, que foi a universidade." for i in range(8)
+    ]
+    fillers += [f"Nota {i} sobre o clero e a nobreza do reino de Portugal." for i in range(8)]
+    texts = [long_page, short, *fillers]
+
+    assert sparse_ranking(lambda text: keywords.keyword_vector(text, KEY), texts, question)[0] == 1
+    assert sparse_ranking(raw_counts, texts, question)[0] == 0
+
+
+def test_the_index_recipe_is_2() -> None:
+    assert INDEX_RECIPE == "2"
 
 
 # --- embedding

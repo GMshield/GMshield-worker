@@ -694,16 +694,31 @@ def para(content: str) -> dict[str, Any]:
     return {"label": "text", "text": content, "box": [0, 0.2, 1, 0.4], "headingLevel": None, "rows": None}
 
 
+def outlined_pdf(total: int, *entries: tuple[str, int]) -> bytes:
+    """`total` pages with one top-level bookmark per entry (title, page from 1)."""
+    pdf = pdfs.pages(total)
+    with pdf.open_outline() as outline:
+        outline.root.extend(pikepdf.OutlineItem(name, page - 1) for name, page in entries)
+    buffer = io.BytesIO()
+    pdf.save(buffer)
+    return buffer.getvalue()
+
+
 def test_passages_read_every_text_file_in_page_order_and_carry_the_path_across_them(
     stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Matrix row "Path across batches": "Magic Items" on page 19 (first batch), "Vorpal Sword" on page 21 (second).
+    # Matrix row "Path across batches": the bookmark "Magic Items" (page 19, first batch) carries to "Vorpal Sword",
+    # a heading on page 21 (second batch). The bookmarks come from the cleaned original, by the clean child.
     first = pdf_records((19, [heading("Magic Items", 1), para("Wondrous things.")]), (20, [para("More.")]))
     second = pdf_records((21, [heading("Vorpal Sword", 2), para("A legendary blade.")]), (22, []))
     job = claim_passages(
         stand_in,
-        passages_input([(text_name(1), 19, 20), (text_name(2), 21, 22)]),
-        {text_name(1): first, text_name(2): second},
+        {**passages_input([(text_name(1), 19, 20), (text_name(2), 21, 22)]), "original": "original"},
+        {
+            "original": outlined_pdf(25, ("Equipment", 4), ("Magic Items", 19)),
+            text_name(1): first,
+            text_name(2): second,
+        },
     )
     work = tmp_path / "work"
 
@@ -722,20 +737,104 @@ def test_passages_read_every_text_file_in_page_order_and_carry_the_path_across_t
     ]
     assert result["passages"][0]["boxes"] == [[0, 0, 1, 0.1], [0, 0.2, 1, 0.4]]
     assert result["outline"] == [
+        {"level": 1, "title": "Equipment", "page": 4},
         {"level": 1, "title": "Magic Items", "page": 19},
         {"level": 2, "title": "Vorpal Sword", "page": 21},
     ]
-    # No child: two downloads, in page order, then the report.
+    # The original, read by one child, then the two text files in page order, then the report.
     paths = [request["path"] for request in stand_in.job_requests(str(job.job_id)) if "/inputs/" in request["path"]]
-    assert [path.rsplit("/", 1)[1] for path in paths] == [text_name(1), text_name(2)]
+    assert [path.rsplit("/", 1)[1] for path in paths] == ["original", text_name(1), text_name(2)]
     assert list(work.iterdir()) == []
     assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
     lines = [line for line in log_lines(capsys.readouterr().out) if line.get("jobId") == str(job.job_id)]
     assert [line["event"] for line in lines] == ["ingestion.step_started", "ingestion.input_downloaded",
+                                                 "ingestion.child_ended", "ingestion.input_downloaded",
                                                  "ingestion.input_downloaded", "ingestion.step_done"]  # fmt: skip
+    assert lines[1]["input"] == "original"
+    assert lines[2]["returncode"] == 0
+    assert lines[-1]["bookmarks"] == 2
     assert lines[-1]["passages"] == 3
-    assert lines[-1]["sections"] == 2
+    assert lines[-1]["sections"] == 3
     assert "Vorpal" not in json.dumps(lines)
+    assert "Magic" not in json.dumps(lines)
+
+
+def test_a_passages_step_without_bookmarks_takes_its_paths_from_its_headings(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    records = pdf_records((1, [heading("Magic Items", 1), para("Wondrous things.")]), (2, [heading("Vorpal", 2)]))
+    expected = [(1, ["Magic Items"]), (2, ["Vorpal"])]
+
+    # The original's child crashes, or writes what is not bookmarks: no bookmarks, and the step still reports.
+    def crashed(*_: Any, **__: Any) -> sandbox.ChildResult:
+        return sandbox.ChildResult(returncode=-9, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
+
+    def garbled(script: Path, arguments: list[str], *, folder: Path, **_: Any) -> sandbox.ChildResult:
+        assert (script, arguments[0]) == (step.CLEAN_SCRIPT, "bookmarks")
+        (folder / arguments[2]).write_text('{"title": "X"}', encoding="utf-8")
+        return sandbox.ChildResult(returncode=0, timed_out=False, cancelled=False, max_rss_kib=1, seconds=0.1)
+
+    for runner in (crashed, garbled):
+        job = claim_passages(
+            stand_in,
+            {**passages_input([(text_name(1), 1, 2)], total=2), "original": "original"},
+            {"original": outlined_pdf(2, ("Ignored", 1)), text_name(1): records},
+        )
+        work = tmp_path / "work"
+        outcome = handler(stand_in, work, runner=runner)(job, threading.Event())
+        assert outcome.outcome == "done", outcome
+        assert outcome.result is not None
+        assert [(item["page"], item["sectionPath"]) for item in outcome.result["passages"]] == expected
+        assert list(work.iterdir()) == []
+        lines = [line for line in log_lines(capsys.readouterr().out) if line.get("jobId") == str(job.job_id)]
+        [unread] = [line for line in lines if line["event"] == "ingestion.bookmarks_unread"]
+        assert unread["reason"] == ("child" if runner is crashed else "invalid")
+
+    # No original named (an older backend), or an image set's (it has no bookmarks): nothing more is downloaded.
+    for fmt, job_input in (
+        ("pdf", passages_input([(text_name(1), 1, 2)], total=2)),
+        ("images", {**passages_input([(text_name(1), 1, 2)], fmt="images", total=2), "original": "original"}),
+    ):
+        job = claim_passages(stand_in, job_input, {text_name(1): records})
+        outcome = handler(stand_in, tmp_path / "work", runner=crashed)(job, threading.Event())
+        assert outcome.result is not None, fmt
+        assert [(item["page"], item["sectionPath"]) for item in outcome.result["passages"]] == expected
+        paths = [item["path"] for item in stand_in.job_requests(str(job.job_id)) if "/inputs/" in item["path"]]
+        assert [path.rsplit("/", 1)[1] for path in paths] == [text_name(1)]
+
+
+def test_bookmarks_are_optional_a_failed_download_or_sandbox_gives_none(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    records = pdf_records((1, [heading("Magic Items", 1), para("Wondrous things.")]))
+    job_input = {**passages_input([(text_name(1), 1, 1)], total=1), "original": "original"}
+
+    def raising(error: Exception) -> Any:
+        def runner(*_: Any, **__: Any) -> sandbox.ChildResult:
+            raise error
+
+        return runner
+
+    cases = [
+        ("download", {text_name(1): records}, raising(AssertionError("no child"))),
+        ("sandbox", {"original": outlined_pdf(1, ("X", 1)), text_name(1): records}, raising(OSError("exec"))),
+        (
+            "sandbox",
+            {"original": outlined_pdf(1, ("X", 1)), text_name(1): records},
+            raising(sandbox.SandboxUnavailable("seccomp")),
+        ),
+    ]
+    for reason, files, runner in cases:
+        job = claim_passages(stand_in, job_input, files)
+        work = tmp_path / "work"
+        outcome = handler(stand_in, work, runner=runner)(job, threading.Event())
+        assert outcome.outcome == "done", (reason, outcome)
+        assert outcome.result is not None
+        assert [item["sectionPath"] for item in outcome.result["passages"]] == [["Magic Items"]]
+        assert list(work.iterdir()) == []
+        lines = [line for line in log_lines(capsys.readouterr().out) if line.get("jobId") == str(job.job_id)]
+        [unread] = [line for line in lines if line["event"] == "ingestion.bookmarks_unread"]
+        assert unread["reason"] == reason
 
 
 def test_a_version_with_no_text_file_reports_no_passages(stand_in: StandIn, tmp_path: Path) -> None:
@@ -789,6 +888,8 @@ def test_a_malformed_texts_input_or_text_file_fails_the_passages_step_at_once(
         {**good, "texts": [{"name": text_name(2), "firstPage": 21, "lastPage": 25},
                            {"name": text_name(1), "firstPage": 1, "lastPage": 20}]},
         {key: value for key, value in good.items() if key != "pageTotal"},
+        {**good, "original": "../original"},
+        {**good, "original": 1},
     ):  # fmt: skip
         job = claim_passages(stand_in, bad, {})
         assert handler(stand_in, tmp_path / "work")(job, threading.Event()) == Outcome.failed(STEP_FAILED, retry=False)
@@ -1195,9 +1296,10 @@ def test_an_image_sets_passages_are_cut_from_pdf_records_with_their_boxes(
     cutters: list[bool] = []
     real = passages.cutter
 
-    def recording(pdf: bool) -> Any:
+    def recording(pdf: bool, **options: Any) -> Any:
         cutters.append(pdf)
-        return real(pdf)
+        assert options == {"bookmarks": []}
+        return real(pdf, **options)
 
     monkeypatch.setattr(passages, "cutter", recording)
     records = pdf_records((1, [heading("Ficha", 1), para("O Corvo Escarlate guarda a ponte.")]), (2, []))

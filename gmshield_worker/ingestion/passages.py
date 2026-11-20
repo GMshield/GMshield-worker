@@ -1,26 +1,39 @@
 """The passages stage's cutter (Story 1.18): a version's page records, in page order, as passages and an outline.
 
-Pure functions over our own JSON: the stage (`step.py`) runs them in-process, with no child, one text file at a time,
-and carries the heading stack from one file to the next. Two kinds of page record come in:
+Pure functions over our own JSON: the stage (`step.py`) runs them in-process, one text file at a time, and carries the
+section from one file to the next. Two kinds of page record come in:
 
-- **PDF** (layout's and OCR's shape, see `layout.py`): blocks in reading order. A block whose `headingLevel` is set
-  closes every open section at its level or deeper and opens its own; the section path is the open headings' titles,
-  outermost first, and every heading with text is an outline entry `{level, title, page}`.
+- **PDF** (layout's and OCR's shape, see `layout.py`), with the file's bookmarks (`clean.py bookmarks`, pipeline "7").
+  The section path is the path of the last bookmark entered (its titles in the outline, outermost first), followed by
+  the last Docling heading since that bookmark, if any. Docling's heading levels never nest headings (Docling ranks a
+  style per batch and per page retry, so one style gets several levels): every heading replaces the one before it under
+  the current bookmark path. Bookmarks are entered in page order, in the outline's order within a page. On its page, a
+  bookmark is entered just before the first block, at or after the previous bookmark's, whose text is its title
+  (`folded`: NFKC, casefold, punctuation and whitespace runs as one space; a heading first, else any block); one that
+  matches no block is entered with the next bookmark of its page that does, else at the page's start when none of the
+  page's does, else at the page's end. A bookmark of a page that has no record is entered before the next page that
+  has one. A heading whose folded title is already in the path (the current heading, as a running header repeats it,
+  or any bookmark's title) is read as an ordinary block: "Tarrasque" under the bookmark "Tarrasque" is one
+  "Tarrasque", and so is the stat block's own "Tarrasque" title after the monster's description. The outline has every
+  bookmark at its depth (from 1) and every heading kept, one level under its bookmark path. With no bookmarks (a scan,
+  an image set), the path is the last heading alone.
 - **Text** (`text.py`'s shape): each page's `headingPath` is its section path; each heading a page newly enters is an
   outline entry whose level is its depth in the path.
 
-Blocks labelled `page_header` or `page_footer`, and blocks with no text, never enter a passage. Cutting, at
-`PASSAGE_LIMIT` code points (the text stage's page limit):
+Blocks labelled `page_header` or `page_footer`, and blocks with no text, never enter a passage. Cutting:
 
-- a new passage starts at a new section, at a new page (a passage lies on one page, so its page is exact), or when the
-  next block would pass the limit;
-- a passage that does not open its section starts with its section's heading (the leaf of its path), so each part of a
-  long stat block repeats its heading; a passage that holds nothing but its own heading takes the next block anyway;
+- a new passage starts at every bookmark and heading (a new section), at a new page (a passage lies on one page, so
+  its page is exact), or when the next block would take it past `PASSAGE_TARGET` code points; a passage that opens its
+  section (its first with content after a bookmark or heading, even on the page after a heading that ended a page)
+  keeps taking blocks up to `PASSAGE_LIMIT` (the text stage's page limit), so a stat block or a spell stays whole;
+- a passage that does not open its section starts with its section's leaf (the last title of its path), so each part
+  of a long stat block repeats its heading; a passage that holds nothing but its own heading takes the next block
+  anyway;
+- a single block over the target is a passage of its own; one over the room a passage has (`PASSAGE_LIMIT`) is cut as
+  `text.py` cuts a page: at its last blank line, else line end, else whitespace, else the limit;
 - a table (its rows one per line, cells joined by ` | `) never splits while it fits; one that does not is cut between
   rows, each part starting with the heading and the table's first row;
-- any other block over the limit is cut as `text.py` cuts a page: at its last blank line, else line end, else
-  whitespace, else the limit;
-- a text page is cut at its blank lines.
+- a text page is cut at its blank lines, its paragraphs joined by the same target and limit.
 
 A PDF passage carries `boxes`, its blocks' boxes on its page (`[left, top, right, bottom]`, fractions from the
 top-left corner); a text passage carries `range`, `[start, end)` in code points of its page's text (the repeated
@@ -32,6 +45,8 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +54,8 @@ from typing import Any
 from gmshield_worker.ingestion import text as text_stage
 
 PASSAGE_LIMIT = text_stage.PAGE_LIMIT
+# The size passages are joined to (pipeline "7"): about a paragraph, so a page of prose is several passages.
+PASSAGE_TARGET = 1200
 MAX_DEPTH = 32
 MAX_TITLE = 1000
 MAX_LEVEL = 1000
@@ -59,6 +76,57 @@ class RecordsInvalid(ValueError):
 def title(value: object) -> str:
     """A heading's text as a title: whitespace runs as one space, trimmed; empty for anything but text."""
     return _SPACES.sub(" ", value).strip() if isinstance(value, str) else ""
+
+
+def folded(value: object) -> str:
+    """A title as it is compared: NFKC (ligatures, fullwidth), casefolded, every punctuation mark (quotes, dashes,
+    a trailing period) as a space, whitespace runs as one space, trimmed."""
+    if not isinstance(value, str):
+        return ""
+    normal = unicodedata.normalize("NFKC", value).casefold()
+    return title("".join(" " if unicodedata.category(char).startswith("P") else char for char in normal))
+
+
+@dataclass(frozen=True)
+class Bookmark:
+    """A bookmark of the file (`clean.py bookmarks`): its title, its depth from 0 in the outline, and its page."""
+
+    title: str
+    depth: int
+    page: int
+
+
+@dataclass(frozen=True)
+class _Mark:
+    """A bookmark ready to enter: its path (its titles in the outline, outermost first) and its page."""
+
+    path: tuple[str, ...]
+    page: int
+
+    @property
+    def key(self) -> str:
+        return folded(self.path[-1])
+
+
+def _marks(bookmarks: Sequence[Bookmark]) -> list[_Mark]:
+    """Each bookmark with its path, worked out in the outline's order, then in page order (the outline's order within
+    a page). A bookmark with no title is dropped, and its children take its place under its parent; a path is cut to
+    leave room for a heading under it."""
+    found: list[_Mark] = []
+    # The open entries by depth: their titles, or None for one with no title (its children skip it).
+    stack: list[tuple[int, str | None]] = []
+    for bookmark in bookmarks:
+        depth = max(bookmark.depth, 0)
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        name = title(bookmark.title)[:MAX_TITLE]
+        stack.append((depth, name or None))
+        if not name:
+            continue
+        names = [entry for _depth, entry in stack if entry is not None]
+        path = tuple(names) if len(names) < MAX_DEPTH else (*names[: MAX_DEPTH - 2], names[-1])
+        found.append(_Mark(path, bookmark.page))
+    return sorted(found, key=lambda mark: mark.page)
 
 
 def table_text(block: Record) -> str:
@@ -110,6 +178,8 @@ class _Draft:
     lines: list[str] = field(default_factory=list)
     boxes: list[Box] = field(default_factory=list)
     heading_only: bool = False
+    # Whether it is its section's first passage (after a bookmark or heading): it joins up to the limit.
+    opens: bool = False
     # Text pages: the range of the page's text the passage holds.
     source: str = ""
     start: int = -1
@@ -131,8 +201,9 @@ class _Draft:
 class _Cutter:
     """What both kinds share: the open sections, the outline, the passages, and the passage being built."""
 
-    def __init__(self, limit: int = PASSAGE_LIMIT) -> None:
+    def __init__(self, limit: int = PASSAGE_LIMIT, target: int = PASSAGE_TARGET) -> None:
         self.limit = limit
+        self.target = min(target, limit)
         self.stack: list[tuple[int, str]] = []
         self.section = 0
         self.passages: list[dict[str, Any]] = []
@@ -143,7 +214,12 @@ class _Cutter:
         return tuple(name for _level, name in self.stack)
 
     def leaf(self) -> str | None:
-        return self.stack[-1][1] if self.stack else None
+        path = self.path()
+        return path[-1] if path else None
+
+    def cap(self, draft: _Draft) -> int:
+        """The most a passage grows to by joining: the limit for one that opens its section, else the target."""
+        return self.limit if draft.opens else self.target
 
     def fresh_room(self) -> int:
         """The code points a new passage that repeats the heading has left for its content."""
@@ -160,7 +236,8 @@ class _Cutter:
 
     def open(self, page: int, *, opens: bool, **text_page: Any) -> _Draft:
         self.close()
-        self._draft = _Draft(page, self.path(), self.section, None if opens else self.leaf(), **text_page)
+        prefix = None if opens else self.leaf()
+        self._draft = _Draft(page, self.path(), self.section, prefix, opens=opens, **text_page)
         return self._draft
 
     def close(self) -> None:
@@ -191,18 +268,45 @@ class _Cutter:
 
 
 class PdfCutter(_Cutter):
-    """Passages of PDF page records (layout's and OCR's shape)."""
+    """Passages of PDF page records (layout's and OCR's shape), under the file's bookmarks."""
+
+    def __init__(
+        self, limit: int = PASSAGE_LIMIT, target: int = PASSAGE_TARGET, bookmarks: Sequence[Bookmark] = ()
+    ) -> None:
+        super().__init__(limit, target)
+        self._marks = _marks(bookmarks)
+        self._next = 0
+        self._bookmark_path: tuple[str, ...] = ()
+        self._heading: str | None = None
+        # The last sections that got a passage, and content beyond their heading.
+        self._opened = 0
+        self._filled = 0
+
+    def path(self) -> tuple[str, ...]:
+        return self._bookmark_path if self._heading is None else (*self._bookmark_path, self._heading)
+
+    def finish(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """The passages and the outline, every bookmark in it (those of pages after the last record too)."""
+        self._enter_before(None)
+        return super().finish()
 
     def page(self, record: Record) -> None:
         page = record["page"]
-        for block in record["blocks"]:
+        self._enter_before(page)
+        blocks = record["blocks"]
+        placed = self._place(page, blocks)
+        for index, block in enumerate(blocks):
+            for mark in placed.get(index, ()):
+                self._mark(mark)
             if not isinstance(block, dict) or block.get("label") in SKIPPED:
                 continue
             box = _box(block.get("box"))
-            level = block.get("headingLevel")
-            name = title(block.get("text"))
-            if type(level) is int and name and len(name) <= MAX_TITLE:
-                self.enter(level, name, page)
+            name = _heading(block)
+            if name is not None and self._repeats(name):
+                # A running header, or a title the path already holds: an ordinary block.
+                name = None
+            if name is not None:
+                self._enter_heading(name, page)
                 draft = self.open(page, opens=True)
                 draft.lines.append(name)
                 draft.heading_only = True
@@ -211,18 +315,95 @@ class PdfCutter(_Cutter):
                 self._table(block, page, box)
             else:
                 self._block(str(block.get("text") or "").strip(), page, box)
+        for mark in placed.get(len(blocks), ()):
+            self._mark(mark)
+
+    def open(self, page: int, *, opens: bool, **text_page: Any) -> _Draft:
+        if opens:
+            self._opened = self.section
+        return super().open(page, opens=opens, **text_page)
+
+    def _new(self, page: int) -> _Draft:
+        """A new passage: the first since a bookmark or heading opens its section, the others repeat its leaf. The
+        first with content after a heading that ended a page alone still opens its section (it joins up to the limit),
+        though it repeats the heading."""
+        first = self.section > 0 and self._opened != self.section
+        draft = self.open(page, opens=first)
+        draft.opens = self.section > 0 and self._filled != self.section
+        return draft
+
+    # --- bookmarks and headings
+
+    def _enter_before(self, page: int | None) -> None:
+        """Enters every bookmark of the pages before `page` (all of them for None) not entered yet."""
+        while self._next < len(self._marks) and (page is None or self._marks[self._next].page < page):
+            self._mark(self._marks[self._next])
+            self._next += 1
+
+    def _place(self, page: int, blocks: list[Any]) -> dict[int, list[_Mark]]:
+        """Where on the page each of its bookmarks is entered: before the block at that index (the page's end is the
+        index past its last block)."""
+        marks = []
+        while self._next < len(self._marks) and self._marks[self._next].page == page:
+            marks.append(self._marks[self._next])
+            self._next += 1
+        if not marks:
+            return {}
+        keys = [folded(block.get("text")) if isinstance(block, dict) and block.get("label") not in SKIPPED else ""
+                for block in blocks]  # fmt: skip
+        headings = [isinstance(block, dict) and _heading(block) is not None for block in blocks]
+        placed: dict[int, list[_Mark]] = {}
+        pending: list[_Mark] = []
+        cursor = 0
+        matched = False
+        for mark in marks:
+            pending.append(mark)
+            found = _first(keys, mark.key, cursor, headings)
+            if found is None:
+                found = _first(keys, mark.key, cursor, None)
+            if found is not None:
+                placed.setdefault(found, []).extend(pending)
+                pending = []
+                cursor = found + 1
+                matched = True
+        if pending:
+            placed.setdefault(len(blocks) if matched else 0, []).extend(pending)
+        return placed
+
+    def _mark(self, mark: _Mark) -> None:
+        """A bookmark opens a section: its path replaces the path, and no heading is under it yet."""
+        self.close()
+        self._bookmark_path = mark.path
+        self._heading = None
+        self.section += 1
+        self.outline.append({"level": min(len(mark.path), MAX_LEVEL), "title": mark.path[-1], "page": mark.page})
+
+    def _repeats(self, name: str) -> bool:
+        """Whether a heading's title is already in the path (the current heading, or any bookmark's title)."""
+        key = folded(name)
+        return any(folded(held) == key for held in self.path())
+
+    def _enter_heading(self, name: str, page: int) -> None:
+        """A heading opens a section: it replaces the heading under the bookmark path."""
+        self._heading = name
+        level = len(self._bookmark_path) + 1
+        self.outline.append({"level": min(level, MAX_LEVEL), "title": name, "page": page})
+        self.section += 1
+
+    # --- cutting
 
     def _join(self, page: int, needed: int) -> _Draft:
-        """The passage the next content of `needed` code points joins: the one being built when it fits, or one that
-        holds only its heading; else a new one that repeats the heading."""
+        """The passage the next content of `needed` code points joins: the one being built while it stays within its
+        cap (or holds nothing but its heading, or nothing at all); else a new one."""
         draft = self.current(page)
-        if draft is not None and (draft.heading_only or draft.size() + 1 + needed <= self.limit):
+        if draft is not None and (draft.heading_only or draft.empty() or draft.size() + 1 + needed <= self.cap(draft)):
             return draft
-        return self.open(page, opens=False)
+        return self._new(page)
 
     def _add(self, draft: _Draft, line: str, box: Box | None) -> None:
         draft.lines.append(line)
         draft.heading_only = False
+        self._filled = draft.section
         if box is not None:
             draft.boxes.append(box)
 
@@ -239,7 +420,7 @@ class PdfCutter(_Cutter):
             front, text = split(text, self._room(draft))
             if front:
                 self._add(draft, front, box)
-            draft = self.open(page, opens=False)
+            draft = self._new(page)
             if not text:
                 return
         self._add(draft, text, box)
@@ -251,7 +432,11 @@ class PdfCutter(_Cutter):
         if not whole:
             return
         if len(whole) <= self.fresh_room():
-            self._add(self._join(page, len(whole)), whole, box)
+            joined = self._join(page, len(whole))
+            if not joined.empty() and joined.size() + 1 + len(whole) > self.limit:
+                # Measured on the passage's own text, never on its leaf's length.
+                joined = self._new(page)
+            self._add(joined, whole, box)
             return
         rows = table_rows(block)
         header, body = (rows[0], rows[1:]) if rows else ("", [])
@@ -261,7 +446,7 @@ class PdfCutter(_Cutter):
             return
         draft = self.current(page)
         if draft is None or not draft.heading_only:
-            draft = self.open(page, opens=False)
+            draft = self._new(page)
         part = [header]
         for row in body:
             pieces = [row]
@@ -270,7 +455,7 @@ class PdfCutter(_Cutter):
             for piece in pieces:
                 if len(part) > 1 and self._room(draft) < len("\n".join(part)) + 1 + len(piece):
                     self._add(draft, "\n".join(part), box)
-                    draft = self.open(page, opens=False)
+                    draft = self._new(page)
                     part = [header]
                 part.append(piece)
         self._add(draft, "\n".join(part), box)
@@ -288,11 +473,26 @@ class PdfCutter(_Cutter):
         return pieces
 
 
+def _heading(block: Record) -> str | None:
+    """A heading block's title; None for any other block (a "heading" past `MAX_TITLE` is an ordinary block). Its
+    level only says that it is a heading."""
+    name = title(block.get("text"))
+    return name if type(block.get("headingLevel")) is int and name and len(name) <= MAX_TITLE else None
+
+
+def _first(keys: list[str], key: str, start: int, only: list[bool] | None) -> int | None:
+    """The first index from `start` whose key is `key` (among those `only` marks, when given)."""
+    for index in range(start, len(keys)):
+        if keys[index] == key and (only is None or only[index]):
+            return index
+    return None
+
+
 class TextCutter(_Cutter):
     """Passages of text page records (`text.py`'s shape)."""
 
-    def __init__(self, limit: int = PASSAGE_LIMIT) -> None:
-        super().__init__(limit)
+    def __init__(self, limit: int = PASSAGE_LIMIT, target: int = PASSAGE_TARGET) -> None:
+        super().__init__(limit, target)
         self._previous: list[str] = []
 
     def page(self, record: Record) -> None:
@@ -316,7 +516,8 @@ class TextCutter(_Cutter):
         self.close()
 
     def _paragraph(self, source: str, page: int, start: int, end: int, *, opens: bool) -> bool:
-        """A paragraph joins the passage being built while it fits, else starts one, cut where it passes the limit.
+        """A paragraph joins the passage being built while it stays within its cap (the limit for the passage that
+        opens its section, else the target), else starts one; a paragraph alone is cut where it passes the limit.
         Answers whether a passage opened next would still open its section (only the page's first can)."""
         draft = self._draft
         while start < end:
@@ -325,7 +526,8 @@ class TextCutter(_Cutter):
                 opens = False
             prefix = len(draft.prefix) + 1 if draft.prefix is not None else 0
             first = draft.start if draft.start >= 0 else start
-            if prefix + end - first <= self.limit:
+            cap = self.limit if draft.start < 0 or draft.opens else self.target
+            if prefix + end - first <= cap:
                 draft.start, draft.end = first, end
                 return opens
             if draft.start >= 0:
@@ -367,8 +569,28 @@ def _paragraphs(source: str) -> list[tuple[int, int]]:
     return found
 
 
-def cutter(pdf: bool, limit: int = PASSAGE_LIMIT) -> PdfCutter | TextCutter:
-    return PdfCutter(limit) if pdf else TextCutter(limit)
+def cutter(
+    pdf: bool, limit: int = PASSAGE_LIMIT, target: int = PASSAGE_TARGET, bookmarks: Sequence[Bookmark] = ()
+) -> PdfCutter | TextCutter:
+    return PdfCutter(limit, target, bookmarks) if pdf else TextCutter(limit, target)
+
+
+def read_bookmarks(path: Path, total: int) -> list[Bookmark]:
+    """The clean child's bookmarks, checked. A body that is not JSON, or not a list of objects, is `RecordsInvalid`; an
+    entry whose title is not text, whose depth is not an integer from 0, or whose page is not an integer within the
+    version's is dropped, and the others kept."""
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RecordsInvalid("unreadable") from error
+    if not isinstance(body, list) or not all(isinstance(item, dict) for item in body):
+        raise RecordsInvalid("bookmarks")
+    found = []
+    for item in body:
+        name, depth, page = item.get("title"), item.get("depth"), item.get("page")
+        if isinstance(name, str) and type(depth) is int and depth >= 0 and type(page) is int and 1 <= page <= total:
+            found.append(Bookmark(name, depth, page))
+    return found
 
 
 def read_records(path: Path, first: int, last: int, *, pdf: bool) -> list[Record]:

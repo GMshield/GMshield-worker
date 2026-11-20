@@ -27,10 +27,13 @@ size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in 
 - `text` (a TXT or Markdown upload): `text.py` splits it into pages of bounded length; the report gives the file back
   unchanged as the `original`, `pageTotal`, one `read_directly` range, its `texts` files, a page view `{page, text}`
   per page (no picture) and the `passages` step.
-- `passages` (Story 1.18; every text file of the version, named in the claim input's `texts` in page order): runs
-  in-process, with no child, since it reads only our own JSON. It downloads one text file at a time and feeds its
-  page records to `passages.py`, which carries the heading stack across files; the report gives the `passages`
-  (page, section path, text, boxes or range) and the `outline`.
+- `passages` (Story 1.18; every text file of the version, named in the claim input's `texts` in page order): cuts
+  in-process, since it reads only our own JSON. It downloads one text file at a time and feeds its page records to
+  `passages.py`, which carries the section across files; the report gives the `passages` (page, section path, text,
+  boxes or range) and the `outline`. From pipeline "7", a PDF's passages step whose claim input names the version's
+  cleaned `original` first downloads it and reads its bookmarks with `clean.py bookmarks` in the sandbox, so section
+  paths follow the file's own bookmarks; a child that fails or writes something else leaves no bookmarks (the paths
+  then come from the headings alone), and the original is deleted before the text files come.
 
 Before anything is downloaded, a step whose input names the chain's `pipelineVersion` checks it against this worker's:
 another one fails the step with `ingestion.pipeline_changed` and `retry: false`, and the backend restarts the chain.
@@ -89,6 +92,8 @@ MAX_IMAGES = 500
 # The input of a step over every text file of the version (Story 1.18), and the one file a passages step holds.
 TEXTS = "texts"
 TEXTS_FILE = "texts.json"
+# The file the clean child writes the original's bookmarks to, in a passages step (pipeline "7").
+BOOKMARKS_FILE = "bookmarks.json"
 UNIT = "worker.ingestion"
 SOURCE_FILE = "source.pdf"
 SOURCE_TEXT = "source.txt"
@@ -315,6 +320,8 @@ class StepInput:
     input_first_page: int | None
     texts: tuple[TextInput, ...] = ()
     images: tuple[ImageInput, ...] = ()
+    # A step over every text file: the input name of the version's cleaned original, when the backend names one.
+    original: str | None = None
 
     def pages(self) -> list[int]:
         if self.first_page is None or self.last_page is None:
@@ -361,7 +368,10 @@ def step_input(values: dict[str, Any]) -> StepInput:
             raise StepFailed(STEP_FAILED, retry=False)
     texts = _texts(values.get("texts"), total) if name == TEXTS else ()
     inputs = _images(values.get("inputs")) if name == IMAGES else ()
-    return StepInput(str(values.get("stage")), name, total, first, last, file_id, input_first, texts, inputs)
+    original = values.get("original") if name == TEXTS else None
+    if original is not None and (not isinstance(original, str) or not _INPUT_NAME.fullmatch(original)):
+        raise StepFailed(STEP_FAILED, retry=False)
+    return StepInput(str(values.get("stage")), name, total, first, last, file_id, input_first, texts, inputs, original)
 
 
 def _images(value: object) -> tuple[ImageInput, ...]:
@@ -808,10 +818,14 @@ class IngestionStep:
     def _passages(
         self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
     ) -> tuple[dict[str, Any], dict[str, int]]:
-        """Every text file of the version, one at a time, through one cutter: the heading stack crosses files."""
-        # An image set's pages are a PDF's once assembled (Story 1.21).
+        """Every text file of the version, one at a time, through one cutter: the section crosses files. A PDF's
+        bookmarks come first, from its cleaned original."""
+        # An image set's pages are a PDF's once assembled (Story 1.21); it has no bookmarks.
         pdf = job.input.get("format") in (PDF, IMAGE_SET)
-        cutter = passages.cutter(pdf)
+        bookmarks = []
+        if job.input.get("format") == PDF and checked.original is not None:
+            bookmarks = self._bookmarks(job, checked, cancel, folder, log)
+        cutter = passages.cutter(pdf, bookmarks=bookmarks)
         path = folder / TEXTS_FILE
         for item in checked.texts:
             size = self.files.download(job, item.name, path)
@@ -832,7 +846,54 @@ class IngestionStep:
             "outline": outline,
             "next": [],
         }
-        return result, {"texts": len(checked.texts), "passages": len(found), "sections": len(outline)}
+        return result, {
+            "texts": len(checked.texts),
+            "bookmarks": len(bookmarks),
+            "passages": len(found),
+            "sections": len(outline),
+        }
+
+    def _bookmarks(
+        self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
+    ) -> list[passages.Bookmark]:
+        """The cleaned original's bookmarks, read by the clean child in the sandbox. They are optional: a download
+        that fails, a sandbox that cannot start, a child that fails or a file that is not bookmarks each gives none
+        (logged `ingestion.bookmarks_unread` with its `reason`), so the passages keep the paths their headings give.
+        A cancel still ends the step."""
+        job_id = str(job.job_id)
+        source = folder / SOURCE_FILE
+        reason = "download"
+        try:
+            size = self.files.download(job, str(checked.original), source)
+            log.info("ingestion.input_downloaded", jobId=job_id, input="original", size=size)
+            _stop_if_cancelled(cancel)
+            reason = "sandbox"
+            child = self._child(
+                job,
+                CLEAN_SCRIPT,
+                [clean.BOOKMARKS, SOURCE_FILE, BOOKMARKS_FILE],
+                folder=folder,
+                log=log,
+                cancel=cancel,
+                deadline=self.deadline_seconds,
+            )
+            _stop_if_cancelled(cancel)
+            reason = "child"
+            if not _succeeded(child):
+                raise StepFailed(STEP_FAILED)
+            reason = "invalid"
+            path = _output(folder, BOOKMARKS_FILE)
+            found = passages.read_bookmarks(path, checked.page_total or 0)
+            path.unlink()
+        except (FileTransferError, httpx.HTTPError, OSError, sandbox.SandboxUnavailable, passages.RecordsInvalid,
+                StepFailed) as error:  # fmt: skip
+            if cancel.is_set():
+                raise StepFailed(STEP_FAILED) from error
+            log.warn("ingestion.bookmarks_unread", jobId=job_id, reason=reason, errorType=type(error).__name__)
+            return []
+        finally:
+            source.unlink(missing_ok=True)
+        return found
 
     # --- shared
 

@@ -73,7 +73,7 @@ lockfile and the production image:
 | `gmshield_worker/backend/` | the internal API: `client.py` (one client per request), `files.py` (a claimed job's input and output files, streamed), `contract.py` (minimum contract version), `generated/` (generated, not committed) |
 | `gmshield_worker/models/` | the one way to a model (Story 2.10): `providers.py` (the providers, the claim's `ModelChoice`, base URLs and keys), `chat.py` (`chat_model`: `ChatOpenAI`, `ChatAnthropic` or the fake), `output.py` (the uniform events, the citation markers, the typed failures), `fake.py` (the fake chat model); the only place a provider SDK is imported |
 | `gmshield_worker/lanes/` | the work lanes (Story 1.12): `consumer.py` (the loop both lanes share), `interactive.py`, `ingestion.py`, `renewal.py`, `streams.py` (Redis), `handlers.py` (handlers by kind), `answer.py` (Story 2.4's `question.answer`) and `batches.py` (its event batches), `probe.py`, `question.py` and `model_probe.py` (test mode only; Story 2.3's `test.question`, Story 2.10's `test.model`) |
-| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.21): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `images.py` (Pillow, pi-heif and pikepdf; Story 1.21), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
+| `gmshield_worker/ingestion/` | ingestion steps (Stories 1.15 to 1.21): `step.py` (the `ingestion` handler, dispatch on the stage), the stages' children `clean.py` (pikepdf), `images.py` (Pillow, pi-heif and pikepdf; Story 1.21), `triage.py` (pypdfium2), `layout.py` (Docling; pypdfium2 and Pillow for the page pictures), `ocr.py` (OpenCV, Docling and Tesseract) and `text.py` (standard library), `passages.py` (the in-process passages cutter; a PDF's bookmarks come from `clean.py bookmarks`), `sandbox.py` (the child's sandbox: environment, seccomp filter, deadline), `errors.py` (failure codes); `PIPELINE_VERSION` in `__init__.py` |
 | `gmshield_worker/retrieval/` | the index (Story 2.1): `recipe.py` (`INDEX_RECIPE`), `embedding.py` (embeddinggemma through Ollama), `keywords.py` (the keyed keyword vector), `store.py` (the Qdrant collection `passages`), `indexing.py` (the `index.change` and `index.removal` handlers); the search (Story 2.3): `search.py` (`find_passages`) |
 | `gmshield_worker/agents/` | the agents (Story 2.10): `graphs.py` (`compile_graph`, the only place a LangGraph graph is compiled; `AnswerWithTools`, the model-and-tools node), `tools.py` (`read_passages`, read-only under the job's grant) |
 | `contracts/internal.json` | the worker's copy of the backend's internal OpenAPI document |
@@ -187,7 +187,7 @@ lockfile and the production image:
   - Logs carry the job's trace id, the sizes, counts and times, and the child's and the worker's
     peak RSS (`childMaxRssKib`, `workerMaxRssKib`). A generated 1 GiB PDF is cleaned with a child
     peak under 512 MiB (`tests/test_clean.py`).
-- **Reading pages (Stories 1.16 and 1.17; `PIPELINE_VERSION` "3", now "6").** The clean report asks one `triage` step per
+- **Reading pages (Stories 1.16 and 1.17; `PIPELINE_VERSION` "3", now "7").** The clean report asks one `triage` step per
   batch. Triage (`triage.py`, pypdfium2) gives each page a layer: `text` when its text layer has at
   least 16 characters other than whitespace, unless it has fewer than 200 and one image covers at least
   half of the page, else `image`; its report gives the `layers`, one `layout` step per run of text pages,
@@ -219,9 +219,9 @@ lockfile and the production image:
   report end their `next` with `{"stage": "passages", "firstPage": 1, "lastPage": <pageTotal>, "input": "texts"}`:
   a step over every text file of the version, which the backend holds with no job until every page has an outcome.
   Its claim input names those files in page order (`texts: [{name: "text-<fileId>", firstPage, lastPage}]`). The
-  stage runs in-process, with no child (it reads only our own JSON): it downloads one text file at a time
-  (`GET …/inputs/text-<fileId>`) and feeds its page records to `passages.py`, which carries the heading stack across
-  files.
+  stage cuts in-process (it reads only our own JSON): it downloads one text file at a time
+  (`GET …/inputs/text-<fileId>`) and feeds its page records to `passages.py`, which carries the section across files
+  (from pipeline "7", a PDF's bookmarks come first; see below).
   - PDF records: blocks in reading order; a heading block (`headingLevel` set) closes the open sections at its level
     or deeper and opens its own; the section path is the open headings, outermost first, and every heading with text
     is an outline entry `{level, title, page}`. Text records: `headingPath` is the section path, and each heading a
@@ -236,6 +236,24 @@ lockfile and the production image:
   - The report gives `passages: [{page, sectionPath, text, boxes | range}]` in reading order (`boxes`: the blocks'
     boxes on the page; `range`: `[start, end)` in code points of the page's text) and `outline`. The backend mints
     the passage ids and stores both encrypted; a version with no text file (every page unreadable) reports none.
+  - **Since `PIPELINE_VERSION` "7" (the retrieval-quality fix).** It reaches new uploads only: an accepted version
+    keeps the passages and paths pipeline "6" gave it (AD-15) until its material is uploaded again. Docling ranks
+    heading styles per batch and per page retry, so its levels no longer nest headings. When the claim input of a PDF's passages step names the version's
+    cleaned original (`original: "original"`; backends that serve it to a `texts` step), the step downloads it and
+    runs `clean.py bookmarks` in the sandbox, which writes the outline as `[{title, depth, page}]` (depth from 0, page
+    from 1; named destinations resolved; an entry whose page does not resolve, or with no title, dropped and its
+    children lifted; the document-title root dropped when it is the only entry at depth 0). The original is deleted
+    before the text files come; a child that fails leaves no bookmarks (`ingestion.bookmarks_unread`), and the paths
+    then come from the headings alone. A PDF passage's section path is the path of the last bookmark entered, plus
+    the last Docling heading after it: every heading replaces the one before it, and a heading whose title is already
+    in the path (the current heading, or any bookmark's title; compared after NFKC, casefold, and punctuation and
+    whitespace as one space) is read as an ordinary block. A bookmark is entered on its page just before the first
+    block that carries its title (a heading first), else with the next bookmark of its page that matches, else at
+    the page's start (none of the page's matches) or end. The outline lists every bookmark (level: its depth from 1)
+    and every heading kept (one level under its bookmark path). A new passage starts at every bookmark and heading;
+    blocks join a passage only while it stays within `PASSAGE_TARGET` (1,200 code points), except the passage that
+    opens its section, which joins up to the 3,000 limit (a stat block stays whole); a single larger block is a
+    passage of its own. Text pages join their paragraphs by the same rule. Tables keep their rules.
 - **Page views (Story 1.19, `PIPELINE_VERSION` "5", backend contract 1.5.0 or later).** Every page a reading child
   reads gets a page view in its step's report, `pageViews: [{page, picture: {fileId, width, height}, lines: [{text,
   box}]}]`, or for a text page `{page, text}`. A page whose child fails, crashes or times out gets none.
@@ -291,7 +309,10 @@ lockfile and the production image:
     embedded with the same title and split again if refused, at most 4 times deep, and its vector is the L2-normalized
     mean of its parts: nothing is cut silently. The keyword vector folds the text (NFKC, casefold, diacritics stripped),
     takes its Unicode word tokens and numbers each by the first 4 bytes, big-endian, of HMAC-SHA256 under the owner's
-    `tokenKey`, valued by its count; Qdrant applies the `idf` modifier. Each passage is upserted as one point (id: the
+    `tokenKey`, valued by BM25's term weight `tf·(k1+1) / (tf + k1·(1 - b + b·L/AVG))` (k1 = 1.2, b = 0.75, L the
+    passage's token count, AVG = 250, a fixed, corpus-independent average) under index recipe "2"; under "1" each
+    token was valued by its count. Qdrant applies the `idf` modifier. While a deploy's recipe "2" re-indexes, the
+    points still under "1" carry raw counts, so a search may mix the two weightings until every source is re-indexed. Each passage is upserted as one point (id: the
     passage id; vectors `dense` and `sparse`; payload exactly `{owner, source, kind, page, language}`). The result is
     `{indexRecipe, points}`.
   - The collection `passages` is created when missing: `dense` (768, cosine), `sparse` (`idf`), a tenant keyword index
@@ -323,8 +344,8 @@ lockfile and the production image:
   2.10), never with the input; nothing here calls a model.
   - When no tier has a source the answer is an empty list, with no embedding, no Qdrant query and no passages call.
   - The question is embedded as at indexing (`embeddinggemma:300m`, `truncate: false`, normalized) under the query
-    prompt `task: search result | query: {question}`; its keyword vector is `keyword_vector(question, tokenKey)`. The
-    index recipe does not change.
+    prompt `task: search result | query: {question}`; its keyword vector is `query_vector(question, tokenKey)`, the
+    same token numbers each valued 1. The query side is not part of the index recipe.
   - Per tier with sources, one `query_points` call: a dense and a sparse prefetch (40 each) fused by Qdrant's RRF
     (`FusionQuery(Fusion.RRF)`), 8 points, the filter `owner == the job's owner AND source IN the tier's sources` on
     the query and on each prefetch. A question with no keyword token has no sparse prefetch. No payload or vector is
