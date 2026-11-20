@@ -686,6 +686,22 @@ def test_a_tier_with_no_source_issues_no_query(stand_in: StandIn, indexed: Libra
     assert_filtered(indexed.spy.queries[-1], [SRD])
 
 
+def test_the_sparse_prefetch_queries_each_distinct_question_token_once(stand_in: StandIn, indexed: Library) -> None:
+    # "de" is three times in the question: its query value is still 1 (the passage side carries the BM25 weights).
+    serve_fixtures(stand_in)
+    asked = QUESTIONS["q-pt-fireball"].question
+    assert keywords.tokens(asked).count("de") == 3
+
+    ask(stand_in, indexed, asked, [tier("system", [SRD, PT])])
+
+    [sparse] = [prefetch for prefetch in indexed.spy.queries[-1]["prefetch"] if prefetch.using == "sparse"]
+    expected = keywords.query_vector(asked, KEY)
+    assert sparse.query.indices == expected.indices
+    assert sparse.query.indices == sorted({keywords.token_number(KEY, token) for token in keywords.tokens(asked)})
+    assert all(math.isclose(value, 1.0) for value in sparse.query.values)
+    assert len(sparse.query.values) == len(expected.indices)
+
+
 def test_a_refusal_of_the_backend_fails_the_job_with_its_code_and_no_retry(stand_in: StandIn, indexed: Library) -> None:
     serve_fixtures(stand_in)
     stand_in.passages_status = 403
@@ -926,7 +942,8 @@ def test_ranking_compares_plain_tokens_and_never_computes_an_hmac(monkeypatch: p
 
     monkeypatch.setattr(keywords, "token_number", refused)
     monkeypatch.setattr(keywords, "keyword_vector", refused)
-    monkeypatch.setattr(search, "keyword_vector", refused)
+    monkeypatch.setattr(keywords, "query_vector", refused)
+    monkeypatch.setattr(search, "query_vector", refused)
     ids = [str(uuid.uuid4()) for _ in range(300)]
     texts = {
         item: f"texto {index} sobre a espada vorpal" if index % 7 == 0 else f"texto {index}"

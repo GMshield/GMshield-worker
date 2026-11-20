@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import Any
 
 import pikepdf
 from pikepdf import Array, Dictionary, Name, Pdf, String
@@ -155,6 +156,74 @@ def linked(path: Path, page_count: int) -> Path:
     last.Annots = Array([_link(pdf, Dictionary(S=Name.GoTo, D=Array([first, Name.Fit])))])
     pdf.save(path)
     return path
+
+
+type Entry = tuple[str, dict[str, Any], list["Entry"]]
+
+
+def _outline(pdf: Pdf, parent: Dictionary, entries: list[Entry]) -> None:
+    """`entries` as `parent`'s children: each a dictionary with its title, its own keys, and its children."""
+    items = [pdf.make_indirect(Dictionary(Title=String(title), Parent=parent, **keys)) for title, keys, _ in entries]
+    for index, item in enumerate(items):
+        if index:
+            item.Prev = items[index - 1]
+        if index + 1 < len(items):
+            item.Next = items[index + 1]
+        _outline(pdf, item, entries[index][2])
+    if items:
+        parent.First, parent.Last, parent.Count = items[0], items[-1], len(items)
+
+
+def outlined(path: Path, page_count: int = 6, *, loop: bool = False) -> Path:
+    """`page_count` pages (at least 5) under bookmarks of every form clean reads: a document-title root over an
+    explicit destination, a named one (`/Dests`), a named one in the `/Names` name tree (a dictionary with `/D`), an
+    entry to a page outside the file whose child is a GoTo action, an entry with no title, a GoTo to a name that is
+    not there, and a page index. With `loop`, the last top entry's `/Next` leads back to the first."""
+    pdf = pages(page_count)
+    page = [item.obj for item in pdf.pages]
+    stray = pdf.make_indirect(Dictionary(Type=Name.Page))
+    pdf.Root.Dests = Dictionary(S11=Array([page[1], Name.Fit]))
+    tree = pikepdf.NameTree.new(pdf)
+    tree["s12"] = Dictionary(D=Array([page[2], Name.XYZ, 0, 100, 0]))
+    pdf.Root.Names = Dictionary(Dests=tree.obj)
+    outlines = pdf.make_indirect(Dictionary(Type=Name.Outlines))
+    pdf.Root.Outlines = outlines
+    goto = Dictionary(S=Name.GoTo, D=Array([page[3], Name.Fit]))
+    _outline(
+        pdf,
+        outlines,
+        [
+            (
+                "Book  Title",
+                {"Dest": Array([page[0], Name.Fit])},
+                [
+                    (
+                        "Chapter 1",
+                        {"Dest": Array([page[0], Name.Fit])},
+                        [("Section 1.1", {"Dest": Name.S11}, []), ("Section 1.2", {"Dest": String("s12")}, [])],
+                    ),
+                    ("Broken", {"Dest": Array([stray, Name.Fit])}, [("Orphan", {"A": goto}, [])]),
+                    ("  ", {"Dest": Array([page[1], Name.Fit])}, []),
+                    ("Chapter 2", {"A": Dictionary(S=Name.GoTo, D=String("missing"))}, []),
+                    ("Chapter 3", {"Dest": Array([4, Name.Fit])}, []),
+                ],
+            )
+        ],
+    )
+    if loop:
+        root = outlines.First
+        root.Last.Next = root.First
+    pdf.save(path)
+    return path
+
+
+OUTLINED_BOOKMARKS = [
+    {"title": "Chapter 1", "depth": 0, "page": 1},
+    {"title": "Section 1.1", "depth": 1, "page": 2},
+    {"title": "Section 1.2", "depth": 1, "page": 3},
+    {"title": "Orphan", "depth": 0, "page": 4},
+    {"title": "Chapter 3", "depth": 0, "page": 5},
+]
 
 
 def large(path: Path, *, pages_count: int, image_bytes: int) -> Path:
