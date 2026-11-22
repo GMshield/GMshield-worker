@@ -396,7 +396,7 @@ def test_the_probe_stops_when_cancelled_and_refuses_bad_input() -> None:
 
 
 def test_ingestion_runs_in_every_mode_and_the_probes_in_test_mode_only() -> None:
-    always = {"index.change", "index.removal", "question.answer"}
+    always = {"index.change", "index.removal", "question.answer", "library.search"}
     assert set(handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))) == {
         "ingestion",
         "probe",
@@ -477,6 +477,7 @@ def test_build_lanes_puts_the_interactive_lane_first_with_its_capacity() -> None
         "index.change",
         "index.removal",
         "question.answer",
+        "library.search",
     }
     # Story 2.10: every claim states the providers; test mode states all three.
     assert first.api is second.api
