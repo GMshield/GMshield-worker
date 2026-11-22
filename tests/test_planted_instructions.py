@@ -13,7 +13,9 @@ structure the real model's run by hand relies on (`docs/_bmad-output/implementat
   (Story 3.8);
 - the worker calls only the passages, events and outcome routes, reading only the handed ids;
 - the answer lane hands the model no tool, and the model probe only `read_passages`, which only reads;
-- no line of the planted material, and not the question, reaches the logs.
+- no line of the planted material, and not the question, reaches the logs;
+- Story 3.10: the planted text as an earlier turn's question and answer stays escaped data inside the same delimiter
+  (one `<passage>` per passage still, one `</documents>`), never in the system message, and its ids are never cited.
 
 The planted file holds no `fake:` directive: the fake model would read it from any user text."""
 
@@ -285,6 +287,68 @@ def assert_user_turn(user: str, question: str) -> None:
     assert f'&lt;passage id="{FOREIGN}"' in user
     assert "&lt;script&gt;" in user
     assert user.endswith(f"<question>{escape(question)}</question>")
+
+
+def test_planted_text_in_an_earlier_turn_stays_escaped_data_inside_the_delimiter() -> None:
+    planted = "\n".join(planted_texts())
+    handed = [search.Handed(item.passage_id, "campaign", item.page, item.text, item.section_path) for item in PASSAGES]
+    history = [search.EarlierTurn(planted[:4000], planted[-4000:]), search.EarlierTurn(QUESTIONS[0], planted[:4000])]
+
+    user = answer.user_turn(handed, QUESTIONS[1], history)
+
+    # The passages are as without history: one element each, the break-outs escaped.
+    assert user.count("<passage ") == len(PASSAGES)
+    assert user.count("</passage>") == len(PASSAGES)
+    # Two earlier turns, each one element, their planted break-outs escaped too.
+    assert user.count("<earlier-turn>") == 2
+    assert user.count("</earlier-turn>") == 2
+    assert user.count("<answer>") == 2
+    assert user.count("<question>") == 3
+    assert user.count(answer.DOCUMENTS_OPEN) == 1
+    assert user.count("<documents>") == 1
+    assert user.count("</documents>") == 1
+    closed = user.index(answer.DOCUMENTS_CLOSE)
+    assert user.rindex("</earlier-turn>") < user.index("<passage ") < closed < user.rindex("<question>")
+    assert user.endswith(f"<question>{escape(QUESTIONS[1])}</question>")
+    for text in planted_texts():
+        assert text not in answer.system_prompt(False, True)
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_planted_text_in_history_is_never_cited_nor_obeyed(
+    stand_in: StandIn, library: QdrantClient, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    seen: list[list[BaseMessage]] = []
+
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Iterator[Any]:
+            seen.append(list(messages))
+            yield from super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Recording(provider=choice.provider))
+    serve(stand_in)
+    planted = "\n".join(planted_texts())
+    job_input = {
+        "question": QUESTIONS[0],
+        "owner": OWNER,
+        "tiers": [{"tier": "campaign", "sources": [PLANTED_SOURCE], "pending": []}],
+        "tokenKey": base64.b64encode(KEY).decode(),
+        "history": [{"question": planted[:4000], "answer": planted[-4000:]}],
+    }
+    job_id = stand_in.offer(answer.KIND, job_input, new_trace_id(), model=model_of(provider))
+    claim = JobsApi(stand_in.url, CREDENTIAL, providers=PROVIDERS).claim(UUID(job_id), new_trace_id())
+    assert claim.job is not None
+
+    assert run_answer(stand_in, library, claim.job) == Outcome.done()
+
+    system = [message for message in seen[0] if isinstance(message, SystemMessage)]
+    assert [message.content for message in system] == [answer.system_prompt(False, True)]
+    events = [event for batch in stand_in.batches.get(str(claim.job.job_id), []) for event in batch["events"]]
+    text = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert CANARY not in text
+    cited = [event["passageId"] for event in events if event["type"] == "citation"]
+    assert set(cited) <= set(PLANTED_IDS)
+    assert FOREIGN not in cited
 
 
 @pytest.mark.parametrize("case", list(itertools.product(QUESTIONS, PROVIDERS)), ids=str)

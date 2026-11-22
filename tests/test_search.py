@@ -896,6 +896,18 @@ def test_an_unrecorded_question_fails_the_test(stand_in: StandIn, indexed: Libra
         {"modelKnowledge": "true"},
         {"modelKnowledge": 1},
         {"modelKnowledge": None},
+        # Story 3.10: history, when present, is at most 6 earlier turns of exactly a question and an answer.
+        {"history": None},
+        {"history": {"question": "x", "answer": "y"}},
+        {"history": [{"question": "x", "answer": "y"}] * 7},
+        {"history": [{"question": "x"}]},
+        {"history": [{"question": "x", "answer": "y", "id": "z"}]},
+        {"history": [{"question": "", "answer": "y"}]},
+        {"history": [{"question": "x" * 4001, "answer": "y"}]},
+        {"history": [{"question": "x", "answer": "y" * 4001}]},
+        {"history": [{"question": 1, "answer": "y"}]},
+        {"history": [{"question": "x", "answer": None}]},
+        {"history": ["x"]},
     ],
 )
 def test_an_input_that_is_not_the_backends_fails_without_a_retry(
@@ -909,6 +921,25 @@ def test_an_input_that_is_not_the_backends_fails_without_a_retry(
     )(job, threading.Event())
 
     assert outcome == Outcome.failed("retrieval.input_invalid", retry=False)
+
+
+def test_history_is_read_oldest_first_absent_is_none_and_a_search_input_carries_none() -> None:
+    raw = question_input("Vorpal Sword", [tier("system", [SRD])])
+    assert search.question_input(raw).history == ()
+    assert search.question_input({**raw, "history": []}).history == ()
+    earlier = [{"question": "Primeira?", "answer": ""}, {"question": "Segunda?", "answer": "😀" * 4000}]
+    checked = search.question_input({**raw, "history": earlier})
+    assert [(turn.question, turn.answer) for turn in checked.history] == [
+        ("Primeira?", ""),
+        ("Segunda?", "😀" * 4000),
+    ]
+    # Never printed, and the search reads the question alone.
+    assert "Primeira" not in repr(checked)
+    assert checked.question == "Vorpal Sword"
+    query = {**raw, "query": raw.pop("question")}
+    assert search.question_input(query, field="query").history == ()
+    with pytest.raises(search.InputInvalid):
+        search.question_input({**query, "history": []}, field="query")
 
 
 def test_model_knowledge_is_read_from_the_input_and_absent_is_off() -> None:
