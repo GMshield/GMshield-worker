@@ -891,6 +891,10 @@ def test_an_unrecorded_question_fails_the_test(stand_in: StandIn, indexed: Libra
         {"tiers": [tier("system", [SRD, SRD])]},
         {"tiers": [{"tier": "system", "sources": [SRD]}]},
         {"tiers": None},
+        # Story 3.8: modelKnowledge, when present, is a boolean.
+        {"modelKnowledge": "true"},
+        {"modelKnowledge": 1},
+        {"modelKnowledge": None},
     ],
 )
 def test_an_input_that_is_not_the_backends_fails_without_a_retry(
@@ -904,6 +908,13 @@ def test_an_input_that_is_not_the_backends_fails_without_a_retry(
     )(job, threading.Event())
 
     assert outcome == Outcome.failed("retrieval.input_invalid", retry=False)
+
+
+def test_model_knowledge_is_read_from_the_input_and_absent_is_off() -> None:
+    raw = question_input("Vorpal Sword", [tier("system", [SRD])])
+    assert search.question_input(raw).model_knowledge is False
+    assert search.question_input({**raw, "modelKnowledge": False}).model_knowledge is False
+    assert search.question_input({**raw, "modelKnowledge": True}).model_knowledge is True
 
 
 def test_the_handed_over_ids_are_logged_never_the_question_a_text_or_the_key(

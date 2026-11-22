@@ -14,6 +14,10 @@
    never worked out here. When passages of different tiers disagree, the instructions ask for the campaign's version
    first, then each other tier's as an alternative, each paragraph opened by `[[tier:<tier>]]`; only a tier of a
    handed passage becomes a tier mark (`CitationMarkers.give_tiers`), any other is removed.
+   Story 3.8: only when the input's `modelKnowledge` is true, the system message adds `MODEL_KNOWLEDGE_RULE` (a
+   statement not drawn from the passages only in its own paragraph opened by `[[tier:model]]`, with no citation) and
+   `model` is given as a tier; when it is false the prompt forbids the model's own knowledge as before, and a
+   `[[tier:model]]` the model writes anyway is removed and emits nothing.
 4. Every event goes to an `EventBatcher` as it comes, which posts numbered batches to the backend; the final batch is
    flushed before the outcome.
 5. The GM's stop (Story 2.6): once a batch's answer says `stop`, the model stream is closed before its next chunk
@@ -45,7 +49,7 @@ from gmshield_worker.backend.client import ClaimedJob, Outcome
 from gmshield_worker.lanes.batches import BATCH_INTERVAL_SECONDS, MAX_EVENTS, EventBatcher, EventPoster
 from gmshield_worker.log import TraceLog
 from gmshield_worker.models.chat import chat_model
-from gmshield_worker.models.output import UNAVAILABLE, CitationMarkers
+from gmshield_worker.models.output import MODEL_TIER, UNAVAILABLE, CitationMarkers
 from gmshield_worker.models.providers import ModelChoice, ProviderUnavailable
 from gmshield_worker.retrieval import search
 from gmshield_worker.retrieval.embedding import Embedder
@@ -78,6 +82,25 @@ SYSTEM_PROMPT = (
     "Answer in the language of the question. "
     "If the passages do not answer the question, say so in one sentence and add nothing else."
 )
+# Story 3.8: added after `SYSTEM_PROMPT` only when the turn's model knowledge is on (the input's `modelKnowledge`), so
+# the prompt is fixed for each value of the switch. Instructions only, like the rest: no account data, no library text.
+MODEL_KNOWLEDGE_RULE = (
+    "The GM has turned on model knowledge, which changes three of the rules above: answering only from the passages "
+    "and not your own knowledge, writing no [[tier:...]] marker when only one tier speaks, and saying in one sentence "
+    "that the passages do not answer. You may add what you know beyond the passages, but only in a paragraph of its "
+    "own that starts with [[tier:model]] and has no [[<passage id>]] in it. "
+    "Write that paragraph after everything drawn from the passages, and write [[tier:model]] even when you write no "
+    "other [[tier:...]] marker. Never put a statement that is not drawn from a passage anywhere else, and keep the "
+    "[[<passage id>]] after each statement drawn from a passage. "
+    "If the passages do not answer the question, write only the [[tier:model]] paragraph, without a sentence saying "
+    "that the passages do not answer. Only when you know nothing reliable to add either, say in one sentence that the "
+    "passages do not answer the question, and add nothing else."
+)
+
+
+def system_prompt(model_knowledge: bool) -> str:
+    """The system message: `SYSTEM_PROMPT`, then `MODEL_KNOWLEDGE_RULE` only when model knowledge is on."""
+    return f"{SYSTEM_PROMPT} {MODEL_KNOWLEDGE_RULE}" if model_knowledge else SYSTEM_PROMPT
 
 
 class AnswerRoutes(search.PassageReader, EventPoster, Protocol):
@@ -125,7 +148,12 @@ class AnswerJob:
         markers = CitationMarkers()
         markers.give(item.passage_id for item in handed)
         markers.give_tiers(item.tier for item in handed)
-        messages = [SystemMessage(SYSTEM_PROMPT), HumanMessage(user_turn(handed, checked.question))]
+        if checked.model_knowledge:
+            markers.give_tiers([MODEL_TIER])
+        messages = [
+            SystemMessage(system_prompt(checked.model_knowledge)),
+            HumanMessage(user_turn(handed, checked.question)),
+        ]
         batcher = EventBatcher(self.api, job, cancel, log, interval=self.interval, max_events=self.max_events)
         node = AnswerWithTools(
             model=model,
@@ -142,6 +170,7 @@ class AnswerJob:
             model=choice.model,
             tier=choice.tier,
             passages=len(handed),
+            modelKnowledge=checked.model_knowledge,
             searchSeconds=round(searched - started, 3),
         )
         batcher.start()

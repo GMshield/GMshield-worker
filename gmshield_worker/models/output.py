@@ -10,7 +10,8 @@ hands its events, in order, to `emit`:
 - `TierMark(tier, offset)` (Story 3.7): the model wrote `[[tier:<word>]]` to open one tier's version of the answer
   (the sources disagree); the offset is where the marker stood. Only a tier of a passage handed to the model
   (`CitationMarkers.give_tiers`, copied from the backend's label, never worked out here) is kept: any other word is
-  removed and marks nothing;
+  removed and marks nothing. Story 3.8: `model` (`MODEL_TIER`) opens a part from the model's own knowledge, and is
+  given only when the turn's model knowledge is on; otherwise a `[[tier:model]]` is removed like any other word;
 - `Usage(call_id, response_id, input, cache_read, cache_write, output, reasoning, estimated)`, once per call, from the
   model's `usage_metadata`. Input includes the cache reads and writes, output includes the reasoning, as LangChain
   counts them. A call stopped before the provider sent its usage reports an estimate instead (`estimated=True`, Story
@@ -71,6 +72,8 @@ MAX_MARKER_ID = 64
 _MARKER_ID = re.compile(r"[A-Za-z0-9-]{1,64}", re.ASCII)
 # Story 3.7: `[[tier:<word>]]`, the word the tier as the backend writes it (any case).
 TIER_PREFIX = "tier:"
+# Story 3.8: the tier word of a part from the model's own knowledge, never a passage's tier.
+MODEL_TIER = "model"
 _TIER_MARKER = re.compile(r"tier:([a-z]{1,16})", re.ASCII | re.IGNORECASE)
 # What may still become a marker once more text arrives: the id (or the tier marker) so far, and perhaps the first
 # closing bracket.
@@ -106,8 +109,8 @@ class Citation:
 
 @dataclass(frozen=True)
 class TierMark:
-    """A handed passage's tier (Story 3.7): that tier's version of the answer starts at this code-point offset of the
-    display text."""
+    """A handed passage's tier (Story 3.7), or `model` (Story 3.8): that tier's version of the answer, or the model's
+    own knowledge, starts at this code-point offset of the display text."""
 
     tier: str
     offset: int
@@ -172,7 +175,8 @@ class CitationMarkers:
             self._given.setdefault(passage_id.lower(), passage_id)
 
     def give_tiers(self, tiers: Iterable[str]) -> None:
-        """The tiers of the passages handed to the model, as the backend labelled them: only these may be marked."""
+        """The tiers of the passages handed to the model, as the backend labelled them, and `MODEL_TIER` when the
+        turn's model knowledge is on: only these may be marked."""
         self._tiers.update(tier.lower() for tier in tiers)
 
     def feed(self, text: str) -> list[StreamedEvent]:

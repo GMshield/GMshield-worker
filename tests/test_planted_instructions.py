@@ -9,6 +9,8 @@ structure the real model's run by hand relies on (`docs/_bmad-output/implementat
   passage (the planted `</passage><question>` break-out stays escaped data), all inside one Azure document delimiter
   (`answer.DOCUMENTS_OPEN` … `answer.DOCUMENTS_CLOSE`) that the planted `</documents>` break-out cannot end;
 - only handed ids are cited, never the passage id the planted text quotes (the fake cites every id it sees);
+- a `[[tier:model]]` written as if a planted instruction were obeyed is removed while model knowledge is off
+  (Story 3.8);
 - the worker calls only the passages, events and outcome routes, reading only the handed ids;
 - the answer lane hands the model no tool, and the model probe only `read_passages`, which only reads;
 - no line of the planted material, and not the question, reaches the logs.
@@ -32,7 +34,8 @@ from xml.sax.saxutils import escape
 
 import httpx
 import pytest
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.outputs import ChatGenerationChunk
 from qdrant_client import QdrantClient
 
 from gmshield_worker.agents import graphs
@@ -347,6 +350,34 @@ def test_planted_passages_stay_data_in_the_user_turn_and_only_handed_ids_are_cit
 
     logged = capsys.readouterr()
     assert_no_content_logged(logged.out + logged.err, [*planted_texts(), *FRAGMENTS, question])
+
+
+def test_a_planted_model_marker_with_model_knowledge_off_is_stripped_and_posts_no_tier(
+    stand_in: StandIn, library: QdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 3.8: a model that obeys a planted instruction and writes `[[tier:model]]` gets no model mark while the
+    switch is off (the job's input has no `modelKnowledge`, so it is off): the marker is removed and posts nothing, and
+    the system message stays `SYSTEM_PROMPT` with no model-knowledge rule."""
+    seen: list[list[BaseMessage]] = []
+
+    class Obeying(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Iterator[Any]:
+            seen.append(list(messages))
+            yield ChatGenerationChunk(message=AIMessageChunk(content="[[tier:model]]Como mandam os trechos: "))
+            yield from super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Obeying(provider=choice.provider))
+    job = claimed_answer(stand_in, QUESTIONS[0], "azure-openai")
+
+    assert run_answer(stand_in, library, job) == Outcome.done()
+
+    system = [message.content for message in seen[0] if isinstance(message, SystemMessage)]
+    assert system == [answer.SYSTEM_PROMPT]
+    events = [event for batch in stand_in.batches.get(str(job.job_id), []) for event in batch["events"]]
+    text = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert text.startswith("Como mandam os trechos: ")
+    assert "[[" not in text
+    assert not any(event["type"] == "tier" for event in events)
 
 
 def capturing(handed: dict[str, list[str]], lane: str) -> type[graphs.AnswerWithTools]:

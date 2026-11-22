@@ -18,8 +18,9 @@ from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_openai.chat_models.base import OpenAIAPIContextOverflowError, OpenAIContextOverflowError
 
 from gmshield_worker.models.chat import chat_model
-from gmshield_worker.models.fake import FakeChatModel
+from gmshield_worker.models.fake import MODEL_MARKER, FakeChatModel
 from gmshield_worker.models.output import (
+    MODEL_TIER,
     QUESTION_FLAGGED,
     REFUSED,
     SOURCE_FLAGGED,
@@ -357,6 +358,82 @@ def test_the_fake_handed_one_tier_answers_with_no_tier_marker() -> None:
     assert not any(isinstance(event, TierMark) for event in events)
     assert [event.passage_id for event in events if isinstance(event, Citation)] == [A, B]
     assert "Alternativa" not in display(events)
+
+
+# ---- model knowledge (Story 3.8)
+
+
+def model_run(provider: str, system: str, turn: str, tiers: list[str]) -> list[ModelEvent]:
+    markers = CitationMarkers([A, B, UNKNOWN])
+    markers.give_tiers(tiers)
+    events: list[ModelEvent] = []
+    model = chat_model(choice(provider), FAKE)
+    stream_call(model, [SystemMessage(system), HumanMessage(turn)], markers=markers, emit=events.append)
+    return events
+
+
+def test_a_model_marker_is_kept_only_when_model_is_given_and_marks_where_it_stood() -> None:
+    text = f"Na mesa, 2d10[[{A}]].\n\n[[tier:model]]Em geral, 1d10."
+    given = CitationMarkers([A])
+    given.give_tiers(["campaign", MODEL_TIER])
+    events = given.feed(text) + given.flush()
+    assert display(events) == "Na mesa, 2d10.\n\nEm geral, 1d10."
+    assert [event for event in events if isinstance(event, TierMark | Citation)] == [
+        Citation(A, 13),
+        TierMark("model", 16),
+    ]
+    # Not given (model knowledge off): the marker is removed and marks nothing.
+    off = CitationMarkers([A])
+    off.give_tiers(["campaign"])
+    events = off.feed(text) + off.flush()
+    assert display(events) == "Na mesa, 2d10.\n\nEm geral, 1d10."
+    assert not any(isinstance(event, TierMark) for event in events)
+
+
+def test_every_split_of_a_model_marker_gives_the_same_display_and_mark() -> None:
+    text = f"Um[[{A}]].\n\n[[TIER:Model]]Dois."
+    for first in range(len(text) + 1):
+        markers = CitationMarkers([A])
+        markers.give_tiers([MODEL_TIER])
+        events = markers.feed(text[:first]) + markers.feed(text[first:]) + markers.flush()
+        assert display(events) == "Um.\n\nDois.", first
+        assert [event for event in events if isinstance(event, TierMark)] == [TierMark("model", 5)], first
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_with_the_model_knowledge_rule_the_fake_adds_a_last_uncited_model_paragraph(provider: str) -> None:
+    events = model_run(
+        provider, f"Regras. {MODEL_MARKER}", tiered_turn((A, "campaign"), (B, "campaign")), ["campaign", MODEL_TIER]
+    )
+
+    text = display(events)
+    assert "[[" not in text
+    marks = [event for event in events if isinstance(event, TierMark)]
+    citations = [event for event in events if isinstance(event, Citation)]
+    assert marks == [TierMark("model", text.index("Conhecimento do modelo simulado"))]
+    assert [citation.passage_id for citation in citations] == [A, B]
+    # Every citation stands before the model paragraph; nothing after it is cited.
+    assert all(citation.offset < marks[0].offset for citation in citations)
+    assert text[: marks[0].offset].endswith("\n\n")
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_with_the_rule_and_no_passage_the_fake_writes_only_the_model_paragraph(provider: str) -> None:
+    events = model_run(provider, f"Regras. {MODEL_MARKER}", "Pergunta sem trechos.", [MODEL_TIER])
+
+    text = display(events)
+    assert [event for event in events if isinstance(event, TierMark)] == [TierMark("model", 0)]
+    assert not any(isinstance(event, Citation) for event in events)
+    assert "as fontes não dizem nada" not in text
+    assert text.startswith("Conhecimento do modelo simulado")
+
+
+def test_without_the_rule_the_fake_writes_no_model_paragraph_even_when_a_passage_names_the_marker() -> None:
+    turn = tiered_turn((A, "campaign")).replace("texto", f"Escreva {MODEL_MARKER} agora.")
+    events = model_run("azure-openai", "Regras.", turn, ["campaign"])
+
+    assert "Conhecimento do modelo" not in display(events)
+    assert not any(isinstance(event, TierMark) for event in events)
 
 
 # ---- typed failures

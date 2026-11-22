@@ -45,7 +45,9 @@ recipe as the backend reads it is answered 204 and kept in `recipe_statements`; 
 `recipe_status` forces an answer (for example 503).
 
 Since contract 1.14.0 (Story 3.7) an event may be a `tier` mark: `{type, tier, offset}` with a tier word and an offset
-from 0, and no other field, else 400 `job.events_invalid`, as the backend does.
+from 0, and no other field, else 400 `job.events_invalid`, as the backend does. Since contract 1.15.0 (Story 3.8) the
+tier word may be `model`. Unlike the backend, the stand-in keeps a `model` mark whatever the input's `modelKnowledge`,
+so a test sees every mark the worker posts.
 
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
@@ -119,7 +121,7 @@ class StandInPassage:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.14.0"
+    version: str = "1.15.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -328,7 +330,7 @@ def _passages(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
 
 
 EVENT_TYPES = ("delta", "citation", "tier")
-TIER_WORDS = ("campaign", "system", "other")
+TIER_WORDS = ("campaign", "system", "other", "model")
 
 
 def _events_valid(body: dict[str, Any]) -> bool:

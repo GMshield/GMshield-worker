@@ -8,7 +8,11 @@ Story 2.6: the GM's stop. Once a batch's answer says `stop`, the model stream is
 events, only the usage (an estimate when the provider sent none), and the outcome is `done`.
 
 Story 3.7: each passage block carries the backend's tier of that passage, in tier order; handed two tiers, the fake
-model's campaign version leads under a `tier` mark at 0 and the system's follows under its own mark."""
+model's campaign version leads under a `tier` mark at 0 and the system's follows under its own mark.
+
+Story 3.8: the system prompt has the model-knowledge rule only when the input's `modelKnowledge` is true (absent is
+false); then the fake adds an uncited paragraph under a `model` mark after the cited ones, or writes only that paragraph
+with no passage; off, a `[[tier:model]]` the model writes is removed and posts nothing."""
 
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ from uuid import UUID
 import pytest
 from langchain_core.exceptions import ModelConnectionError
 from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.outputs import ChatGenerationChunk
 
 from gmshield_worker.backend.client import ClaimedJob, EventsAnswer, JobsApi, Outcome
 from gmshield_worker.lanes import answer, batches
@@ -65,9 +70,19 @@ def model_of(provider: str) -> dict[str, str]:
     return {"provider": provider, "model": "model-of-" + provider, "tier": "full"}
 
 
-def claimed(stand_in: StandIn, text: str, tiers: list[dict[str, Any]], provider: str = "azure-openai") -> ClaimedJob:
+def claimed(
+    stand_in: StandIn,
+    text: str,
+    tiers: list[dict[str, Any]],
+    provider: str = "azure-openai",
+    *,
+    model_knowledge: bool | None = None,
+) -> ClaimedJob:
     serve_fixtures(stand_in)
-    job_id = stand_in.offer(answer.KIND, question_input(text, tiers), new_trace_id(), model=model_of(provider))
+    job_input = question_input(text, tiers)
+    if model_knowledge is not None:
+        job_input["modelKnowledge"] = model_knowledge
+    job_id = stand_in.offer(answer.KIND, job_input, new_trace_id(), model=model_of(provider))
     claim = JobsApi(stand_in.url, CREDENTIAL, providers=PROVIDERS).claim(UUID(job_id), new_trace_id())
     assert claim.job is not None, claim
     return claim.job
@@ -606,3 +621,116 @@ def test_handed_one_tier_the_answer_has_no_tier_mark(stand_in: StandIn, lib: Lib
     assert run(stand_in, lib, job) == Outcome.done()
 
     assert not any(event["type"] == "tier" for event in every_event(stand_in, job))
+
+
+# ---- Story 3.8: model knowledge only when I turn it on
+
+
+def recording(seen: list[list[BaseMessage]]) -> type[FakeChatModel]:
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
+            seen.append(list(messages))
+            return super()._stream(messages, *args, **kwargs)
+
+    return Recording
+
+
+@pytest.mark.parametrize("switch", [None, False, True])
+def test_the_system_prompt_has_the_model_knowledge_rule_only_when_the_switch_is_on(
+    stand_in: StandIn, lib: Library, monkeypatch: pytest.MonkeyPatch, switch: bool | None
+) -> None:
+    seen: list[list[BaseMessage]] = []
+    model = recording(seen)
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: model(provider=choice.provider))
+    job = claimed(stand_in, ASKED.question, [tier("system", [SRD, PT])], model_knowledge=switch)
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    system = [str(message.content) for message in seen[0] if isinstance(message, SystemMessage)]
+    if switch:
+        assert system == [f"{answer.SYSTEM_PROMPT} {answer.MODEL_KNOWLEDGE_RULE}"]
+    else:
+        assert system == [answer.SYSTEM_PROMPT]
+        assert "[[tier:model]]" not in answer.SYSTEM_PROMPT
+        assert "model knowledge" not in answer.SYSTEM_PROMPT.lower()
+    # The prompt is fixed for each value of the switch, and holds no account data and no library text.
+    assert answer.system_prompt(bool(switch)) == system[0]
+    for content in (OWNER, base64.b64encode(KEY).decode(), job.grant, ASKED.question, BY_KEY[ASKED.expected].text):
+        assert content not in answer.MODEL_KNOWLEDGE_RULE
+    assert "[[tier:model]]" in answer.MODEL_KNOWLEDGE_RULE
+    assert "[[tier:model]]" not in answer.SYSTEM_PROMPT
+
+
+def test_with_model_knowledge_on_the_cited_statements_keep_their_citations_and_a_model_mark_opens_the_last_paragraph(
+    stand_in: StandIn, lib: Library
+) -> None:
+    job = claimed(stand_in, ASKED.question, [tier("system", [SRD, PT])], model_knowledge=True)
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    events = every_event(stand_in, job)
+    text = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert "[[" not in text
+    marks = [event for event in events if event["type"] == "tier"]
+    assert marks == [{"type": "tier", "tier": "model", "offset": text.index("Conhecimento do modelo simulado")}]
+    cited = [event["offset"] for event in events if event["type"] == "citation"]
+    assert cited
+    assert all(offset < marks[0]["offset"] for offset in cited)
+    assert text.startswith("Resposta simulada (azure-openai)")
+
+
+def test_with_model_knowledge_on_and_nothing_handed_only_the_model_paragraph_is_posted(
+    stand_in: StandIn, lib: Library
+) -> None:
+    job = claimed(stand_in, ASKED.question, [tier("campaign", []), tier("system", [])], model_knowledge=True)
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    events = every_event(stand_in, job)
+    text = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert [event for event in events if event["type"] == "tier"] == [{"type": "tier", "tier": "model", "offset": 0}]
+    assert not any(event["type"] == "citation" for event in events)
+    assert "as fontes não dizem nada" not in text
+
+
+def test_with_model_knowledge_off_a_model_marker_the_model_writes_is_removed_and_posts_nothing(
+    stand_in: StandIn, lib: Library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Disobeying(FakeChatModel):
+        """A model that writes a model paragraph although its prompt forbids it."""
+
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
+            yield from super()._stream(messages, *args, **kwargs)
+            yield ChatGenerationChunk(message=AIMessageChunk(content="\n\n[[tier:model]]Em geral, 1d10."))
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Disobeying(provider=choice.provider))
+    for switch in (None, False):
+        job = claimed(stand_in, ASKED.question, [tier("system", [SRD, PT])], model_knowledge=switch)
+
+        assert run(stand_in, lib, job) == Outcome.done()
+
+        events = every_event(stand_in, job)
+        text = "".join(event["text"] for event in events if event["type"] == "delta")
+        assert text.endswith("\n\nEm geral, 1d10.")
+        assert "[[" not in text
+        assert not any(event["type"] == "tier" for event in events)
+
+
+def test_with_model_knowledge_on_and_two_tiers_that_disagree_the_marks_are_campaign_system_then_model(
+    stand_in: StandIn, lib: Library
+) -> None:
+    job = claimed(stand_in, ASKED.question, TIERED, model_knowledge=True)
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    events = every_event(stand_in, job)
+    text = "".join(event["text"] for event in events if event["type"] == "delta")
+    marks = [event for event in events if event["type"] == "tier"]
+    assert [mark["tier"] for mark in marks] == ["campaign", "system", "model"]
+    assert [mark["offset"] for mark in marks] == sorted(mark["offset"] for mark in marks)
+    model_at = marks[-1]["offset"]
+    assert text[model_at:].startswith("Conhecimento do modelo simulado")
+    # The model paragraph is last and uncited: every citation stands before it.
+    cited = [event["offset"] for event in events if event["type"] == "citation"]
+    assert cited
+    assert all(offset < model_at for offset in cited)

@@ -478,7 +478,7 @@ lockfile and the production image:
 
   - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
     `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4, 1.11.0 from Story 2.6, 1.13.0 from Story
-    3.5, 1.14.0 from Story 3.7).
+    3.5, 1.14.0 from Story 3.7, 1.15.0 from Story 3.8).
 - **The answer to a question (Story 2.4, `question.answer`, backend contract 1.10.0).** Registered in every mode
   (`lanes/answer.py`), on the interactive lane.
   - The claim's input is the backend's question input (`retrieval.search.question_input`; else
@@ -527,6 +527,22 @@ lockfile and the production image:
     scope. The fake model, handed passages of more than one tier, writes one paragraph per tier in tier order, each
     opened by its marker. Deploy order: the backend, then the frontend, then this worker (its minimum backend
     contract becomes 1.14.0).
+  - **Model knowledge only when the GM turns it on (Story 3.8, backend contract 1.15.0).** The question input's
+    `modelKnowledge` (the turn's frozen switch; absent reads as false, anything but a boolean is
+    `retrieval.input_invalid`) chooses the system message: `SYSTEM_PROMPT` alone when it is off, then
+    `SYSTEM_PROMPT` followed by the fixed `MODEL_KNOWLEDGE_RULE` when it is on (`lanes.answer.system_prompt`): a
+    statement not drawn from the passages may be added only in its own paragraph opened by `[[tier:model]]`, with no
+    `[[<passage id>]]`, after everything drawn from the passages, and every library statement keeps its citation;
+    when the passages do not answer, only that paragraph, with no sentence saying they do not. The rule holds no
+    account data and no library text. `model` (`output.MODEL_TIER`) is given to `CitationMarkers.give_tiers` only
+    when the switch is on, so with it off a `[[tier:model]]` is stripped and emits nothing; with it on the batcher
+    posts `{"type": "tier", "tier": "model", "offset"}`, which the backend stores only for a turn whose switch is on.
+    No worker safety net checks for unmarked statements: the prompt rule, and the fake-model, parser and backend
+    tests. The fake model, seeing `[[tier:model]]` in its system message, adds a final uncited paragraph under that
+    marker (only that paragraph when it was handed no passage). `answer.started` logs `modelKnowledge`. Deploy
+    order: the backend, then this worker (its minimum backend contract becomes 1.15.0; the old frontend cannot turn
+    the switch on, so nothing it can set is ignored), then the frontend, last so the switch only turns on once the
+    worker honours it.
   - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
 - **Text in a material is never an instruction (Story 2.8).** The passages go inside Azure's document delimiter
   (above); `tests/test_planted_instructions.py` pins the defences against one planted material,

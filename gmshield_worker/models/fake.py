@@ -9,7 +9,10 @@ Its answer is deterministic. It cites, with `[[<id>]]` markers, the passage ids 
 the user turn), streamed in small chunks so that markers split across them. Story 3.7: when the passages it was given
 carry more than one tier (the `tier="…"` of each block, the backend's label), it answers as the tiers disagreeing: one
 paragraph per tier in tier order (campaign, system, other), each opened by `[[tier:<tier>]]` and citing that tier's
-passages. Directives in a user turn change it:
+passages. Story 3.8: when its system message allows model knowledge (it holds `MODEL_MARKER`, which only
+`lanes.answer.MODEL_KNOWLEDGE_RULE` writes there), it adds a final paragraph opened by `[[tier:model]]`, with no
+citation; with no passage that paragraph is the whole answer, with no sources-are-silent sentence. Directives in a user
+turn change it:
 
 - `fake:refusal`: no text, the provider's refusal stop (`content_filter`, `refusal`);
 - `fake:outage`: the call fails before any chunk, as an unreachable provider does;
@@ -29,7 +32,7 @@ from typing import Any
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.exceptions import ModelConnectionError
 from langchain_core.language_models import BaseChatModel, LanguageModelInput
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.messages.tool import tool_call_chunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import Runnable
@@ -47,6 +50,8 @@ _PASSAGE_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 # A data block's id and tier, as `lanes.answer.user_turn` writes them.
 _TIERED = re.compile(r'<passage id="([0-9a-f-]{36})" tier="([a-z]+)"', re.ASCII)
 TIER_ORDER = ("campaign", "system", "other")
+# Story 3.8: the marker the model-knowledge rule names in the system message, and that opens the fake's model paragraph.
+MODEL_MARKER = "[[tier:model]]"
 _CHUNK = 7
 
 
@@ -59,11 +64,21 @@ def _digest(messages: Sequence[BaseMessage]) -> str:
     return hashlib.sha256(joined.encode()).hexdigest()[:24]
 
 
-def answer_text(provider: str, ids: Sequence[str], tiers: Mapping[str, str] | None = None) -> str:
+def answer_text(
+    provider: str, ids: Sequence[str], tiers: Mapping[str, str] | None = None, *, model_knowledge: bool = False
+) -> str:
     """The fake's answer: one cited statement per id, or the sources-are-silent sentence without any. With the ids of
-    more than one tier (`tiers`: id to tier), one paragraph per tier in tier order, each opened by its tier marker."""
+    more than one tier (`tiers`: id to tier), one paragraph per tier in tier order, each opened by its tier marker.
+    With `model_knowledge`, a last paragraph opened by `MODEL_MARKER`, uncited; with no id, only that paragraph."""
+    model = f"{MODEL_MARKER}Conhecimento do modelo simulado ({provider}): em geral, a regra vale assim."
     if not ids:
-        return f"Resposta simulada ({provider}): as fontes não dizem nada sobre isso."
+        return model if model_knowledge else f"Resposta simulada ({provider}): as fontes não dizem nada sobre isso."
+    sourced = _sourced_text(provider, ids, tiers)
+    return f"{sourced}\n\n{model}" if model_knowledge else sourced
+
+
+def _sourced_text(provider: str, ids: Sequence[str], tiers: Mapping[str, str] | None) -> str:
+    """The cited part of `answer_text`, as it says."""
     by_tier: dict[str, list[str]] = {}
     for passage_id in ids:
         by_tier.setdefault((tiers or {}).get(passage_id, ""), []).append(passage_id)
@@ -146,7 +161,12 @@ class FakeChatModel(BaseChatModel):
 
         given = " ".join(_text(message) for message in results) if results else asked
         tiers = {passage_id: tier for passage_id, tier in _TIERED.findall(given)}
-        text = answer_text(self.provider, list(dict.fromkeys(_PASSAGE_ID.findall(given))), tiers)
+        model_knowledge = any(
+            isinstance(message, SystemMessage) and MODEL_MARKER in _text(message) for message in messages
+        )
+        text = answer_text(
+            self.provider, list(dict.fromkeys(_PASSAGE_ID.findall(given))), tiers, model_knowledge=model_knowledge
+        )
         if REFUSAL in asked:
             text, stop_reason = "", "refusal" if anthropic else "content_filter"
         elif TRUNCATED in asked:
