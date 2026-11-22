@@ -19,6 +19,10 @@ turn change it:
 - `fake:truncated`: half the answer, then the provider's length stop (`length`, `max_tokens`);
 - `fake:tool`: when `read_passages` is bound and no tool result is in the conversation yet, a call of `read_passages`
   with the passage ids of the user turn; once the results are in, the answer cites them.
+
+Story 3.10: the earlier turns of a conversation (`<earlier-turn>` elements, as `lanes.answer.user_turn` writes them) are
+left out before anything is read from a user turn, so a directive or an id in an earlier question or answer neither
+changes the answer nor is cited: directives and cited ids come from the question and the passages only.
 """
 
 from __future__ import annotations
@@ -53,10 +57,27 @@ TIER_ORDER = ("campaign", "system", "other")
 # Story 3.8: the marker the model-knowledge rule names in the system message, and that opens the fake's model paragraph.
 MODEL_MARKER = "[[tier:model]]"
 _CHUNK = 7
+# Story 3.10: an earlier turn of the conversation, as `lanes.answer.user_turn` writes it (its text escaped inside).
+_EARLIER_OPEN = "<earlier-turn>"
+_EARLIER_CLOSE = "</earlier-turn>"
 
 
 def _text(message: BaseMessage) -> str:
     return message.content if isinstance(message.content, str) else str(message.text)
+
+
+def _without_history(text: str) -> str:
+    """The text without its earlier turns (Story 3.10): each `<earlier-turn>` element is cut out whole."""
+    kept: list[str] = []
+    start = 0
+    while (opened := text.find(_EARLIER_OPEN, start)) != -1:
+        closed = text.find(_EARLIER_CLOSE, opened)
+        if closed == -1:
+            break
+        kept.append(text[start:opened])
+        start = closed + len(_EARLIER_CLOSE)
+    kept.append(text[start:])
+    return "".join(kept)
 
 
 def _digest(messages: Sequence[BaseMessage]) -> str:
@@ -140,7 +161,7 @@ class FakeChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
         del stop, run_manager
-        asked = " ".join(_text(message) for message in messages if isinstance(message, HumanMessage))
+        asked = " ".join(_without_history(_text(message)) for message in messages if isinstance(message, HumanMessage))
         if OUTAGE in asked:
             raise ModelConnectionError("fake outage")
         results = [message for message in messages if isinstance(message, ToolMessage)]

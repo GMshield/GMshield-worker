@@ -4,7 +4,10 @@ The question input is the backend's (`Scopes.questionInput`), never computed her
 sources, pending}], tokenKey}`, the tiers in order (campaign, system, then other from internal contract 1.13.0, Story
 3.5; the backend works out each tier, the worker never does), `pending` the ids of the tier's passages
 that are not indexed yet (their index change has not ended, or it failed; the backend lists at most the first 5,000 of
-each tier), and `tokenKey` Base64 of the owner's 32-byte token key.
+each tier), and `tokenKey` Base64 of the owner's 32-byte token key. From internal contract 1.16.0 (Story 3.10) it may
+carry `history: [{question, answer}]`, the conversation's earlier turns oldest first (at most `MAX_HISTORY`, each answer
+at most `MAX_HISTORY_ANSWER` code points): checked here and handed to the model as data only (`lanes.answer`); the
+search below never reads it.
 
 1. When no tier has a source, nothing is asked of Ollama, Qdrant or the backend: the list is empty.
 2. The question is embedded with the indexing model under embeddinggemma's query prompt (`Embedder.embed_query`), and
@@ -82,6 +85,10 @@ PENDING_BUDGET_SECONDS = 1.5
 MAX_QUESTION = 4000
 # The longest search query, in code points (the backend's `Scopes.MAX_QUERY`, Story 3.9).
 MAX_QUERY = 500
+# Story 3.10: the most earlier turns a question input carries, and the longest earlier answer, in code points (the
+# backend's `Conversations.HISTORY_TURNS` and `HISTORY_ANSWER`).
+MAX_HISTORY = 6
+MAX_HISTORY_ANSWER = 4000
 INPUT_INVALID = "retrieval.input_invalid"
 EMBEDDING_UNAVAILABLE = "retrieval.embedding_unavailable"
 STORE_UNAVAILABLE = "retrieval.store_unavailable"
@@ -113,15 +120,27 @@ class TierScope:
 
 
 @dataclass(frozen=True)
+class EarlierTurn:
+    """An earlier turn of the question's conversation (Story 3.10): data for the model only, never searched with and
+    never a source. Its question and answer are never printed."""
+
+    question: str = field(repr=False)
+    answer: str = field(repr=False)
+
+
+@dataclass(frozen=True)
 class QuestionInput:
     """The checked question input. `model_knowledge` (Story 3.8, contract 1.15.0) is the turn's frozen switch: whether
-    the model may add its own knowledge, each such part under `[[tier:model]]`; absent from the input, it is off."""
+    the model may add its own knowledge, each such part under `[[tier:model]]`; absent from the input, it is off.
+    `history` (Story 3.10, contract 1.16.0) is the conversation's earlier turns, oldest first; absent, there is none.
+    Retrieval reads `question` alone."""
 
     owner: str
     tiers: tuple[TierScope, ...]
     question: str = field(repr=False)
     token_key: bytes = field(repr=False)
     model_knowledge: bool = False
+    history: tuple[EarlierTurn, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -171,9 +190,28 @@ def _tiers(value: object) -> tuple[TierScope, ...]:
     return tuple(found)
 
 
+def _history(value: object) -> tuple[EarlierTurn, ...]:
+    """The earlier turns (Story 3.10): a list of at most `MAX_HISTORY` objects of exactly `question` (1 to
+    `MAX_QUESTION` code points) and `answer` (0 to `MAX_HISTORY_ANSWER`), both strings."""
+    if not isinstance(value, list) or len(value) > MAX_HISTORY:
+        raise InputInvalid
+    found: list[EarlierTurn] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"question", "answer"}:
+            raise InputInvalid
+        question, earlier_answer = item["question"], item["answer"]
+        if not isinstance(question, str) or not 1 <= len(question) <= MAX_QUESTION:
+            raise InputInvalid
+        if not isinstance(earlier_answer, str) or len(earlier_answer) > MAX_HISTORY_ANSWER:
+            raise InputInvalid
+        found.append(EarlierTurn(question, earlier_answer))
+    return tuple(found)
+
+
 def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionInput:
     """The question input, checked; `InputInvalid` otherwise. With `field="query"` (Story 3.9) it is the backend's
-    search input instead: the same shape, its text (1 to `MAX_QUERY` code points) under `query`, kept as `question`."""
+    search input instead: the same shape, its text (1 to `MAX_QUERY` code points) under `query`, kept as `question`;
+    a search input carries no `history`."""
     if field not in ("question", "query"):
         raise ValueError(field)
     question = raw.get(field)
@@ -192,12 +230,15 @@ def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionI
     model_knowledge = raw.get("modelKnowledge", False)
     if not isinstance(model_knowledge, bool):
         raise InputInvalid
+    if field == "query" and "history" in raw:
+        raise InputInvalid
     return QuestionInput(
         owner=_uuid(raw.get("owner")),
         tiers=_tiers(raw.get("tiers")),
         question=question,
         token_key=key,
         model_knowledge=model_knowledge,
+        history=_history(raw["history"]) if "history" in raw else (),
     )
 
 
