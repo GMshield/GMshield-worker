@@ -478,7 +478,7 @@ lockfile and the production image:
 
   - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
     `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4, 1.11.0 from Story 2.6, 1.13.0 from Story
-    3.5).
+    3.5, 1.14.0 from Story 3.7).
 - **The answer to a question (Story 2.4, `question.answer`, backend contract 1.10.0).** Registered in every mode
   (`lanes/answer.py`), on the interactive lane.
   - The claim's input is the backend's question input (`retrieval.search.question_input`; else
@@ -489,7 +489,8 @@ lockfile and the production image:
     with `models.chat.chat_model(job.model)`. The `SystemMessage` holds instructions only: answer only from the
     passages, write `[[<passage id>]]` after each statement, answer in the question's language, and say so in one
     sentence when the passages do not answer. The one `HumanMessage` holds the passages as data blocks
-    (`<passage id="…" section="Magias > Fire Bolt">text</passage>`, XML-escaped) inside Azure's document delimiter
+    (`<passage id="…" tier="campaign" section="Magias > Fire Bolt">text</passage>`, XML-escaped, in the backend's
+    tier order) inside Azure's document delimiter
     (`""" <documents>` … `</documents> """`, sent to every provider; none when no passage was found), then
     `<question>…</question>`. Azure's Prompt Shields jailbreak check then reads only the question, so an
     instruction-like passage no longer blocks an honest question. The documents get Prompt Shields' indirect-attack
@@ -515,6 +516,17 @@ lockfile and the production image:
   - Deploy order for the prompt-filter codes (Story 2.8): the frontend before or with the worker. The frontend's
     change is backward compatible, while an older frontend shows `model.question_flagged` and `model.source_flagged`
     as an outage with "Tentar de novo".
+  - **The campaign's version leads (Story 3.7, backend contract 1.14.0).** Each block's `tier` is the backend's label
+    of that passage (`JobPassage.tier`, kept in `Handed.tier`), copied and never worked out here. `SYSTEM_PROMPT`
+    adds: when passages of different tiers disagree, state the campaign tier's version first, then each other tier's
+    as an alternative, each in its own paragraph opened by `[[tier:<tier>]]` (the leading campaign version included),
+    each statement keeping its `[[<passage id>]]`; when they agree or only one tier speaks, no tier marker.
+    `CitationMarkers` strips `[[tier:<word>]]` from the text and emits `TierMark(tier, offset)` only when the word is
+    the tier of a handed passage (`give_tiers`); any other word is dropped silently, like an unknown id. The batcher
+    posts it as `{"type": "tier", "tier", "offset"}`; the backend drops one whose tier has no source in the turn's
+    scope. The fake model, handed passages of more than one tier, writes one paragraph per tier in tier order, each
+    opened by its marker. Deploy order: the backend, then the frontend, then this worker (its minimum backend
+    contract becomes 1.14.0).
   - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
 - **Text in a material is never an instruction (Story 2.8).** The passages go inside Azure's document delimiter
   (above); `tests/test_planted_instructions.py` pins the defences against one planted material,

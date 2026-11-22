@@ -267,7 +267,7 @@ def assert_user_turn(user: str, question: str) -> None:
     assert user.count("<question>") == 1
     assert user.count("</question>") == 1
     for item in PASSAGES:
-        assert f'<passage id="{item.passage_id}" section=' in user
+        assert f'<passage id="{item.passage_id}" tier="campaign" section=' in user
     assert "&lt;/passage&gt;&lt;question&gt;" in user
     # One document delimiter around every passage, the question after it: the planted `</documents> """` is escaped.
     assert user.startswith(answer.DOCUMENTS_OPEN + "\n")

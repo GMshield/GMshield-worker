@@ -5,12 +5,16 @@ ids only, usage once. A late outage is never retried, an early one is; the syste
 user turn no account data.
 
 Story 2.6: the GM's stop. Once a batch's answer says `stop`, the model stream is closed, the batcher posts no more
-events, only the usage (an estimate when the provider sent none), and the outcome is `done`."""
+events, only the usage (an estimate when the provider sent none), and the outcome is `done`.
+
+Story 3.7: each passage block carries the backend's tier of that passage, in tier order; handed two tiers, the fake
+model's campaign version leads under a `tier` mark at 0 and the system's follows under its own mark."""
 
 from __future__ import annotations
 
 import base64
 import json
+import re
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -26,7 +30,7 @@ from gmshield_worker.lanes import answer, batches
 from gmshield_worker.log import TraceLog, new_trace_id
 from gmshield_worker.models import chat
 from gmshield_worker.models.fake import FakeChatModel
-from gmshield_worker.models.output import Citation, TextDelta, Usage
+from gmshield_worker.models.output import Citation, StreamedEvent, TextDelta, Usage
 from gmshield_worker.retrieval import search
 from gmshield_worker.settings import PROVIDERS, ModelKeys
 from tests import retrieval_fixtures
@@ -233,7 +237,7 @@ def test_the_system_prompt_holds_no_library_text_and_the_user_turn_no_account_da
     expected = BY_KEY[ASKED.expected]
     assert expected.text not in answer.SYSTEM_PROMPT
     user = str(human[0].content)
-    assert f'<passage id="{expected.passage_id}" section="' in user
+    assert f'<passage id="{expected.passage_id}" tier="system" section="' in user
     assert user.endswith(f"<question>{ASKED.question}</question>")
     for account in (OWNER, base64.b64encode(KEY).decode(), job.grant):
         assert account not in user
@@ -302,7 +306,7 @@ class Poster:
         self.first = threading.Event()
 
     def events(
-        self, job: ClaimedJob, batch: int, events: Sequence[TextDelta | Citation], usage: Sequence[Usage] = ()
+        self, job: ClaimedJob, batch: int, events: Sequence[StreamedEvent], usage: Sequence[Usage] = ()
     ) -> EventsAnswer:
         self.posted.append((batch, list(events), list(usage)))
         self.first.set()
@@ -423,7 +427,7 @@ class StoppingPoster(Poster):
         self.after = after
 
     def events(
-        self, job: ClaimedJob, batch: int, events: Sequence[TextDelta | Citation], usage: Sequence[Usage] = ()
+        self, job: ClaimedJob, batch: int, events: Sequence[StreamedEvent], usage: Sequence[Usage] = ()
     ) -> EventsAnswer:
         super().events(job, batch, events, usage)
         return EventsAnswer(status=200, stop=batch >= self.after)
@@ -532,3 +536,73 @@ def test_an_input_that_is_not_the_backends_a_claim_without_a_model_and_a_provide
 
 def test_chat_model_is_the_only_builder_the_answer_uses() -> None:
     assert vars(answer)["chat_model"] is chat.chat_model
+
+
+# ---- Story 3.7: the campaign's version leads
+
+TIERED = [tier("campaign", [PT]), tier("system", [SRD])]
+BLOCK = re.compile(r'<passage id="([0-9a-f-]{36})" tier="([a-z]+)" section=')
+
+
+def test_each_blocks_tier_is_the_backends_label_of_that_passage_in_tier_order(
+    stand_in: StandIn, lib: Library, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[list[BaseMessage]] = []
+
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
+            seen.append(list(messages))
+            return super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Recording(provider=choice.provider))
+    job = claimed(stand_in, ASKED.question, TIERED)
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    user = str(next(message for message in seen[0] if isinstance(message, HumanMessage)).content)
+    blocks = BLOCK.findall(user)
+    assert len(blocks) == user.count("<passage ")
+    # The backend (here its stand-in) labels each passage it serves with the tier whose sources hold it.
+    served = {
+        passage_id: "campaign" if stand_in.passages[passage_id].source == PT else "system" for passage_id, _ in blocks
+    }
+    assert blocks == [(passage_id, served[passage_id]) for passage_id, _ in blocks]
+    assert {block_tier for _, block_tier in blocks} == {"campaign", "system"}
+    tiers = [block_tier for _, block_tier in blocks]
+    assert tiers == sorted(tiers, key=["campaign", "system"].index)
+    assert "[[tier:<tier>]]" in answer.SYSTEM_PROMPT
+    assert "campaign tier's version first" in answer.SYSTEM_PROMPT
+
+
+def test_handed_two_tiers_the_fake_posts_a_campaign_mark_first_then_a_system_mark(
+    stand_in: StandIn, lib: Library
+) -> None:
+    job = claimed(stand_in, ASKED.question, TIERED)
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    events = every_event(stand_in, job)
+    text = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert "[[" not in text
+    marks = [event for event in events if event["type"] == "tier"]
+    assert marks == [{"type": "tier", "tier": "campaign", "offset": 0}, marks[1]]
+    assert set(marks[1]) == {"type", "tier", "offset"}
+    assert marks[1]["tier"] == "system"
+    assert text[marks[1]["offset"] :].startswith("Alternativa:")
+    # The campaign's citations come before the system mark, the system's after it.
+    cited = [
+        (event["offset"], stand_in.passages[event["passageId"]].source)
+        for event in events
+        if event["type"] == "citation"
+    ]
+    assert cited
+    assert all((source == PT) == (offset < marks[1]["offset"]) for offset, source in cited)
+    assert all(len(batch["events"]) <= batches.MAX_EVENTS for batch in posted(stand_in, job))
+
+
+def test_handed_one_tier_the_answer_has_no_tier_mark(stand_in: StandIn, lib: Library) -> None:
+    job = claimed(stand_in, ASKED.question, [tier("campaign", []), tier("system", [SRD, PT])])
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    assert not any(event["type"] == "tier" for event in every_event(stand_in, job))

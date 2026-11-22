@@ -44,6 +44,9 @@ Since contract 1.12.0 it serves `PUT /internal/v1/index-recipe` as the backend d
 recipe as the backend reads it is answered 204 and kept in `recipe_statements`; anything else 400 `request.invalid`.
 `recipe_status` forces an answer (for example 503).
 
+Since contract 1.14.0 (Story 3.7) an event may be a `tier` mark: `{type, tier, offset}` with a tier word and an offset
+from 0, and no other field, else 400 `job.events_invalid`, as the backend does.
+
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
 """
@@ -116,7 +119,7 @@ class StandInPassage:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.13.0"
+    version: str = "1.14.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -324,7 +327,8 @@ def _passages(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     return 200, {"passages": found}
 
 
-EVENT_TYPES = ("delta", "citation")
+EVENT_TYPES = ("delta", "citation", "tier")
+TIER_WORDS = ("campaign", "system", "other")
 
 
 def _events_valid(body: dict[str, Any]) -> bool:
@@ -337,6 +341,13 @@ def _events_valid(body: dict[str, Any]) -> bool:
         if event["type"] == "delta" and not (isinstance(event.get("text"), str) and event["text"]):
             return False
         if event["type"] == "citation" and not (type(event.get("offset")) is int and event["offset"] >= 0):
+            return False
+        if event["type"] == "tier" and not (
+            event.get("tier") in TIER_WORDS
+            and type(event.get("offset")) is int
+            and event["offset"] >= 0
+            and set(event) == {"type", "tier", "offset"}
+        ):
             return False
     keys = ("input", "cacheRead", "cacheWrite", "output", "reasoning")
     return isinstance(usage, list) and all(
