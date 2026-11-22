@@ -1,5 +1,6 @@
 """The models module (Story 2.10): the providers and their keys, the chat models each one builds, the fake model for
-every provider and directive, the citation markers, and the typed failures."""
+every provider and directive, the citation markers, and the typed failures. Story 3.7: the tier markers and the fake
+model's tier-ordered answer."""
 
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from gmshield_worker.models.output import (
     ModelEvent,
     ModelFailed,
     TextDelta,
+    TierMark,
     Usage,
     failure_code,
     stream_call,
@@ -75,7 +77,7 @@ def run(model: object, prompt: str, given: tuple[str, ...] = (A, B)) -> list[Mod
     return events
 
 
-def display(events: list[ModelEvent] | list[TextDelta | Citation]) -> str:
+def display(events: list[ModelEvent] | list[TextDelta | Citation | TierMark]) -> str:
     return "".join(event.text for event in events if isinstance(event, TextDelta))
 
 
@@ -256,6 +258,105 @@ def test_the_display_offset_runs_across_calls() -> None:
     markers.give([A])
     events = markers.feed(f"de[[{A}]]")
     assert events[-1] == Citation(A, 5)
+
+
+# ---- tier markers (Story 3.7)
+
+
+def test_a_tier_marker_of_a_handed_tier_is_removed_and_marks_where_it_stood() -> None:
+    markers = CitationMarkers([A, B])
+    markers.give_tiers(["campaign", "system", "campaign"])
+    text = f"[[tier:campaign]]Na mesa, 2d10[[{A}]].\n\n[[TIER:System]] No livro, 1d10[[{B}]]."
+    events = markers.feed(text) + markers.flush()
+
+    assert display(events) == "Na mesa, 2d10.\n\n No livro, 1d10."
+    assert [event for event in events if isinstance(event, TierMark | Citation)] == [
+        TierMark("campaign", 0),
+        Citation(A, 13),
+        TierMark("system", 16),
+        Citation(B, 31),
+    ]
+
+
+def test_a_tier_marker_of_a_tier_not_handed_or_of_no_tier_is_removed_and_marks_nothing() -> None:
+    markers = CitationMarkers([A])
+    markers.give_tiers(["system"])
+    events = markers.feed("[[tier:campaign]]Um. [[tier:other]]Dois. [[tier:xyz]]Três. [[tier:system]]Quatro.")
+    events += markers.flush()
+
+    assert display(events) == "Um. Dois. Três. Quatro."
+    assert [event for event in events if isinstance(event, TierMark)] == [TierMark("system", 16)]
+    # No tier given at all: every tier marker is removed and marks nothing.
+    bare = CitationMarkers([A])
+    events = bare.feed("[[tier:campaign]]Um.") + bare.flush()
+    assert display(events) == "Um."
+    assert not any(isinstance(event, TierMark) for event in events)
+
+
+@pytest.mark.parametrize(
+    ("campaign", "system"), [("[[tier:campaign]]", "[[tier:system]]"), ("[[tier:Campaign]]", "[[TIER:System]]")]
+)
+def test_every_split_of_a_tiered_stream_gives_the_same_display_and_marks(campaign: str, system: str) -> None:
+    text = f"{campaign}Um[[{A}]]. [[tier:]] {system}Dois[[{B}]] [[tier:sistema-x]] fim [[tier:camp"
+    whole = CitationMarkers([A, B])
+    whole.give_tiers(["campaign", "system"])
+    expected = whole.feed(text) + whole.flush()
+    marks = [event for event in expected if isinstance(event, TierMark | Citation)]
+    assert display(expected) == "Um. [[tier:]] Dois [[tier:sistema-x]] fim [[tier:camp"
+    assert marks == [TierMark("campaign", 0), Citation(A, 2), TierMark("system", 14), Citation(B, 18)]
+    for first in range(len(text) + 1):
+        for second in (first, min(first + 4, len(text))):
+            markers = CitationMarkers([A, B])
+            markers.give_tiers(["campaign", "system"])
+            events = markers.feed(text[:first]) + markers.feed(text[first:second]) + markers.feed(text[second:])
+            events += markers.flush()
+            assert display(events) == display(expected), (first, second)
+            assert [event for event in events if isinstance(event, TierMark | Citation)] == marks, (first, second)
+
+
+def tiered_turn(*blocks: tuple[str, str]) -> str:
+    """A user turn shaped as `lanes.answer.user_turn` writes it, with these (id, tier) blocks."""
+    passages = "\n".join(f'<passage id="{pid}" tier="{tier}" section="S">texto</passage>' for pid, tier in blocks)
+    return f'""" <documents>\n{passages}\n</documents> """\n\nQuestion:\n<question>Quanto?</question>'
+
+
+def tiered_run(provider: str, turn: str, tiers: list[str]) -> list[ModelEvent]:
+    markers = CitationMarkers([A, B, UNKNOWN])
+    markers.give_tiers(tiers)
+    events: list[ModelEvent] = []
+    model = chat_model(choice(provider), FAKE)
+    stream_call(model, [SystemMessage("s"), HumanMessage(turn)], markers=markers, emit=events.append)
+    return events
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_the_fake_handed_three_tiers_leads_with_the_campaign_then_each_other_tier_under_its_marker(
+    provider: str,
+) -> None:
+    turn = tiered_turn((B, "system"), (UNKNOWN, "other"), (A, "campaign"))
+    events = tiered_run(provider, turn, ["system", "other", "campaign"])
+
+    text = display(events)
+    assert "[[" not in text
+    assert text.startswith(f"Resposta simulada ({provider}):")
+    assert text.count("\n\nAlternativa:") == 2
+    marked = [event for event in events if isinstance(event, TierMark | Citation)]
+    assert [type(event).__name__ for event in marked] == ["TierMark", "Citation"] * 3
+    assert [event.tier for event in marked if isinstance(event, TierMark)] == ["campaign", "system", "other"]
+    assert [event.passage_id for event in marked if isinstance(event, Citation)] == [A, B, UNKNOWN]
+    assert [event.offset for event in marked if isinstance(event, TierMark)] == [
+        0,
+        text.index("Alternativa"),
+        text.rindex("Alternativa"),
+    ]
+
+
+def test_the_fake_handed_one_tier_answers_with_no_tier_marker() -> None:
+    events = tiered_run("azure-openai", tiered_turn((A, "system"), (B, "system")), ["system"])
+
+    assert not any(isinstance(event, TierMark) for event in events)
+    assert [event.passage_id for event in events if isinstance(event, Citation)] == [A, B]
+    assert "Alternativa" not in display(events)
 
 
 # ---- typed failures

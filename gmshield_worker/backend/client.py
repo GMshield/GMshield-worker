@@ -48,9 +48,10 @@ from gmshield_worker.backend.generated.models import (
     JobStreamEvent,
     Problem,
 )
+from gmshield_worker.backend.generated.models.job_stream_event_tier import check_job_stream_event_tier
 from gmshield_worker.backend.generated.types import UNSET, Unset
 from gmshield_worker.log import parse_traceparent, traceparent
-from gmshield_worker.models.output import Citation, TextDelta, Usage
+from gmshield_worker.models.output import StreamedEvent, TextDelta, TierMark, Usage
 from gmshield_worker.models.providers import ModelChoice
 from gmshield_worker.retrieval.recipe import INDEX_RECIPE
 
@@ -227,9 +228,11 @@ class EventsAnswer:
     code: str | None = None
 
 
-def _stream_event(event: TextDelta | Citation) -> JobStreamEvent:
+def _stream_event(event: StreamedEvent) -> JobStreamEvent:
     if isinstance(event, TextDelta):
         return JobStreamEvent(type_="delta", text=event.text)
+    if isinstance(event, TierMark):
+        return JobStreamEvent(type_="tier", tier=check_job_stream_event_tier(event.tier), offset=event.offset)
     return JobStreamEvent(type_="citation", passage_id=UUID(event.passage_id), offset=event.offset)
 
 
@@ -331,12 +334,12 @@ class JobsApi:
         return PassagesAnswer(status=int(response.status_code), code=_code(parsed))
 
     def events(
-        self, job: ClaimedJob, batch: int, events: Sequence[TextDelta | Citation], usage: Sequence[Usage] = ()
+        self, job: ClaimedJob, batch: int, events: Sequence[StreamedEvent], usage: Sequence[Usage] = ()
     ) -> EventsAnswer:
         """`POST /internal/v1/jobs/{id}/claims/{claimId}/events` (contract 1.11.0, Stories 2.4 and 2.6): a numbered
-        batch of answer events (from 1 per claim) and the usage of the model calls that ended since the last one (an
-        estimate marked `estimated`), under the claim's grant. The answer says whether the answer must stop: the GM
-        stopped it."""
+        batch of answer events (from 1 per claim; a tier mark from contract 1.14.0, Story 3.7) and the usage of the
+        model calls that ended since the last one (an estimate marked `estimated`), under the claim's grant. The answer
+        says whether the answer must stop: the GM stopped it."""
         body = JobEvents(
             batch=batch,
             events=[_stream_event(event) for event in events],
