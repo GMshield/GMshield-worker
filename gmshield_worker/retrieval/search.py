@@ -31,6 +31,10 @@ each tier), and `tokenKey` Base64 of the owner's 32-byte token key.
    1.8.0): the handed-over list is `[Handed(id, tier, text, section_path, page)]`. Library text reaches the worker by
    no other path, and nothing of it reaches Qdrant.
 
+The library search (Story 3.9, `lanes/search.py`) reuses steps 1 to 4 (`rank_tiers`) on the backend's search input
+(`Scopes.searchInput`: the same shape with `query`, 1 to `MAX_QUERY` code points, in place of `question`;
+`question_input(raw, field="query")`), with its own limit per tier, and keeps each id's fused score.
+
 Failures (`SearchFailed`): Ollama `retrieval.embedding_unavailable` and Qdrant `retrieval.store_unavailable`, both
 retryable (nothing has been sent yet); a question the model refuses as too long `retrieval.question_too_long`; a refusal
 of the backend (4xx) its own code (`scope.passage_refused`, ...), or `retrieval.passages_refused` when it names none,
@@ -76,6 +80,8 @@ PARALLEL = 8
 # The pending reads' deadline, from the question's first pending read, for every tier together.
 PENDING_BUDGET_SECONDS = 1.5
 MAX_QUESTION = 4000
+# The longest search query, in code points (the backend's `Scopes.MAX_QUERY`, Story 3.9).
+MAX_QUERY = 500
 INPUT_INVALID = "retrieval.input_invalid"
 EMBEDDING_UNAVAILABLE = "retrieval.embedding_unavailable"
 STORE_UNAVAILABLE = "retrieval.store_unavailable"
@@ -165,10 +171,14 @@ def _tiers(value: object) -> tuple[TierScope, ...]:
     return tuple(found)
 
 
-def question_input(raw: dict[str, Any]) -> QuestionInput:
-    """The question input, checked; `InputInvalid` otherwise."""
-    question = raw.get("question")
-    if not isinstance(question, str) or not 1 <= len(question) <= MAX_QUESTION:
+def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionInput:
+    """The question input, checked; `InputInvalid` otherwise. With `field="query"` (Story 3.9) it is the backend's
+    search input instead: the same shape, its text (1 to `MAX_QUERY` code points) under `query`, kept as `question`."""
+    if field not in ("question", "query"):
+        raise ValueError(field)
+    question = raw.get(field)
+    longest = MAX_QUESTION if field == "question" else MAX_QUERY
+    if not isinstance(question, str) or not 1 <= len(question) <= longest:
         raise InputInvalid
     encoded = raw.get("tokenKey")
     if not isinstance(encoded, str):
@@ -234,18 +244,25 @@ def rank_pending(passages: Sequence[PendingPassage], weights: dict[str, float]) 
     return [passage_id for rarest, _, passage_id in ranked if rarest > 0]
 
 
-def fuse(found: Sequence[Found], pending: Sequence[str], limit: int = LIMIT) -> list[str]:
-    """Qdrant's fused results with the pending ranking as a third RRF list: a pending id at rank r (from 0) scores
-    1 / (r + RRF_K), as Qdrant scores each of its prefetches. An id found both ways is one entry whose two scores add
-    up, as RRF sums across lists; a tie keeps Qdrant's order, then the pending order."""
+def fused(found: Sequence[Found], pending: Sequence[str], limit: int = LIMIT) -> list[tuple[str, float]]:
+    """Qdrant's fused results with the pending ranking as a third RRF list, each id with its score: a pending id at
+    rank r (from 0) scores 1 / (r + RRF_K), as Qdrant scores each of its prefetches. An id found both ways is one entry
+    whose two scores add up, as RRF sums across lists; a tie keeps Qdrant's order, then the pending order."""
     scores: dict[str, float] = {item.passage_id: item.score for item in found}
     for rank, passage_id in enumerate(pending):
         scores[passage_id] = scores.get(passage_id, 0.0) + 1.0 / (rank + RRF_K)
-    return sorted(scores, key=lambda passage_id: -scores[passage_id])[:limit]
+    ranked = sorted(scores, key=lambda passage_id: -scores[passage_id])[:limit]
+    return [(passage_id, scores[passage_id]) for passage_id in ranked]
 
 
-def _read(reader: PassageReader, job: ClaimedJob, ids: list[str], tiers: dict[str, str]) -> list[ReadPassage]:
-    """The passages with these ids, in this order, each of the expected tier; `SearchFailed` otherwise."""
+def fuse(found: Sequence[Found], pending: Sequence[str], limit: int = LIMIT) -> list[str]:
+    """The ids of `fused`, best first."""
+    return [passage_id for passage_id, _ in fused(found, pending, limit)]
+
+
+def read_passages(reader: PassageReader, job: ClaimedJob, ids: list[str], tiers: dict[str, str]) -> list[ReadPassage]:
+    """The passages with these ids (1 to `PAGE`), in this order, each of the expected tier; `SearchFailed`
+    otherwise."""
     try:
         answer = reader.passages(job, ids)
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
@@ -283,9 +300,10 @@ def terms_in(text: str, terms: frozenset[str]) -> frozenset[str]:
 def _read_terms(
     reader: PassageReader, job: ClaimedJob, ids: list[str], tiers: dict[str, str], terms: frozenset[str]
 ) -> list[PendingPassage]:
-    """A page of pending passages (`_read`), each kept as its id and the `terms` its folded text contains
+    """A page of pending passages (`read_passages`), each kept as its id and the `terms` its folded text contains
     (`terms_in`)."""
-    return [PendingPassage(item.passage_id, terms_in(item.text, terms)) for item in _read(reader, job, ids, tiers)]
+    read = read_passages(reader, job, ids, tiers)
+    return [PendingPassage(item.passage_id, terms_in(item.text, terms)) for item in read]
 
 
 @dataclass(frozen=True)
@@ -369,7 +387,31 @@ class _Timings:
         self.started = now
 
 
-def find_passages(
+@dataclass(frozen=True)
+class TierRanking:
+    """One searched tier's fused ranking (`fused`): its ids, best first, each with its RRF score."""
+
+    tier: str
+    scored: list[tuple[str, float]]
+
+    @property
+    def ids(self) -> list[str]:
+        return [passage_id for passage_id, _ in self.scored]
+
+
+@dataclass
+class Ranked:
+    """What `rank_tiers` found: each searched tier's ranking in tier order (empty when no tier has a source), how many
+    pending passages it read and skipped, and its timings so far (None when no tier has a source: nothing was timed)."""
+
+    tiers: list[TierRanking]
+    searched: int
+    fetched: int
+    skipped: int
+    timings: _Timings | None
+
+
+def rank_tiers(
     job: ClaimedJob,
     checked: QuestionInput,
     *,
@@ -378,13 +420,15 @@ def find_passages(
     reader: PassageReader,
     log: TraceLog,
     clock: Callable[[], float] = time.monotonic,
-) -> list[Handed]:
-    """The passages that answer the question within its scope, as the module says."""
+    limit: int = LIMIT,
+) -> Ranked:
+    """Steps 1 to 4 of the module: each tier with sources searched in Qdrant (`limit` points) and its pending passages
+    ranked, fused into at most `limit` ids per tier with their scores. No passage text is read but the pending
+    passages' (to rank them)."""
     job_id = str(job.job_id)
     searched = [tier for tier in checked.tiers if tier.sources]
     if not searched:
-        log.info("retrieval.search_done", jobId=job_id, tiers=0, handed=0)
-        return []
+        return Ranked([], 0, 0, 0, None)
     timings = _Timings(clock)
     try:
         dense = embedder.embed_query(checked.question)
@@ -397,7 +441,7 @@ def find_passages(
         with stores() as store:
             store.ensure_collection()
             for tier in searched:
-                found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, LIMIT)))
+                found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, limit)))
                 timings.lap("searchSeconds")
     except StoreFailed as error:
         raise SearchFailed(STORE_UNAVAILABLE, retry=True) from error
@@ -417,7 +461,7 @@ def find_passages(
         )
         timings.lap("pendingSeconds")
     weights = rarity(item for tier_read in read.values() for item in tier_read.passages)
-    ranked: list[tuple[str, list[str]]] = []
+    ranked: list[TierRanking] = []
     fetched = skipped = 0
     for tier, tier_found in found:
         unread = len(tier.pending) - min(len(tier.pending), MAX_PENDING)
@@ -430,26 +474,48 @@ def find_passages(
         if unread > 0:
             skipped += unread
             log.info("retrieval.pending_skipped", jobId=job_id, tier=tier.tier, skipped=unread)
-        ranked.append((tier.tier, fuse(tier_found, matching)))
+        ranked.append(TierRanking(tier.tier, fused(tier_found, matching, limit)))
     if read:
         timings.lap("rankSeconds")
-    tiers = {passage_id: tier for tier, ids in ranked for passage_id in ids}
+    return Ranked(ranked, len(searched), fetched, skipped, timings)
+
+
+def find_passages(
+    job: ClaimedJob,
+    checked: QuestionInput,
+    *,
+    embedder: Embedder,
+    stores: StoreFactory,
+    reader: PassageReader,
+    log: TraceLog,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[Handed]:
+    """The passages that answer the question within its scope, as the module says."""
+    job_id = str(job.job_id)
+    ranked = rank_tiers(
+        job, checked, embedder=embedder, stores=stores, reader=reader, log=log, clock=clock, limit=LIMIT
+    )
+    timings = ranked.timings
+    if timings is None:
+        log.info("retrieval.search_done", jobId=job_id, tiers=0, handed=0)
+        return []
+    tiers = {passage_id: tier.tier for tier in ranked.tiers for passage_id in tier.ids}
     ids = list(tiers)
     handed: list[Handed] = []
     if ids:
         handed = [
             Handed(item.passage_id, item.tier, item.page, item.text, list(item.section_path))
-            for item in _read(reader, job, ids, tiers)
+            for item in read_passages(reader, job, ids, tiers)
         ]
         timings.lap("readSeconds")
     log.info(
         "retrieval.search_done",
         jobId=job_id,
-        tiers=len(searched),
+        tiers=ranked.searched,
         handed=len(handed),
         ids=[item.passage_id for item in handed],
-        pendingFetched=fetched,
-        pendingSkipped=skipped,
+        pendingFetched=ranked.fetched,
+        pendingSkipped=ranked.skipped,
         **timings.spent,
     )
     return handed

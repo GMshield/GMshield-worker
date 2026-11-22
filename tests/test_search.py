@@ -25,6 +25,7 @@ from qdrant_client import QdrantClient, models
 
 from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome, PassagesAnswer, ReadPassage
 from gmshield_worker.lanes import question
+from gmshield_worker.lanes import search as lane_search
 from gmshield_worker.log import TraceLog, new_trace_id
 from gmshield_worker.retrieval import embedding, keywords, search, store
 from gmshield_worker.settings import IndexSettings
@@ -1104,3 +1105,268 @@ def test_the_terms_found_in_a_text_are_exactly_its_folded_tokens_that_are_terms(
 def test_a_question_with_no_ascii_term_finds_none_in_ascii_text() -> None:
     terms = frozenset({"ação", "straße"})
     assert search.terms_in("Plain ASCII text about acao and strasse.", terms) == frozenset()
+
+
+# --- the library search (Story 3.9)
+
+SEARCHES = {item.key: item for item in retrieval_fixtures.searches()}
+
+
+def search_input(text: str, tiers: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"query": text, "owner": OWNER, "tiers": tiers, "tokenKey": base64.b64encode(KEY).decode()}
+
+
+def library_search(
+    stand_in: StandIn, lib: Library, text: str, tiers: list[dict[str, Any]], job_input: dict[str, Any] | None = None
+) -> Run:
+    """The `library.search` handler over the claim of a job with this search input."""
+    job_id = stand_in.offer(lane_search.KIND, job_input or search_input(text, tiers), new_trace_id())
+    answer = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(job_id), new_trace_id())
+    assert answer.job is not None
+    handler = lane_search.SearchJob(
+        JobsApi(stand_in.url, CREDENTIAL), retrieval_fixtures.RecordedOllama().embedder(), lambda: local(lib.spy)
+    )
+    return Run(handler(answer.job, threading.Event()), answer.job)
+
+
+def test_an_exact_phrase_from_a_fixture_passage_ranks_that_passage_first(stand_in: StandIn, indexed: Library) -> None:
+    serve_fixtures(stand_in)
+    phrase = SEARCHES["s-to-fire-damage"]
+    frost = BY_KEY["srd-frost-brand"].passage_id
+    # The phrase is in Frost Brand's text alone, and by meaning alone two passages about fire come before it.
+    assert [item.key for item in PASSAGES if phrase.query.lower() in item.text.lower()] == ["srd-frost-brand"]
+    by_meaning = ask(stand_in, indexed, phrase.query, [tier("system", [SRD])]).ids
+    assert by_meaning.index(frost) > 0
+
+    ids = library_search(stand_in, indexed, phrase.query, [tier("system", [SRD])]).ids
+
+    assert ids[0] == frost
+    # The rest keep the order of their meaning.
+    assert [item for item in ids if item != frost][:2] == [item for item in by_meaning if item != frost][:2]
+
+
+def test_every_passage_holding_the_query_comes_first_in_its_ranked_order(stand_in: StandIn, indexed: Library) -> None:
+    serve_fixtures(stand_in)
+    searched = SEARCHES["s-fire-damage"]
+    holding = {BY_KEY[key].passage_id for key in searched.expected}
+    assert {item.passage_id for item in PASSAGES if "fire damage" in item.text.lower()} == holding
+
+    ids = library_search(stand_in, indexed, searched.query, [tier("system", [SRD])]).ids
+
+    assert set(ids[:3]) == holding
+    assert holding.isdisjoint(ids[3:])
+    by_meaning = ask(stand_in, indexed, searched.query, [tier("system", [SRD])]).ids
+    assert ids[:3] == [item for item in by_meaning if item in holding]
+
+
+def test_the_exact_query_moves_up_whatever_its_case_or_accents_from_a_pending_passage(
+    stand_in: StandIn, indexed: Library
+) -> None:
+    serve_fixtures(stand_in)
+    asked = QUESTIONS["q-pending"].question  # "Quem é Osvaldo Brandão?"
+    pending = [str(uuid.uuid4()) for _ in range(3)]
+    stand_in.passages[pending[0]] = StandInPassage(NEW, "Osvaldo Brandão, Osvaldo e Brandão: quem é quem.", ["N"], 1)
+    stand_in.passages[pending[1]] = StandInPassage(NEW, "No cais:   QUEM E\nOSVALDO BRANDAO? Ninguém sabe.", ["N"], 2)
+    stand_in.passages[pending[2]] = StandInPassage(NEW, "Página sem nada a ver.", ["N"], 3)
+
+    ids = library_search(stand_in, indexed, asked, [tier("campaign", [PT, NEW], pending)]).ids
+
+    assert ids[0] == pending[1]
+    assert pending[0] in ids
+    assert pending[2] not in ids
+
+
+def test_only_the_scopes_passages_are_returned_and_every_query_is_filtered_on_the_owner_and_the_tiers_sources(
+    stand_in: StandIn, indexed: Library
+) -> None:
+    serve_fixtures(stand_in)
+    before = len(indexed.spy.queries)
+
+    run = library_search(
+        stand_in,
+        indexed,
+        SEARCHES["s-fire-damage"].query,
+        [tier("campaign", [PT]), tier("system", []), tier("other", [SRD])],
+    )
+
+    # 10 campaign and 15 other candidates, merged: the result is cut to the backend's 20, each once.
+    assert len(run.ids) == lane_search.LIMIT == 20
+    assert len(set(run.ids)) == 20
+    assert indexed.outside_ids.isdisjoint(run.ids)
+    assert all(item in stand_in.passages for item in run.ids)
+    queries = indexed.spy.queries[before:]
+    assert len(queries) == 2
+    for query, sources in zip(queries, ([PT], [SRD]), strict=True):
+        expected = models.Filter(
+            must=[
+                models.FieldCondition(key="owner", match=models.MatchValue(value=OWNER)),
+                models.FieldCondition(key="source", match=models.MatchAny(any=sources)),
+            ]
+        )
+        assert query["query_filter"] == expected
+        assert all(prefetch.filter == expected for prefetch in query["prefetch"])
+        assert query["limit"] == lane_search.LIMIT
+
+
+def test_up_to_20_candidates_a_tier_are_read_and_20_ids_returned(stand_in: StandIn, indexed: Library) -> None:
+    serve_fixtures(stand_in)
+
+    run = library_search(stand_in, indexed, SEARCHES["s-fire-damage"].query, [tier("system", [SRD, PT])])
+
+    assert len(run.ids) == 20
+    assert len(set(run.ids)) == 20
+    fetched = passages_requests(stand_in)
+    assert len(fetched) == 1
+    assert len(fetched[0]) == 20
+    assert set(run.ids) == set(fetched[0])
+
+
+def test_an_empty_scope_asks_nothing_and_finds_nothing(stand_in: StandIn, indexed: Library) -> None:
+    serve_fixtures(stand_in)
+    before = len(indexed.spy.queries)
+
+    run = library_search(
+        stand_in, indexed, "Vorpal Sword", [tier("campaign", []), tier("system", []), tier("other", [])]
+    )
+
+    assert run.ids == []
+    assert len(indexed.spy.queries) == before
+    assert passages_requests(stand_in) == []
+
+
+@pytest.mark.parametrize(
+    "job_input",
+    [
+        {"question": "Vorpal Sword", "owner": OWNER, "tiers": [], "tokenKey": base64.b64encode(KEY).decode()},
+        {"query": "", "owner": OWNER, "tiers": [], "tokenKey": base64.b64encode(KEY).decode()},
+        {"query": "a" * 501, "owner": OWNER, "tiers": [], "tokenKey": base64.b64encode(KEY).decode()},
+        {"query": 5, "owner": OWNER, "tiers": [], "tokenKey": base64.b64encode(KEY).decode()},
+        {"query": "Vorpal Sword", "owner": "nope", "tiers": [], "tokenKey": base64.b64encode(KEY).decode()},
+    ],
+)
+def test_a_search_input_that_is_not_the_backends_fails_without_a_retry(
+    stand_in: StandIn, indexed: Library, job_input: dict[str, Any]
+) -> None:
+    serve_fixtures(stand_in)
+
+    run = library_search(stand_in, indexed, "", [], job_input)
+
+    assert run.outcome == Outcome.failed("retrieval.input_invalid", retry=False)
+
+
+def test_a_query_of_500_code_points_is_accepted_and_a_question_input_keeps_its_own_limit() -> None:
+    raw = search_input("\U0001f409" * 500, [tier("system", [SRD])])
+    assert search.question_input(raw, field="query").question == "\U0001f409" * 500
+    with pytest.raises(search.InputInvalid):
+        search.question_input(raw)
+    with pytest.raises(ValueError, match="other"):
+        search.question_input(raw, field="other")
+
+
+def test_a_refusal_of_the_backend_fails_the_search_with_its_code_and_no_retry(
+    stand_in: StandIn, indexed: Library
+) -> None:
+    serve_fixtures(stand_in)
+    stand_in.passages_status = 403
+
+    run = library_search(stand_in, indexed, "Vorpal Sword", [tier("system", [SRD])])
+
+    assert run.outcome == Outcome.failed("scope.passage_refused", retry=False)
+
+
+def test_a_store_down_or_ollama_down_is_retryable(stand_in: StandIn, indexed: Library) -> None:
+    serve_fixtures(stand_in)
+    down = IndexSettings(qdrant_url="http://127.0.0.1:9")
+    job_id = stand_in.offer(lane_search.KIND, search_input("Vorpal Sword", [tier("system", [SRD])]), new_trace_id())
+    job = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(job_id), new_trace_id()).job
+    assert job is not None
+
+    store_down = lane_search.SearchJob(
+        JobsApi(stand_in.url, CREDENTIAL),
+        retrieval_fixtures.RecordedOllama().embedder(),
+        lambda: store.passage_store(down),
+    )(job, threading.Event())
+    ollama_down = lane_search.SearchJob(
+        JobsApi(stand_in.url, CREDENTIAL),
+        retrieval_fixtures.RecordedOllama(status=503).embedder(),
+        lambda: local(indexed.spy),
+    )(job, threading.Event())
+
+    assert store_down == Outcome.failed("retrieval.store_unavailable")
+    assert ollama_down == Outcome.failed("retrieval.embedding_unavailable")
+    assert passages_requests(stand_in) == []
+
+
+def test_the_ids_are_logged_never_the_query_a_text_or_the_key(
+    stand_in: StandIn, indexed: Library, capsys: pytest.CaptureFixture[str]
+) -> None:
+    serve_fixtures(stand_in)
+    query = SEARCHES["s-to-fire-damage"].query
+
+    run = library_search(stand_in, indexed, query, [tier("system", [SRD])])
+
+    captured = capsys.readouterr()
+    done = [line for line in log_lines(captured.out) if line["event"] == "retrieval.library_search_done"]
+    assert done[0]["ids"] == run.ids
+    assert done[0]["exact"] == 1
+    candidates = done[0]["candidates"]
+    assert isinstance(candidates, int)
+    assert candidates >= len(run.ids)
+    assert {"embedSeconds", "searchSeconds", "readSeconds", "rerankSeconds"} <= set(done[0])
+    for secret in (query, "Frost", "Resistance", base64.b64encode(KEY).decode(), KEY.hex()):
+        assert secret not in captured.out + captured.err
+
+
+def test_the_tiers_are_merged_by_score_with_the_campaign_first_on_a_tie() -> None:
+    rankings = [
+        search.TierRanking("campaign", [("c1", 0.5), ("c2", 0.2)]),
+        search.TierRanking("system", [("s1", 0.5), ("s2", 0.4)]),
+        search.TierRanking("other", [("o1", 0.9)]),
+    ]
+
+    assert lane_search.merge(rankings) == [
+        ("o1", "other"),
+        ("c1", "campaign"),
+        ("s1", "system"),
+        ("s2", "system"),
+        ("c2", "campaign"),
+    ]
+    assert lane_search.merge([]) == []
+
+
+def read(passage_id: str, text: str) -> ReadPassage:
+    return ReadPassage(passage_id=passage_id, tier="campaign", page=1, text=text, section_path=[])
+
+
+def test_the_passages_holding_the_query_move_to_the_front_in_their_order_whatever_case_accents_or_spacing() -> None:
+    found = [
+        read("a", "Nothing here."),
+        read("b", "A Coroa de\n  ESPINHOS e outras."),
+        read("c", "coroa de espinhos"),
+        read("d", "Coroa, de espinhos"),
+    ]
+
+    assert lane_search.exact_first(found, "Côroa de Espinhos") == ["b", "c", "a", "d"]
+    assert lane_search.exact_first(found, "   ") == ["a", "b", "c", "d"]
+    assert lane_search.exact_first([], "x") == []
+
+
+class CountingReader:
+    """Answers every passages call from a table, recording the ids of each call."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def passages(self, job: ClaimedJob, ids: list[str]) -> PassagesAnswer:
+        self.calls.append(list(ids))
+        return PassagesAnswer(status=200, passages=[read(item, item) for item in ids])
+
+
+def test_the_candidates_text_is_read_in_calls_of_at_most_100_ids_in_order() -> None:
+    reader = CountingReader()
+    candidates = [(f"id-{index}", "campaign") for index in range(150)]
+
+    found = lane_search.read_texts(reader, fake_job(), candidates)
+
+    assert [len(call) for call in reader.calls] == [100, 50]
+    assert [item.passage_id for item in found] == [item for item, _ in candidates]

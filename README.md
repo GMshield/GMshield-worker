@@ -401,6 +401,37 @@ lockfile and the production image:
     ```
 
     Ollama is `GMSHIELD_OLLAMA_URL`, else `http://localhost:11434` (the `roberto-server` SSH alias forwards it).
+- **Search the library (Story 3.9, `library.search`, backend contract 1.15.0: the internal contract does not change).**
+  `lanes/search.py` `SearchJob`, registered in every mode, runs a GM's search over the campaign's scope only and calls
+  no model. Its claim input is the backend's search input (`Scopes.searchInput`): the question input's shape with
+  `query` (1 to 500 code points, `search.MAX_QUERY`) in place of `question`, read by
+  `search.question_input(raw, field="query")`; the backend has already narrowed its tiers by the search's tier and
+  material filters, and the worker never works out a tier.
+  - Each tier with sources is searched as a question's is (`search.rank_tiers`, shared with `find_passages`: the
+    query embedded under the query prompt, Qdrant's dense and sparse prefetches fused by RRF under the owner and
+    source filters, and the tier's pending passages read and ranked by the query's tokens), but with up to 20
+    candidates per tier (`LIMIT`), each with its fused score (`search.fused`).
+  - The tiers are merged by that score, highest first; a tie keeps tier order (campaign, system, other), then each
+    tier's own order (`merge`).
+  - The candidates' text is read through the backend in calls of at most 100 ids (`read_texts`, each call checked as
+    `search.read_passages` checks a question's).
+  - Every candidate whose text, folded (`keywords.fold`: NFKC, casefold, accents dropped) with its runs of white space
+    made one space, contains the query folded the same way moves to the front, in its existing order
+    (`exact_first`): a passage holding the query verbatim, whatever its case or accents, comes first.
+  - The result is the first 20 ids, `{"ids": [...]}`; the backend re-checks every one against the scope and refuses
+    the whole result for one outside it. The index's payload, its vectors, the keyword numbering and `INDEX_RECIPE`
+    are unchanged.
+  - Failures as `find_passages`: `retrieval.input_invalid` (also for a question input, or a query past 500 code
+    points) and a refusal of the passages route with its code, with `retry: false`; Ollama, Qdrant and the passages
+    route down are retryable. Lines (`retrieval.library_search_started`, `retrieval.library_search_done` with the
+    tiers, candidate, exact-match and pending counts, the ids and the timings including `rerankSeconds`,
+    `retrieval.library_search_failed`) never carry the query, a text or the key.
+  - Tests (`tests/test_search.py`, "the library search") use the recorded fixtures; the two search queries
+    (`searches` in `tests/fixtures/retrieval/questions.json`: "to Fire damage", an exact phrase of Frost Brand that two
+    passages about fire outrank by meaning, and "Fire damage", held by three passages) were recorded through the
+    Ollama tunnel and appended to `vectors.json` (`record_embeddings.py --check` passes on all 39 inputs).
+  - Deploy order: the backend (it adds the job kind), then this worker, then the frontend, which creates the first
+    search.
 - **Models through LangGraph, with a switchable provider (Story 2.10, AD-18, backend contract 1.9.0).** The backend
   chooses the provider, model and tier of each attempt; the worker never chooses one and never falls back to another.
   - **Claim.** Every claim states `providers`: those the worker holds a key for (test mode: `azure-openai`,
