@@ -327,7 +327,7 @@
         "type" : "object"
       },
       "JobStreamEvent" : {
-        "description" : "One answer event (contract 1.10.0): a delta with its display text, a citation of a given passage id at a code-point offset of the answer's text, or (contract 1.14.0) a tier marker: the version of that tier starts at the offset. Each type carries its own fields and no other",
+        "description" : "One answer event (contract 1.10.0): a delta with its display text, a citation of a given passage id at a code-point offset of the answer's text, or (contract 1.14.0) a tier marker: the version of that tier starts at the offset. From contract 1.15.0 the tier model marks a part from the model's own knowledge. Each type carries its own fields and no other",
         "properties" : {
           "offset" : {
             "description" : "For citation and tier only: where the citation or the tier's version stands, in code points of the answer's text",
@@ -346,8 +346,8 @@
             "type" : "string"
           },
           "tier" : {
-            "description" : "For tier only: the tier of a passage handed for this answer; one with no source in the turn's scope is dropped",
-            "enum" : [ "campaign", "system", "other" ],
+            "description" : "For tier only: the tier of a passage handed for this answer, or model (contract 1.15.0) for a part from the model's own knowledge, only when the input's modelKnowledge is true. A tier with no source in the turn's scope, or model when the turn's model knowledge is off, is dropped",
+            "enum" : [ "campaign", "system", "other", "model" ],
             "type" : "string"
           },
           "type" : {
@@ -401,7 +401,7 @@
   },
   "info" : {
     "title" : "GMshield internal API",
-    "version" : "1.14.0"
+    "version" : "1.15.0"
   },
   "openapi" : "3.1.0",
   "paths" : {

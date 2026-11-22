@@ -108,10 +108,14 @@ class TierScope:
 
 @dataclass(frozen=True)
 class QuestionInput:
+    """The checked question input. `model_knowledge` (Story 3.8, contract 1.15.0) is the turn's frozen switch: whether
+    the model may add its own knowledge, each such part under `[[tier:model]]`; absent from the input, it is off."""
+
     owner: str
     tiers: tuple[TierScope, ...]
     question: str = field(repr=False)
     token_key: bytes = field(repr=False)
+    model_knowledge: bool = False
 
 
 @dataclass(frozen=True)
@@ -175,8 +179,15 @@ def question_input(raw: dict[str, Any]) -> QuestionInput:
         raise InputInvalid from error
     if len(key) != KEY_BYTES:
         raise InputInvalid
+    model_knowledge = raw.get("modelKnowledge", False)
+    if not isinstance(model_knowledge, bool):
+        raise InputInvalid
     return QuestionInput(
-        owner=_uuid(raw.get("owner")), tiers=_tiers(raw.get("tiers")), question=question, token_key=key
+        owner=_uuid(raw.get("owner")),
+        tiers=_tiers(raw.get("tiers")),
+        question=question,
+        token_key=key,
+        model_knowledge=model_knowledge,
     )
 
 
