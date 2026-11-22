@@ -142,7 +142,7 @@ def test_old_backend(stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFi
     incompatible = [line for line in lines if line["event"] == "backend.incompatible"]
     assert len(incompatible) == 1
     assert incompatible[0]["backendContractVersion"] == "0.9.0"
-    assert incompatible[0]["minimumContractVersion"] == "1.11.0"
+    assert incompatible[0]["minimumContractVersion"] == "1.13.0"
     assert not any(line["event"] == "worker.ready" for line in lines)
 
 
@@ -151,7 +151,7 @@ def test_an_old_backend_that_is_upgraded_becomes_healthy(stand_in: StandIn, tmp_
     health_file = tmp_path / "healthy"
     with running(mode_env(stand_in, tmp_path), health_file):
         wait_for(lambda: len(stand_in.requests) >= 2)
-        stand_in.version = "1.11.0"
+        stand_in.version = "1.13.0"
         wait_for(lambda: health.is_healthy(health_file))
         stand_in.version = "0.9.0"
         wait_for(lambda: not health_file.exists())
@@ -432,7 +432,7 @@ def test_the_lanes_start_after_the_first_compatible_answer_and_stop_at_the_end(
     with running(mode_env(stand_in, tmp_path), health_file, lanes=lanes):
         wait_for(lambda: len(stand_in.requests) >= 3)
         assert lanes.events == []  # an older backend: nothing is claimed from it
-        stand_in.version = "1.11.0"
+        stand_in.version = "1.13.0"
         wait_for(lambda: health.is_healthy(health_file))
         wait_for(lambda: len(stand_in.requests) >= 6)  # re-checked, never started twice
         assert lanes.events == ["start"]
@@ -470,10 +470,10 @@ def recipe_requests(stand_in: StandIn) -> list[dict[str, str]]:
     return [request for request in stand_in.requests if request["path"] == "/internal/v1/index-recipe"]
 
 
-def test_the_recipe_is_stated_at_every_compatible_check_of_a_backend_at_1_12_0_with_no_job_claimed(
+def test_the_recipe_is_stated_at_every_compatible_check_of_a_backend_at_1_13_0_with_no_job_claimed(
     stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    stand_in.version = "1.12.0"
+    stand_in.version = "1.13.0"
     stand_in.credential = "gmshield-test-mode-worker-credential-not-a-secret"
     lanes = FakeLanes()
     health_file = tmp_path / "healthy"
@@ -501,27 +501,30 @@ def test_the_recipe_is_stated_at_every_compatible_check_of_a_backend_at_1_12_0_w
     assert not any(line["event"] == "index.recipe_unstated" for line in lines)
 
 
-@pytest.mark.parametrize("version", ["1.11.0", "1.11.9"])
-def test_an_older_backend_is_never_told_the_recipe_and_works_as_before(
+@pytest.mark.parametrize("version", ["1.11.0", "1.12.0", "1.12.9"])
+def test_a_backend_before_1_13_0_is_incompatible_and_never_told_the_recipe(
     stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str], version: str
 ) -> None:
-    # Matrix row "Old backend": the minimum stays 1.11.0, and the route is never called.
+    # Story 3.5: the minimum is 1.13.0 (the `other` tier), so an older backend leaves the worker unhealthy, with no lane
+    # started and the recipe route never called.
     stand_in.version = version
+    lanes = FakeLanes()
     health_file = tmp_path / "healthy"
-    with running(mode_env(stand_in, tmp_path), health_file):
-        wait_for(lambda: health.is_healthy(health_file))
-        wait_for(lambda: len(stand_in.requests) >= 4)
+    with running(mode_env(stand_in, tmp_path), health_file, lanes=lanes):
+        wait_for(lambda: len(stand_in.requests) >= 3)
+        assert not health.is_healthy(health_file)
+        assert lanes.events == []  # nothing is claimed from it
     assert recipe_requests(stand_in) == []
-    assert contract.MINIMUM_BACKEND_CONTRACT_VERSION == "1.11.0"
+    assert contract.MINIMUM_BACKEND_CONTRACT_VERSION == "1.13.0"
     events = [line["event"] for line in log_lines(capsys.readouterr().out)]
+    assert "backend.incompatible" in events
     assert "index.recipe_stated" not in events
-    assert "index.recipe_unstated" not in events
 
 
 def test_a_failed_statement_is_logged_changes_neither_health_nor_lanes_and_is_stated_again_at_the_next_check(
     stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    stand_in.version = "1.12.0"
+    stand_in.version = "1.13.0"
     stand_in.recipe_status = 503
     lanes = FakeLanes()
     health_file = tmp_path / "healthy"
@@ -543,7 +546,7 @@ def test_a_failed_statement_is_logged_changes_neither_health_nor_lanes_and_is_st
 def test_a_statement_that_raises_is_logged_by_error_type_only(
     stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    stand_in.version = "1.12.0"
+    stand_in.version = "1.13.0"
     calls = 0
 
     def unreachable(_url: str, _trace_id: str) -> RecipeAnswer:

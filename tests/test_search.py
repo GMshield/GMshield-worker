@@ -274,6 +274,51 @@ def test_with_matches_in_both_tiers_the_campaign_tiers_ids_come_first_each_label
     assert "Exhaustion" not in repr(handed)
 
 
+def test_the_other_tier_is_searched_on_its_own_sources_and_its_passages_are_handed_over_labelled_other(
+    stand_in: StandIn, indexed: Library
+) -> None:
+    # Story 3.5 (backend contract 1.13.0): three tiers in order, the backend working out which sources each holds.
+    serve_fixtures(stand_in)
+    before = len(indexed.spy.queries)
+
+    handed = find(
+        stand_in,
+        indexed,
+        QUESTIONS["q-pt-exhaustion"].question,
+        [tier("campaign", [PT]), tier("system", []), tier("other", [SRD])],
+    )
+
+    tiers = [item.tier for item in handed]
+    assert "campaign" in tiers
+    assert "other" in tiers
+    assert "system" not in tiers
+    # In tier order (campaign, system, other), never alphabetical: every campaign id first.
+    assert tiers == sorted(tiers, key=search.TIERS.index)
+    by_id = {item.passage_id: item for item in PASSAGES}
+    assert all(by_id[item.passage_id].srd is (item.tier == "other") for item in handed)
+    assert BY_KEY["srd-exhaustion"].passage_id in [item.passage_id for item in handed if item.tier == "other"]
+    # The system tier has no source: no query; the campaign's and the other tier's queries, each on its own sources.
+    queries = indexed.spy.queries[before:]
+    assert len(queries) == 2
+    assert_filtered(queries[0], [PT])
+    assert_filtered(queries[1], [SRD])
+
+
+def test_with_the_other_tier_empty_nothing_of_it_is_queried_or_handed_over(stand_in: StandIn, indexed: Library) -> None:
+    serve_fixtures(stand_in)
+    before = len(indexed.spy.queries)
+
+    handed = find(
+        stand_in,
+        indexed,
+        QUESTIONS["q-pt-exhaustion"].question,
+        [tier("campaign", [PT]), tier("system", []), tier("other", [])],
+    )
+
+    assert {item.tier for item in handed} == {"campaign"}
+    assert len(indexed.spy.queries[before:]) == 1
+
+
 def test_a_pending_passage_past_the_first_100_that_names_a_word_of_the_question_is_handed_over(
     stand_in: StandIn, indexed: Library, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -546,6 +591,38 @@ def test_the_tiers_pages_are_started_in_turns_then_the_rest_of_the_longer_tier()
     assert (read["campaign"].unread, read["system"].unread) == (0, 0)
 
 
+def test_three_tiers_pages_are_started_in_turns_campaign_system_other_then_the_rest() -> None:
+    campaign = [str(uuid.uuid4()) for _ in range(150)]
+    system = [str(uuid.uuid4()) for _ in range(250)]
+    other = [str(uuid.uuid4()) for _ in range(120)]
+    reader = PageReader(tiers={**dict.fromkeys(campaign, "campaign"), **dict.fromkeys(other, "other")})
+
+    read = search.read_pending(
+        reader,
+        fake_job(),
+        [("campaign", campaign), ("system", system), ("other", other)],
+        terms=NO_TERMS,
+        clock=lambda: 0.0,
+        parallel=1,
+    )
+
+    assert reader.calls == [
+        campaign[:100],
+        system[:100],
+        other[:100],
+        campaign[100:],
+        system[100:200],
+        other[100:],
+        system[200:],
+    ]
+    assert [item.passage_id for item in read["other"].passages] == other
+    assert (read["campaign"].unread, read["system"].unread, read["other"].unread) == (0, 0, 0)
+
+
+def test_the_tiers_constant_is_campaign_system_other() -> None:
+    assert search.TIERS == ("campaign", "system", "other")
+
+
 def test_one_deadline_for_both_tiers_and_no_page_starts_after_it() -> None:
     campaign = [str(uuid.uuid4()) for _ in range(1000)]
     system = [str(uuid.uuid4()) for _ in range(3142)]
@@ -807,7 +884,9 @@ def test_an_unrecorded_question_fails_the_test(stand_in: StandIn, indexed: Libra
         {"tokenKey": "not base64!"},
         {"tiers": [tier("system", [SRD]), tier("campaign", [PT])]},
         {"tiers": [tier("system", [SRD]), tier("system", [PT])]},
-        {"tiers": [tier("other", [SRD])]},
+        {"tiers": [tier("elsewhere", [SRD])]},
+        {"tiers": [tier("other", [SRD]), tier("system", [PT])]},
+        {"tiers": [tier("other", [SRD]), tier("other", [PT])]},
         {"tiers": [tier("system", ["not-a-uuid"])]},
         {"tiers": [tier("system", [SRD, SRD])]},
         {"tiers": [{"tier": "system", "sources": [SRD]}]},

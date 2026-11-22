@@ -1,7 +1,8 @@
 """Finding the passages that answer a question (Story 2.3, AD-10): `find_passages`.
 
 The question input is the backend's (`Scopes.questionInput`), never computed here: `{question, owner, tiers: [{tier,
-sources, pending}], tokenKey}`, the tiers in order (campaign, then system), `pending` the ids of the tier's passages
+sources, pending}], tokenKey}`, the tiers in order (campaign, system, then other from internal contract 1.13.0, Story
+3.5; the backend works out each tier, the worker never does), `pending` the ids of the tier's passages
 that are not indexed yet (their index change has not ended, or it failed; the backend lists at most the first 5,000 of
 each tier), and `tokenKey` Base64 of the owner's 32-byte token key.
 
@@ -11,21 +12,21 @@ each tier), and `tokenKey` Base64 of the owner's 32-byte token key.
 3. Per tier with sources, one Qdrant search (`PassageStore.search`): dense and sparse prefetches fused by RRF, `LIMIT`
    points, the owner and source filters always on. A tier without sources issues no query.
 4. Pending: once every tier is searched, the first `MAX_PENDING` ids of each tier's `pending`, in input order, are read
-   by id in pages of `PAGE` (the backend's most ids per call, `JobPassageReads.MAX_IDS`), at most `PARALLEL` pages at
-   a time, the tiers' pages in turns (campaign, system, campaign, ..., then the rest of the longer one), under one
+   by id in pages of `PAGE` (the backend's most ids per call, `JobPassageReads.MAX_IDS`), at most `PARALLEL` pages at a
+   time, the tiers' pages in turns (campaign, system, other, campaign, ..., then the rest of the longer ones), under one
    deadline `PENDING_BUDGET_SECONDS` after the question's first pending read (`read_pending`), so the first words stay
    within NFR-14's 5 s: no page starts after it, and a page not back by it is dropped, never waited for. Each page is
-   tokenized as it comes back, inside the deadline: each passage keeps only the question's distinct folded tokens of
-   two characters or more (`question_terms`, from `keywords.tokens`, never an HMAC) that it contains, and its text is
-   let go. After the deadline only the counting runs: each token weighs BM25's ln(1 + (N - df + 0.5) / (df + 0.5)), N
-   the pending passages read for the question (both tiers) and df how many of them contain it (`rarity`); passages
-   are ordered by the weight of the rarest question token they contain, then by the sum of their tokens' weights, so
-   the passage naming what the question is about (a monster, a spell, a person) comes first; those with no token are
-   dropped and ties keep input order (`rank_pending`). That ranking is fused with the tier's
-   Qdrant results as a third RRF list (`fuse`), `LIMIT` ids. An id found both ways is one entry whose scores add up,
-   as RRF does. The ids not read (past `MAX_PENDING`, in pages the deadline left out, or in pages it dropped) are
-   skipped and logged as a count per tier (`retrieval.pending_skipped`). A question with no token of two characters or
-   more can match no pending passage: its pending passages are not read at all.
+   tokenized as it comes back, inside the deadline: each passage keeps only the question's distinct folded tokens of two
+   characters or more (`question_terms`, from `keywords.tokens`, never an HMAC) that it contains, and its text is let
+   go. After the deadline only the counting runs: each token weighs BM25's ln(1 + (N - df + 0.5) / (df + 0.5)), N the
+   pending passages read for the question (every tier) and df how many of them contain it (`rarity`); passages are
+   ordered by the weight of the rarest question token they contain, then by the sum of their tokens' weights, so the
+   passage naming what the question is about (a monster, a spell, a person) comes first; those with no token are dropped
+   and ties keep input order (`rank_pending`). That ranking is fused with the tier's Qdrant results as a third RRF list
+   (`fuse`), `LIMIT` ids. An id found both ways is one entry whose scores add up, as RRF does. The ids not read (past
+   `MAX_PENDING`, in pages the deadline left out, or in pages it dropped) are skipped and logged as a count per tier
+   (`retrieval.pending_skipped`). A question with no token of two characters or more can match no pending passage: its
+   pending passages are not read at all.
 5. The text of every found id, in rank order, campaign tier first, is read in one call to `POST …/passages` (contract
    1.8.0): the handed-over list is `[Handed(id, tier, text, section_path, page)]`. Library text reaches the worker by
    no other path, and nothing of it reaches Qdrant.
@@ -62,17 +63,17 @@ from gmshield_worker.retrieval.indexing import StoreFactory
 from gmshield_worker.retrieval.keywords import KEY_BYTES, query_vector, tokens
 from gmshield_worker.retrieval.store import RRF_K, Found, StoreFailed
 
-TIERS = ("campaign", "system")
+TIERS = ("campaign", "system", "other")
 LIMIT = 8
 # The most pending ids of a tier the worker reads: as many as the backend lists (`Scopes.MAX_PENDING`).
 MAX_PENDING = 5000
 # The most ids of one passages call (the backend's `JobPassageReads.MAX_IDS`).
 PAGE = 100
-# The most passages calls of a question's pending reads at a time, both tiers together. 8, not 4: on roberto-server
+# The most passages calls of a question's pending reads at a time, every tier together. 8, not 4: on roberto-server
 # while indexing loaded it (2026-11-19), 4 read about 2,100-2,900 of 3,900 pending passages in the 1.5 s and 8 read
 # all 3,721 in about 1 s.
 PARALLEL = 8
-# The pending reads' deadline, from the question's first pending read, for both tiers together.
+# The pending reads' deadline, from the question's first pending read, for every tier together.
 PENDING_BUDGET_SECONDS = 1.5
 MAX_QUESTION = 4000
 INPUT_INVALID = "retrieval.input_invalid"
