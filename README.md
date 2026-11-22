@@ -328,16 +328,25 @@ lockfile and the production image:
 - **Passages by id (backend contract 1.8.0, Story 2.2).** `contracts/internal.json` carries
   `POST /internal/v1/jobs/{jobId}/claims/{claimId}/passages` (`readJobPassages`): with the claim's `X-Job-Grant` and
   `{ids}` (1 to 100 passage ids), the backend answers `{passages: [{id, tier, text, sectionPath, page}]}` in the order
-  asked, each id once, `tier` being `campaign` or `system`. It checks every id against the job's resolved scope before
+  asked, each id once, `tier` being `campaign`, `system` or (from backend contract 1.13.0, Story 3.5) `other`. It checks every id against the job's resolved scope before
   decrypting anything. The refusals: 400 `request.invalid` for a malformed body or an id that is not a UUID (before
   the grant); 403 `job.grant_refused` for a wrong, ended or lapsed grant; 400 `job.passages_invalid` for no id, more
   than 100 or a null one; 403 `job.passages_refused` for a kind that reads no passage; 404 `request.not_found` when the
   job's campaign is gone; 403 `scope.passage_refused`, naming no id, when any id is out of the scope. The worker calls
   it through `JobsApi.passages` since Story 2.3, so `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.8.0.
+- **The other tier (Story 3.5, backend contract 1.13.0).** A question input lists three tiers, in order: campaign,
+  system and `other` (the GM's other campaigns' and systems' materials, when the GM switched that tier on; empty
+  lists otherwise). `retrieval.search.TIERS` is `("campaign", "system", "other")`: an `other` tier is searched like the
+  others, its pending pages take their turn after the system tier's, and its passages are handed over labelled
+  `other`. The backend works out every tier and every material switch; the worker never does. An input with an
+  unknown tier, or tiers out of that order, is still `retrieval.input_invalid`. `MINIMUM_BACKEND_CONTRACT_VERSION`
+  becomes 1.13.0. Deploy order: the backend first (a 1.12 worker refuses its question inputs, which now always list
+  the `other` tier, so questions fail with `retrieval.input_invalid` until this worker is deployed), then this worker.
 - **Find the passages that answer a question (Story 2.3, AD-10, backend contract 1.8.0).**
   `retrieval/search.py` `find_passages` runs for an interactive job whose claim input is the backend's question input
   (`Scopes.questionInput`): `{question, owner, tiers: [{tier, sources, pending}], tokenKey}`, `question` 1 to 4,000
-  characters (code points), the tiers in order (campaign, then system), `sources` the allowed version ids, `pending`
+  characters (code points), the tiers in order (campaign, system, then other from backend contract 1.13.0), `sources`
+  the allowed version ids, `pending`
   the ids of the tier's passages that are not indexed (their index change has not ended or failed; the backend lists
   at most the first 5,000, 100 before backend contract 1.12.0),
   `tokenKey` Base64 of the owner's 32-byte token key. Provider, model and tier come with the claim's `model` (Story
@@ -352,14 +361,15 @@ lockfile and the production image:
     read back.
   - Pending: once every tier is searched, the first 5,000 (`MAX_PENDING`) `pending` ids of each tier, in input order,
     are read by id in pages of 100 (`PAGE`, the backend's most per passages call), at most 8 at a time (`PARALLEL`),
-    the tiers' pages in turns (campaign, system, campaign, ..., then the rest of the longer one), under one deadline
-    1.5 s (`PENDING_BUDGET_SECONDS`) after the question's first pending read, both tiers together (`read_pending`), so
+    the tiers' pages in turns (campaign, system, other, campaign, ..., then the rest of the longer ones), under one
+    deadline 1.5 s (`PENDING_BUDGET_SECONDS`) after the question's first pending read, every tier together
+    (`read_pending`), so
     the first words stay within NFR-14's 5 s: no page starts after it, and a page not back by it is dropped, never
     waited for. A page that fails before the deadline fails the search as one read did. Each page is tokenized as it
     comes back, in its read's thread and so inside the deadline: each passage keeps only the question's distinct folded
     tokens of two characters or more (`question_terms`, from `keywords.tokens`, never an HMAC) that it contains. After
     the deadline only the counting runs: each token weighs BM25's ln(1 + (N - df + 0.5) / (df + 0.5)), N the pending
-    passages read for the question (both tiers) and df how many contain it (`rarity`); passages are ordered by the
+    passages read for the question (every tier) and df how many contain it (`rarity`); passages are ordered by the
     weight of the rarest question token they contain, then by the sum of their tokens' weights, so the passage naming
     what the question is about ("tarrasque") comes before those sharing several commoner words ("challenge",
     "rating"); a passage with no token is dropped, and ties keep input order (`rank_pending`). That ranking is fused with the tier's
@@ -467,7 +477,8 @@ lockfile and the production image:
     ```
 
   - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
-    `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4, 1.11.0 from Story 2.6).
+    `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4, 1.11.0 from Story 2.6, 1.13.0 from Story
+    3.5).
 - **The answer to a question (Story 2.4, `question.answer`, backend contract 1.10.0).** Registered in every mode
   (`lanes/answer.py`), on the interactive lane.
   - The claim's input is the backend's question input (`retrieval.search.question_input`; else
