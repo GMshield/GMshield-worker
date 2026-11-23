@@ -360,13 +360,15 @@ lockfile and the production image:
     record's id and its payload exactly `{owner, source, kind, page, language, record_type}`: no name, field or text.
     The index recipe stays "2" (`recipe.py` says why). Failures and retries are a passages run's; once a records
     run's retries are spent, the backend's next reconcile cuts only the records runs again, never the passages. The
-    version records its recipe only once its records runs are done too, but passage search ignores record points
-    (below) and the backend's indexing notices count passages only, until Story 4.3 searches records.
+    version records its recipe only once its records runs are done too. A question's search ignores record points
+    (below), the library search finds them from Story 4.3 part B, and the backend's indexing notices count passages
+    only.
   - The collection `passages` is created when missing: `dense` (768, cosine), `sparse` (`idf`), a tenant keyword index
     on `owner` and keyword indexes on `source` and `record_type` (a missing index is added to an existing
-    collection). Passage search filters every query and prefetch on `record_type` being empty (Qdrant's `is_empty`),
-    so it never answers a record's id. Qdrant is reached over REST at `GMSHIELD_QDRANT_URL` with its API key,
-    an https URL verified against `/run/gmshield/certs/ca.crt`, one client per job.
+    collection). A question's search filters every query and prefetch on `record_type` being empty (Qdrant's
+    `is_empty`), so it never answers a record's id; the library search does not (below). Qdrant is reached over REST
+    at `GMSHIELD_QDRANT_URL` with its API key, an https URL verified against `/run/gmshield/certs/ca.crt`, one client
+    per job.
   - `index.removal`: the claim input is `{source, owner}`; the points go by a filter on both, never by ids, so a
     version's record points go with its passage points. Safe to repeat.
   - Failures: `index.input_invalid` and `index.passage_too_long` with `retry: false`; `index.embedding_unavailable`
@@ -475,6 +477,18 @@ lockfile and the production image:
     route down are retryable. Lines (`retrieval.library_search_started`, `retrieval.library_search_done` with the
     tiers, candidate, exact-match and pending counts, the ids and the timings including `rerankSeconds`,
     `retrieval.library_search_failed`) never carry the query, a text or the key.
+  - Records (Story 4.3 part B, backend internal contract 1.18.0). The library search also answers record points
+    (`store.EVERYTHING`: no condition on `record_type`), mixed with passages by their fused score; Qdrant returns only
+    each point's `record_type` (`with_payload` limited to it), which tells a record from a passage. A search input may
+    carry `recordType`, one of the eight core keys (`indexing.CORE_TYPES`; anything else, or `recordType` in a
+    question input, is `retrieval.input_invalid`): then the filter is `record_type == key` (`store.records_of`), no
+    passage is found and no pending passage is read. Only passage candidates have their text read; `exact_first`
+    moves the passages holding the query to the front and leaves every record at its fused rank among the rest (the
+    backend, which holds names, puts a record whose name equals the query first). A record still being indexed has no
+    point, so it is not found (records have no keyword fallback). The result stays `{"ids": [...]}`, passages and
+    records alike, and `retrieval.library_search_done` adds the count of records among the ids. A question's search
+    (`find_passages`) is unchanged: passages only. `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.18.0: an older backend would
+    refuse a result that names a record. Deploy order: the backend, then this worker, then the frontend.
   - Tests (`tests/test_search.py`, "the library search") use the recorded fixtures; the two search queries
     (`searches` in `tests/fixtures/retrieval/questions.json`: "to Fire damage", an exact phrase of Frost Brand that two
     passages about fire outrank by meaning, and "Fire damage", held by three passages) were recorded through the
@@ -558,7 +572,8 @@ lockfile and the production image:
 
   - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
     `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4, 1.11.0 from Story 2.6, 1.13.0 from Story
-    3.5, 1.14.0 from Story 3.7, 1.15.0 from Story 3.8, 1.16.0 from Story 3.10, 1.17.0 from Story 4.2).
+    3.5, 1.14.0 from Story 3.7, 1.15.0 from Story 3.8, 1.16.0 from Story 3.10, 1.17.0 from Story 4.2, 1.18.0 from
+    Story 4.3 part B).
 - **The answer to a question (Story 2.4, `question.answer`, backend contract 1.10.0).** Registered in every mode
   (`lanes/answer.py`), on the interactive lane.
   - The claim's input is the backend's question input (`retrieval.search.question_input`; else
