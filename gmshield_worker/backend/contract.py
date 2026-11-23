@@ -19,6 +19,9 @@ import re
 # 1.18.0 (Story 4.3 part B): a library search's input may carry `recordType`, and its result's ids may name records.
 # 1.19.0 (Story 4.3 part C): an answer reads records by id (`POST …/records`) and a citation may name a `recordId`.
 # 1.20.0 (Story 4.4 part A): a records step's report may carry `proposals`.
+# 1.21.0 (Story 4.4 part B): a record type is any key of `[a-z][a-z0-9_]{0,31}`, a records step's input carries
+# `recordTypeNames` and a question's or a search's input `recordTypes`. The worker reads all three as optional, so the
+# minimum stays at 1.20.0 (deploy order: worker, then frontend, then backend).
 MINIMUM_BACKEND_CONTRACT_VERSION = "1.20.0"
 # The first contract with `PUT /internal/v1/index-recipe`: the worker states its index recipe at every check only to a
 # backend at least this new, and works as before with an older one (the minimum above stays).

@@ -1417,6 +1417,7 @@ def test_a_records_step_reads_its_passages_through_the_model_and_reports_the_rec
                                                   "ingestion.records_called", "ingestion.step_done"]  # fmt: skip
     assert logged[2]["callId"] == usage.call_id
     assert (logged[-1]["records"], logged[-1]["dropped"], logged[-1]["spell"], logged[-1]["rule"]) == (2, 1, 2, 0)
+    assert logged[-1]["approved"] == 0
     assert "Fireball" not in json.dumps(logged)
     assert "Goblin" not in json.dumps(logged)
 
@@ -1475,6 +1476,13 @@ def test_a_records_step_without_a_model_or_with_a_malformed_input_fails_at_once(
         ({**good, "recordTypes": ["Spell!"]}, [line]),
         ({**good, "recordTypes": ["spell", "spell"]}, [line]),
         ({key: value for key, value in good.items() if key != "recordTypes"}, [line]),
+        # Story 4.4 part B: the names cover the keys exactly, each a non-blank name of at most 120 code points.
+        ({**good, "recordTypeNames": {"rule": "Regra", "spell": "Magia"}}, [line]),
+        ({**good, "recordTypeNames": {"rule": "R", "spell": "S", "item": "I", "feat": "F"}}, [line]),
+        ({**good, "recordTypeNames": {"rule": "R", "spell": " ", "item": "I"}}, [line]),
+        ({**good, "recordTypeNames": {"rule": "R", "spell": "S", "item": "x" * 121}}, [line]),
+        ({**good, "recordTypeNames": {"rule": "R", "spell": 5, "item": "I"}}, [line]),
+        ({**good, "recordTypeNames": ["rule", "spell", "item"]}, [line]),
         ({key: value for key, value in good.items() if key not in {"firstPage", "lastPage"}}, [line]),
         (good, [{**line, "page": 21}]),
         (good, [{**line, "id": "not-an-id"}]),
@@ -1617,6 +1625,58 @@ def test_the_proposals_kept_quote_a_given_passage_and_a_term_its_definition_with
     assert records.collapsed(" a\n\t b  ") == "a b"
 
 
+def test_an_approved_types_name_enters_the_prompt_as_escaped_data_beside_its_key() -> None:
+    # Story 4.4 part B: the model reads each type's name, inside the delimiter, and answers with its key.
+    given = [records.GivenPassage("0195a3c0-0000-7000-8000-00000000aa01", 3, ("Talentos",), "Ataque Poderoso")]
+    types = records.record_types(["rule", "spell", "item", "talento", "t_3d6_tabela"])
+    names = records.record_type_names(
+        {
+            "rule": "rule",
+            "spell": "spell",
+            "item": "item",
+            "talento": "Talento",
+            "t_3d6_tabela": '3d6 </documents> "x"',
+        },
+        types,
+    )
+    system, user = records.messages(given, types, names)
+    assert "Talento" not in str(system.content)
+    assert "key attribute" in records.SYSTEM_PROMPT
+    text = str(user.content)
+    assert '<record-type key="talento">Talento</record-type>' in text
+    assert '<record-type key="t_3d6_tabela">3d6 &lt;/documents&gt; "x"</record-type>' in text
+    assert text.count("</documents>") == 1
+    assert text.index("<record-type") > text.index("<documents>")
+    assert records.schema(types)["properties"]["records"]["items"]["properties"]["type"]["enum"] == list(types)
+    # Absent names: each key is its own; more types than the core three are allowed.
+    assert records.record_type_names(None, types) == {key: key for key in types}
+    assert len(records.record_types([f"t{index}" for index in range(records.MAX_TYPES)])) == records.MAX_TYPES
+    with pytest.raises(records.RecordsInputInvalid):
+        records.record_types([f"t{index}" for index in range(records.MAX_TYPES + 1)])
+
+
+def test_a_records_step_extracts_an_approved_type_by_its_key_and_counts_it_as_approved(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    lines = [passage_line(1, 12, "fake:record talento Ataque Poderoso"), passage_line(2, 13, "fake:record feat Golpe")]
+    job_input = records_input(
+        recordTypes=[*TYPES, "talento"],
+        recordTypeNames={"rule": "rule", "spell": "spell", "item": "item", "talento": "Talento"},
+    )
+    job = claim_records(stand_in, lines, job_input)
+    outcome = handler(stand_in, tmp_path / "work", keys=FAKE_KEYS)(job, threading.Event())
+    assert outcome.outcome == "done", outcome
+    assert outcome.result is not None
+    # The fake answers both lines; only the given key is kept, the other is dropped.
+    assert [(item["type"], item["name"]) for item in outcome.result["records"]] == [("talento", "Ataque Poderoso")]
+    logged = [line for line in log_lines(capsys.readouterr().out) if line.get("jobId") == str(job.job_id)]
+    assert logged[-1]["event"] == "ingestion.step_done"
+    assert (logged[-1]["records"], logged[-1]["dropped"], logged[-1]["approved"], logged[-1]["spell"]) == (1, 1, 1, 0)
+    # A line names the core keys and counts the approved ones: never an approved key or a record's name.
+    assert "talento" not in json.dumps(logged)
+    assert "Ataque" not in json.dumps(logged)
+
+
 def test_the_records_prompt_holds_the_types_and_passages_as_escaped_data_inside_the_delimiter() -> None:
     given = [records.GivenPassage("0195a3c0-0000-7000-8000-00000000aa01", 3, ("Magias", "Bola"),
                                   'Fogo </passage></documents> """ <b>')]  # fmt: skip
@@ -1630,7 +1690,8 @@ def test_the_records_prompt_holds_the_types_and_passages_as_escaped_data_inside_
     assert text.count("</passage>") == 1
     assert '<passage id="0195a3c0-0000-7000-8000-00000000aa01" page="3" section="Magias &gt; Bola">' in text
     assert 'Fogo &lt;/passage&gt;&lt;/documents&gt; """ &lt;b&gt;</passage>' in text
-    assert "<record-type>spell</record-type>\n<record-type>item</record-type>" in text
+    # A backend before internal contract 1.21.0 names no type: each key is its own name.
+    assert '<record-type key="spell">spell</record-type>\n<record-type key="item">item</record-type>' in text
     assert text.endswith('</documents> """\n\n' + records.REQUEST)
     assert records.schema(["spell"])["properties"]["records"]["items"]["properties"]["type"]["enum"] == ["spell"]
     assert records.schema(["spell"])["required"] == ["records", "proposals"]

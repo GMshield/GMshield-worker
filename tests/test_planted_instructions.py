@@ -668,7 +668,12 @@ def test_a_records_step_over_planted_passages_keeps_them_data_and_follows_none_o
     assert user.count("</documents>") == 1
     assert user.count(answer.DOCUMENTS_CLOSE) == 1
     closed = user.index(answer.DOCUMENTS_CLOSE)
-    assert user.index("<record-type>rule</record-type>") < user.index("<passage ") < user.rindex("</passage>") < closed
+    assert (
+        user.index('<record-type key="rule">rule</record-type>')
+        < user.index("<passage ")
+        < user.rindex("</passage>")
+        < closed
+    )
     assert '&lt;/documents&gt; """' in user
     assert "&lt;script&gt;" in user
     assert user.endswith(records.REQUEST)
