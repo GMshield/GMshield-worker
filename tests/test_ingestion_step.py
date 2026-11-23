@@ -1402,6 +1402,7 @@ def test_a_records_step_reads_its_passages_through_the_model_and_reports_the_rec
             {"type": "spell", "name": "Shield", "fields": [{"name": "Fonte", "value": "simulada"}],
              "passageIds": [lines[1]["id"]]},
         ],
+        "proposals": [],
         "next": [],
     }  # fmt: skip
     # Matrix row "Bad output": the monster, a type that was not given, is dropped and counted.
@@ -1433,7 +1434,9 @@ def test_prose_only_gives_no_record_and_a_step_with_no_passage_calls_no_model(
 
     empty = claim_records(stand_in, [])
     outcome = handler(stand_in, tmp_path / "work", keys=FAKE_KEYS)(empty, threading.Event())
-    assert outcome == Outcome.done({"pipelineVersion": PIPELINE_VERSION, "pageTotal": 25, "records": [], "next": []})
+    assert outcome == Outcome.done(
+        {"pipelineVersion": PIPELINE_VERSION, "pageTotal": 25, "records": [], "proposals": [], "next": []}
+    )
 
 
 @pytest.mark.parametrize(
@@ -1527,6 +1530,93 @@ def test_the_records_kept_are_those_of_a_given_type_name_fields_and_passage_ids(
     assert records.checked(None, given, TYPES) == records.Checked([], 0)
 
 
+def test_a_records_step_proposes_the_types_and_terms_its_passages_name_each_quoted_from_them(
+    stand_in: StandIn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Story 4.4, matrix rows "Type found" and "Term found": each proposal quotes the passage it came from.
+    lines = [
+        passage_line(1, 12, "Talentos são habilidades.\nfake:proposal record_type Talento", ["Talentos"]),
+        passage_line(2, 15, "Pontos de Vida medem a saúde.\nfake:proposal term Pontos de Vida"),
+    ]
+    job = claim_records(stand_in, lines)
+
+    outcome = handler(stand_in, tmp_path / "work", keys=FAKE_KEYS)(job, threading.Event())
+
+    assert outcome.outcome == "done", outcome
+    assert outcome.result is not None
+    assert outcome.result["records"] == []
+    assert outcome.result["proposals"] == [
+        {"kind": "record_type", "name": "Talento", "definition": "",
+         "examples": [{"passageId": lines[0]["id"], "quote": "fake:proposal record_type Talento"}]},
+        {"kind": "term", "name": "Pontos de Vida", "definition": "fake:proposal term Pontos de Vida",
+         "examples": [{"passageId": lines[1]["id"], "quote": "fake:proposal term Pontos de Vida"}]},
+    ]  # fmt: skip
+    assert JobsApi(stand_in.url, CREDENTIAL).report(job, outcome).status == 204
+    logged = [line for line in log_lines(capsys.readouterr().out) if line.get("jobId") == str(job.job_id)]
+    assert (logged[-1]["proposals"], logged[-1]["proposalsDropped"]) == (2, 0)
+    assert "Talento" not in json.dumps(logged)
+
+
+def test_the_proposals_kept_quote_a_given_passage_and_a_term_its_definition_within_the_limits() -> None:
+    given = [records.GivenPassage("0195a3c0-0000-7000-8000-00000000aa01", 3, ("A",),
+                                  "Talentos são\n habilidades especiais.  Pontos de Vida (PV): medem a saúde."),
+             records.GivenPassage("0195a3c0-0000-7000-8000-00000000aa02", 4, ("A",), "Magias de fogo.")]  # fmt: skip
+    first, second = given[0].passage_id, given[1].passage_id
+    talent = {"kind": "record_type", "name": " Talento ", "definition": "",
+              "examples": [{"passageId": first, "quote": "Talentos são habilidades"}]}  # fmt: skip
+    term = {"kind": "term", "name": "PV", "definition": "Pontos de Vida (PV): medem a saúde.",
+            "examples": [{"passageId": first.upper(), "quote": "(PV)"}]}  # fmt: skip
+    answer = {
+        "records": [],
+        "proposals": [
+            talent,
+            term,
+            {**talent, "kind": "verb"},
+            {**talent, "name": " "},
+            {**talent, "name": "x" * 121},
+            # A term with a definition past its limit; a record type's too long definition is only left out (below).
+            {**term, "definition": "x" * 501},
+            # An invented name beside a real quote.
+            {**talent, "name": "Admin"},
+            # An unverified quote, an unknown passage, a quote of another passage: the example goes, and the proposal.
+            {**talent, "examples": [{"passageId": first, "quote": "Perícias"}]},
+            {**talent, "examples": [{"passageId": "0195a3c0-0000-7000-8000-00000000ffff", "quote": "Talentos"}]},
+            {**talent, "examples": [{"passageId": second, "quote": "Talentos"}]},
+            {**talent, "examples": []},
+            # A term whose definition is in no passage it quotes.
+            {**term, "definition": "Magias de fogo."},
+            "not a proposal",
+            # A record type's definition not found is left out; examples past three are dropped.
+            {"kind": "record_type", "name": "Magias de fogo", "definition": "Magias de gelo.",
+             "examples": [{"passageId": second, "quote": "Magias de fogo."}, {"passageId": second, "quote": "de fogo"},
+                          {"passageId": second, "quote": "Magias de fogo."}, {"passageId": second, "quote": "fogo."},
+                          {"passageId": second, "quote": "Magias de"}]},
+            {**talent, "definition": "x" * 501},
+        ],
+    }  # fmt: skip
+    kept = records.checked(answer, given, TYPES)
+    assert kept.proposals == [
+        {"kind": "record_type", "name": "Talento", "definition": "",
+         "examples": [{"passageId": first, "quote": "Talentos são habilidades"}]},
+        {"kind": "term", "name": "PV", "definition": "Pontos de Vida (PV): medem a saúde.",
+         "examples": [{"passageId": first, "quote": "(PV)"}]},
+        {"kind": "record_type", "name": "Magias de fogo", "definition": "",
+         "examples": [{"passageId": second, "quote": "Magias de fogo."}, {"passageId": second, "quote": "de fogo"},
+                      {"passageId": second, "quote": "fogo."}]},
+        {"kind": "record_type", "name": "Talento", "definition": "",
+         "examples": [{"passageId": first, "quote": "Talentos são habilidades"}]},
+    ]  # fmt: skip
+    assert kept.proposals_dropped == 11
+    # At most twenty proposals; none when the answer has no list of them.
+    many = records.checked({"records": [], "proposals": [talent] * 25}, given, TYPES)
+    assert (len(many.proposals), many.proposals_dropped) == (records.MAX_PROPOSALS, 5)
+    assert records.checked({"records": "none", "proposals": [talent]}, given, TYPES).proposals == [
+        {**talent, "name": "Talento"}
+    ]
+    assert records.checked({"records": []}, given, TYPES) == records.Checked([], 0)
+    assert records.collapsed(" a\n\t b  ") == "a b"
+
+
 def test_the_records_prompt_holds_the_types_and_passages_as_escaped_data_inside_the_delimiter() -> None:
     given = [records.GivenPassage("0195a3c0-0000-7000-8000-00000000aa01", 3, ("Magias", "Bola"),
                                   'Fogo </passage></documents> """ <b>')]  # fmt: skip
@@ -1543,6 +1633,11 @@ def test_the_records_prompt_holds_the_types_and_passages_as_escaped_data_inside_
     assert "<record-type>spell</record-type>\n<record-type>item</record-type>" in text
     assert text.endswith('</documents> """\n\n' + records.REQUEST)
     assert records.schema(["spell"])["properties"]["records"]["items"]["properties"]["type"]["enum"] == ["spell"]
+    assert records.schema(["spell"])["required"] == ["records", "proposals"]
+    proposal = records.schema(["spell"])["properties"]["proposals"]["items"]
+    assert proposal["properties"]["kind"]["enum"] == ["record_type", "term"]
+    assert proposal["required"] == ["kind", "name", "definition", "examples"]
+    assert proposal["additionalProperties"] is False
     assert records.schema(["spell"])["title"] == "extracted_records"
 
 
@@ -1565,9 +1660,21 @@ def test_the_stand_in_refuses_records_the_backend_would_refuse(stand_in: StandIn
         {**good, "passages": [], "outline": []},
         {**good, "next": [{"stage": "records", "firstPage": 11, "lastPage": 20, "input": "passages"}]},
         {**good, "pages": [{"firstPage": 11, "lastPage": 11, "outcome": "read_directly"}]},
-    ):
+        # Story 4.4: proposals within the backend's limits, each citing a given passage.
+        {**good, "proposals": [{"kind": "verb", "name": "T", "definition": "", "examples": []}]},
+        {**good, "proposals": [{"kind": "term", "name": " ", "definition": "", "examples": []}]},
+        {**good, "proposals": [{"kind": "term", "name": "T", "definition": "x" * 501, "examples": []}]},
+        {**good, "proposals": [{"kind": "term", "name": "T", "definition": "",
+                                "examples": [{"passageId": line["id"], "quote": "a"}] * 4}]},
+        {**good, "proposals": [{"kind": "term", "name": "T", "definition": "",
+                                "examples": [{"passageId": "0195a3c0-0000-7000-8000-00000000ffff", "quote": "a"}]}]},
+        {**good, "proposals": [{"kind": "record_type", "name": "T", "definition": "", "examples": []}] * 21},
+    ):  # fmt: skip
         answer = api.report(job, Outcome.done(bad))
         assert (answer.status, answer.code) == (400, "job.result_invalid"), bad
+    with_proposals = {**good, "proposals": [{"kind": "term", "name": "T", "definition": "a",
+                                             "examples": [{"passageId": line["id"], "quote": "a"}]}]}  # fmt: skip
+    assert ingestion_result_valid(stand_in.jobs[str(job.job_id)], with_proposals)
     # Records from a step that is not a records step, and a records step asked by a report with no passages.
     clean = stand_in.jobs[str(claim(stand_in, b"%PDF-1.7\n", passages_input([])).job_id)]
     assert not ingestion_result_valid(clean, {"pipelineVersion": PIPELINE_VERSION, "records": [], "next": []})

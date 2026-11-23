@@ -24,6 +24,8 @@ Story 4.2: when the records schema (`RECORDS_TOOL`, as `ingestion.records` names
 the answer is one call of it: a record for each `fake:record <type> <name>` line of a passage block (`<passage
 id="…" …>`), with one field and that passage's id, and no record otherwise, so the pipeline's end-to-end run reads
 prose into no record. `fake:refusal` and `fake:truncated` give no call and their stop, `fake:outage` fails as above.
+From Story 4.4 the call also holds a proposal for each `fake:proposal <record_type|term> <name>` line of a passage
+block, which quotes that line as its example (and, for a term, as its definition), and none otherwise.
 
 Story 4.3 part C: a record block of the user turn (`<record id="…" tier="…" …>`, as `lanes.answer.user_turn` writes
 it after the passages) is cited by its id as a passage is, in the order the blocks come, with its tier like a
@@ -65,6 +67,9 @@ RECORD = "fake:record"
 _RECORD_BLOCK = re.compile(r'<passage id="([0-9a-f-]{36})"[^>]*>(.*?)</passage>', re.ASCII | re.DOTALL)
 # The name starts with a character that is no blank, so no run of blanks is ever matched two ways (linear).
 _RECORD_LINE = re.compile(r"fake:record[ \t]+([a-z_]{1,32})[ \t]+([^\s<][^\n<]{0,199})")
+# Story 4.4: the line that asks the fake for one proposal, which quotes the line itself (the same linear shape).
+PROPOSAL = "fake:proposal"
+_PROPOSAL_LINE = re.compile(r"fake:proposal[ \t]+(record_type|term)[ \t]+([^\s<][^\n<]{0,119})")
 _PASSAGE_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.ASCII)
 # A data block's id and tier, as `lanes.answer.user_turn` writes them: a passage's or (Story 4.3 part C) a record's.
 _TIERED = re.compile(r'<(?:passage|record) id="([0-9a-f-]{36})" tier="([a-z]+)"', re.ASCII)
@@ -111,6 +116,24 @@ def fake_records(text: str) -> list[dict[str, Any]]:
                     "name": name.strip(),
                     "fields": [{"name": "Fonte", "value": "simulada"}],
                     "passageIds": [passage_id],
+                }
+            )
+    return found
+
+
+def fake_proposals(text: str) -> list[dict[str, Any]]:
+    """The fake's proposals (Story 4.4): one per `fake:proposal <record_type|term> <name>` line of each passage block,
+    in order, quoting the line itself as its example (and a term's definition)."""
+    found: list[dict[str, Any]] = []
+    for passage_id, body in _RECORD_BLOCK.findall(text):
+        for match in _PROPOSAL_LINE.finditer(body):
+            kind, quote = match.group(1), match.group(0).strip()
+            found.append(
+                {
+                    "kind": kind,
+                    "name": match.group(2).strip(),
+                    "definition": quote if kind == "term" else "",
+                    "examples": [{"passageId": passage_id, "quote": quote}],
                 }
             )
     return found
@@ -242,8 +265,8 @@ class FakeChatModel(BaseChatModel):
     def _records(
         self, asked: str, response_id: str, words: int, *, anthropic: bool, digest: str
     ) -> Iterator[ChatGenerationChunk]:
-        """The structured answer of a records step (Story 4.2): one call of `RECORDS_TOOL`, or a refusal's or a
-        truncation's stop with no call."""
+        """The structured answer of a records step (Story 4.2): one call of `RECORDS_TOOL` (from Story 4.4 with its
+        proposals), or a refusal's or a truncation's stop with no call."""
         if REFUSAL in asked:
             yield self._chunk(AIMessageChunk(content=""), response_id, first=True)
             yield self._last("refusal" if anthropic else "content_filter", response_id, words, 0)
@@ -252,7 +275,7 @@ class FakeChatModel(BaseChatModel):
             yield self._chunk(AIMessageChunk(content=""), response_id, first=True)
             yield self._last("max_tokens" if anthropic else "length", response_id, words, 1)
             return
-        args = json.dumps({"records": fake_records(asked)}, ensure_ascii=False)
+        args = json.dumps({"records": fake_records(asked), "proposals": fake_proposals(asked)}, ensure_ascii=False)
         call = tool_call_chunk(name=RECORDS_TOOL, args=args, id=f"call_fake{digest[:12]}", index=0)
         yield self._chunk(AIMessageChunk(content="", tool_call_chunks=[call]), response_id, first=True)
         yield self._last("tool_use" if anthropic else "tool_calls", response_id, words, 1)

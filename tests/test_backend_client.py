@@ -18,7 +18,7 @@ def test_asks_for_the_version_with_a_traceparent(stand_in: StandIn) -> None:
     trace_id = new_trace_id()
     answer = fetch_contract_version(stand_in.url, trace_id)
     assert answer.status == 200
-    assert answer.version == "1.19.0"
+    assert answer.version == "1.20.0"
     request = stand_in.requests[-1]
     assert request["path"] == "/internal/v1/version"
     assert re.fullmatch(rf"00-{trace_id}-[0-9a-f]{{16}}-01", request["traceparent"])
@@ -53,13 +53,13 @@ def test_connection_refused_raises_for_the_caller(stand_in: StandIn) -> None:
 def test_proxy_settings_of_the_environment_are_ignored(stand_in: StandIn, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
     monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:9")
-    assert fetch_contract_version(stand_in.url, new_trace_id()).version == "1.19.0"
+    assert fetch_contract_version(stand_in.url, new_trace_id()).version == "1.20.0"
 
 
 def test_the_workers_credential_is_sent_when_given(stand_in: StandIn) -> None:
     stand_in.credential = "w" * 64
     assert fetch_contract_version(stand_in.url, new_trace_id()).status == 401
-    assert fetch_contract_version(stand_in.url, new_trace_id(), credential="w" * 64).version == "1.19.0"
+    assert fetch_contract_version(stand_in.url, new_trace_id(), credential="w" * 64).version == "1.20.0"
     assert stand_in.requests[-1]["authorization"] == "Bearer " + "w" * 64
 
 
