@@ -15,6 +15,7 @@ import pytest
 import redis
 
 from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome
+from gmshield_worker.ingestion.step import IngestionStep
 from gmshield_worker.lanes import Lanes, build_lanes, consumer_name, handlers, probe
 from gmshield_worker.lanes.consumer import Lane
 from gmshield_worker.lanes.handlers import Handler
@@ -397,7 +398,8 @@ def test_the_probe_stops_when_cancelled_and_refuses_bad_input() -> None:
 
 def test_ingestion_runs_in_every_mode_and_the_probes_in_test_mode_only() -> None:
     always = {"index.change", "index.removal", "question.answer", "library.search"}
-    assert set(handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))) == {
+    test_mode = check_settings({"GMSHIELD_MODE": "test"})
+    assert set(handlers.handlers_for(test_mode)) == {
         "ingestion",
         "probe",
         "test.question",
@@ -418,6 +420,11 @@ def test_ingestion_runs_in_every_mode_and_the_probes_in_test_mode_only() -> None
         }
     )
     assert set(handlers.handlers_for(production)) == {"ingestion", *always}
+    # Story 4.2: the ingestion handler holds the providers' keys, which its records steps' model calls need.
+    for settings in (test_mode, production):
+        ingestion = handlers.handlers_for(settings)["ingestion"]
+        assert isinstance(ingestion, IngestionStep)
+        assert ingestion.keys is settings.models
 
 
 def test_both_lanes_start_interactive_first_and_stop_together() -> None:

@@ -181,20 +181,22 @@ class Answer:
 @dataclass(frozen=True)
 class Outcome:
     """How an attempt ended: `done` with an optional result, or `failed` with an optional code and, since contract
-    1.2.0, `retry=False` for a failure no other attempt can change (the backend then ends the job at once)."""
+    1.2.0, `retry=False` for a failure no other attempt can change (the backend then ends the job at once). From
+    contract 1.17.0 (Story 4.2), the usage of the attempt's model calls that no events batch carried, done or failed."""
 
     outcome: Literal["done", "failed"]
     code: str | None = None
     result: dict[str, Any] | None = None
     retry: bool | None = None
+    usage: tuple[Usage, ...] = ()
 
     @staticmethod
-    def done(result: dict[str, Any] | None = None) -> Outcome:
-        return Outcome("done", None, result)
+    def done(result: dict[str, Any] | None = None, *, usage: Sequence[Usage] = ()) -> Outcome:
+        return Outcome("done", None, result, usage=tuple(usage))
 
     @staticmethod
-    def failed(code: str, *, retry: bool | None = None) -> Outcome:
-        return Outcome("failed", code, None, retry)
+    def failed(code: str, *, retry: bool | None = None, usage: Sequence[Usage] = ()) -> Outcome:
+        return Outcome("failed", code, None, retry, tuple(usage))
 
 
 @dataclass(frozen=True)
@@ -370,6 +372,8 @@ class JobsApi:
             body.result = JobOutcomeResult.from_dict(outcome.result)
         if outcome.retry is not None:
             body.retry = outcome.retry
+        if outcome.usage:
+            body.usage = [_call_usage(item) for item in outcome.usage]
         with self._client(job.trace_id) as client:
             response = report_job_outcome.sync_detailed(
                 job.job_id, job.claim_id, client=client, body=body, x_job_grant=job.grant

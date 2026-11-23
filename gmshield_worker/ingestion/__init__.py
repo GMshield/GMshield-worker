@@ -22,7 +22,9 @@ WebP picture back). "6" (Story 1.21): the `images` stage assembles an image set 
 (a blank page for one that does not decode, which OCR reports unreadable), and asks triage over every batch. "7": a
 PDF's passages step reads the cleaned original's bookmarks, and a section path is the last bookmark's path plus the last
 Docling heading under it (Docling's heading levels no longer nest); passages are joined to about `PASSAGE_TARGET`
-(1,200) code points, the first of each section up to `PASSAGE_LIMIT`.
+(1,200) code points, the first of each section up to `PASSAGE_LIMIT`. "8" (Story 4.2): the passages step also asks
+a `records` step per run of 10 pages that holds a passage, over the passages of those pages; `records.py` reads their
+rules, spells and items through the claim's model, in-process (it reads only the backend's passages).
 """
 
-PIPELINE_VERSION = "7"
+PIPELINE_VERSION = "8"

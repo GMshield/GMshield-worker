@@ -16,6 +16,10 @@ structure the real model's run by hand relies on (`docs/_bmad-output/implementat
 - no line of the planted material, and not the question, reaches the logs;
 - Story 3.10: the planted text as an earlier turn's question and answer stays escaped data inside the same delimiter
   (one `<passage>` per passage still, one `</documents>`), never in the system message, and its ids are never cited.
+- Story 4.2: an ingestion `records` step over the planted passages sends the model `records.SYSTEM_PROMPT` exactly
+  and one user turn holding the record type names and every passage as escaped data inside one delimiter; no record,
+  type or field follows the planted text (the fake reads only `fake:record` lines, and the real model's run is the
+  story's check by hand); the step calls only its input and the worker logs nothing of the material.
 
 The planted file holds no `fake:` directive: the fake model would read it from any user text."""
 
@@ -43,6 +47,8 @@ from qdrant_client import QdrantClient
 from gmshield_worker.agents import graphs
 from gmshield_worker.agents.tools import READ_PASSAGES
 from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome
+from gmshield_worker.backend.files import JobFiles
+from gmshield_worker.ingestion import PIPELINE_VERSION, records, step
 from gmshield_worker.lanes import answer, model_probe
 from gmshield_worker.log import new_trace_id
 from gmshield_worker.models.fake import FakeChatModel
@@ -509,3 +515,74 @@ def test_only_the_answer_lane_and_the_model_probe_build_an_answering_node() -> N
     assert users == ["lanes/answer.py", "lanes/model_probe.py"]
     # graphs.py binds the node's tools; fake.py is the test-mode model's own `bind_tools` (it calls `bind(tools=…)`).
     assert modules_matching(lambda text: _BINDERS.search(text) is not None) == ["agents/graphs.py", "models/fake.py"]
+
+
+def test_a_records_step_over_planted_passages_keeps_them_data_and_follows_none_of_them(
+    stand_in: StandIn, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Matrix row "Planted text": no record, type or field follows the planted instructions.
+    seen: list[list[BaseMessage]] = []
+
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Iterator[Any]:
+            seen.append(list(messages))
+            yield from super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(step, "chat_model", lambda choice, keys, **_options: Recording(provider=choice.provider))
+    stand_in.credential = CREDENTIAL
+    lines = "".join(
+        json.dumps({"id": item.passage_id, "page": item.page, "sectionPath": item.section_path, "text": item.text})
+        + "\n"
+        for item in PASSAGES
+    ).encode()
+    job_input = {
+        "versionId": PLANTED_SOURCE,
+        "stage": "records",
+        "format": "markdown",
+        "input": "passages",
+        "attempt": 1,
+        "pageTotal": len(PASSAGES),
+        "pipelineVersion": PIPELINE_VERSION,
+        "firstPage": 1,
+        "lastPage": len(PASSAGES),
+        "recordTypes": ["rule", "spell", "item"],
+    }
+    job_id = stand_in.offer("ingestion", job_input, new_trace_id(), inputs={"passages": lines},
+                            model=model_of("azure-openai"))  # fmt: skip
+    claim = JobsApi(stand_in.url, CREDENTIAL, providers=PROVIDERS).claim(UUID(job_id), new_trace_id())
+    assert claim.job is not None
+    claimed_at = len(stand_in.requests)
+    work = tmp_path / "work"
+    work.mkdir()
+
+    outcome = step.IngestionStep(JobFiles(stand_in.url, CREDENTIAL), str(work), keys=FAKE)(claim.job, threading.Event())
+
+    calls = stand_in.requests[claimed_at:]
+    assert outcome.outcome == "done", outcome
+    assert outcome.result is not None
+    assert outcome.result["records"] == []
+    assert JobsApi(stand_in.url, CREDENTIAL).report(claim.job, outcome).status == 204
+    assert [route_of(request) for request in calls] == ["passages"]
+
+    [messages] = seen
+    assert [type(message) for message in messages] == [SystemMessage, HumanMessage]
+    assert messages[0].content == records.SYSTEM_PROMPT
+    for text in planted_texts():
+        assert text not in records.SYSTEM_PROMPT
+    user = str(messages[1].content)
+    assert user.count("<passage ") == len(PASSAGES)
+    assert user.count("</passage>") == len(PASSAGES)
+    for item in PASSAGES:
+        assert f'<passage id="{item.passage_id}" page="{item.page}" section=' in user
+    assert user.startswith(answer.DOCUMENTS_OPEN + "\n")
+    assert user.count("<documents>") == 1
+    assert user.count("</documents>") == 1
+    assert user.count(answer.DOCUMENTS_CLOSE) == 1
+    closed = user.index(answer.DOCUMENTS_CLOSE)
+    assert user.index("<record-type>rule</record-type>") < user.index("<passage ") < user.rindex("</passage>") < closed
+    assert '&lt;/documents&gt; """' in user
+    assert "&lt;script&gt;" in user
+    assert user.endswith(records.REQUEST)
+
+    logged = capsys.readouterr()
+    assert_no_content_logged(logged.out + logged.err, [*planted_texts(), *FRAGMENTS])

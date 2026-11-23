@@ -1,9 +1,11 @@
 """The models module (Story 2.10): the providers and their keys, the chat models each one builds, the fake model for
 every provider and directive, the citation markers, and the typed failures. Story 3.7: the tier markers and the fake
-model's tier-ordered answer."""
+model's tier-ordered answer. Story 4.2: the structured call, through the fake for every provider and through Chat
+Completions' strict structured outputs on a replayed answer."""
 
 from __future__ import annotations
 
+import json
 import math
 import socket
 from collections.abc import Iterator
@@ -13,11 +15,13 @@ import httpx2
 import openai
 import pytest
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_openai.chat_models.base import OpenAIAPIContextOverflowError, OpenAIContextOverflowError
+from pydantic import SecretStr
 
-from gmshield_worker.models.chat import chat_model
+from gmshield_worker.ingestion import records
+from gmshield_worker.models.chat import _ChatOpenAI, chat_model
 from gmshield_worker.models.fake import MODEL_MARKER, FakeChatModel
 from gmshield_worker.models.output import (
     MODEL_TIER,
@@ -47,6 +51,7 @@ from gmshield_worker.models.providers import (
     ProviderUnavailable,
     endpoint,
 )
+from gmshield_worker.models.structured import OUTPUT_INVALID, structured_call
 from gmshield_worker.settings import ModelKeys
 from tests.model_fixtures import content_filter_error
 
@@ -633,3 +638,106 @@ def test_the_fake_model_stops_mid_answer_with_an_estimate() -> None:
     usage = [event for event in taken if isinstance(event, Usage)]
     assert len(usage) == 1
     assert usage[0].estimated
+
+
+# --- Story 4.2: the structured call
+
+RECORD_ID = "019a0000-0000-7000-8000-0000000004a1"
+
+
+def records_turn(text: str) -> list[BaseMessage]:
+    return records.messages([records.GivenPassage(RECORD_ID, 12, ("Magias",), text)], ["spell", "item"])
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_the_fake_answers_the_records_schema_with_one_record_per_record_line_and_none_otherwise(provider: str) -> None:
+    model = chat_model(choice(provider), FAKE)
+    found = structured_call(model, records.schema(["spell", "item"]),
+                            records_turn("Fireball\nfake:record spell Fireball\nfake:record item Rope"))  # fmt: skip
+    assert found.failed is None
+    assert found.parsed == {
+        "records": [
+            {"type": "spell", "name": "Fireball", "fields": [{"name": "Fonte", "value": "simulada"}],
+             "passageIds": [RECORD_ID]},
+            {"type": "item", "name": "Rope", "fields": [{"name": "Fonte", "value": "simulada"}],
+             "passageIds": [RECORD_ID]},
+        ]
+    }  # fmt: skip
+    assert found.usage is not None
+    assert found.usage.response_id is not None
+    prose = structured_call(model, records.schema(["spell"]), records_turn("Only prose, no record."))
+    assert prose.parsed == {"records": []}
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+@pytest.mark.parametrize(
+    ("directive", "code"), [("fake:refusal", REFUSED), ("fake:truncated", TRUNCATED), ("fake:outage", UNAVAILABLE)]
+)
+def test_the_fakes_structured_directives_end_in_one_typed_failure(provider: str, directive: str, code: str) -> None:
+    found = structured_call(chat_model(choice(provider), FAKE), records.schema(["spell"]), records_turn(directive))
+    assert (found.parsed, found.failed) == (None, code)
+    assert (found.usage is None) == (directive == "fake:outage")
+
+
+def completion(message: dict[str, object], finish: str = "stop", status: int = 200) -> httpx2.Client:
+    """A Chat Completions client whose every call answers this message, or `status` with an error body."""
+    sent: list[dict[str, object]] = []
+
+    def answer(request: httpx2.Request) -> httpx2.Response:
+        sent.append(json.loads(request.content))
+        if status != 200:
+            return httpx2.Response(status, json={"error": {"message": "down", "type": "server_error"}})
+        return httpx2.Response(200, json={
+            "id": "chatcmpl-records", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", **message}, "finish_reason": finish}],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 40, "total_tokens": 940,
+                      "prompt_tokens_details": {"cached_tokens": 100}},
+        })  # fmt: skip
+
+    client = httpx2.Client(transport=httpx2.MockTransport(answer))
+    client.sent = sent  # type: ignore[attr-defined]
+    return client
+
+
+def openai_model(client: httpx2.Client) -> _ChatOpenAI:
+    return _ChatOpenAI(model="gpt-6.1-terra", api_key=SecretStr("k"), base_url="https://provider.test/v1",
+                       use_responses_api=False, store=False, max_retries=0, http_client=client)  # fmt: skip
+
+
+def test_chat_completions_answers_the_records_schema_through_strict_structured_outputs() -> None:
+    answer = {"records": [{"type": "spell", "name": "Fireball", "fields": [], "passageIds": [RECORD_ID]}]}
+    client = completion({"content": json.dumps(answer), "refusal": None})
+    found = structured_call(openai_model(client), records.schema(["spell"]), records_turn("Fireball"), call_id="c-1")
+    assert found.parsed == answer
+    assert found.failed is None
+    assert found.usage == Usage("c-1", "chatcmpl-records", 900, 100, 0, 40, 0)
+    [request] = client.sent  # type: ignore[attr-defined]
+    assert request["response_format"]["type"] == "json_schema"
+    assert request["response_format"]["json_schema"]["name"] == "extracted_records"
+    assert request["response_format"]["json_schema"]["strict"] is True
+    assert "tools" not in request
+    assert [message["role"] for message in request["messages"]] == ["system", "user"]
+    assert request["messages"][0]["content"] == records.SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize(
+    ("message", "finish", "code"),
+    [
+        ({"content": None, "refusal": "I cannot help with that."}, "stop", REFUSED),
+        ({"content": '{"records": [', "refusal": None}, "length", TRUNCATED),
+        ({"content": "", "refusal": None}, "content_filter", REFUSED),
+        ({"content": "not an object", "refusal": None}, "stop", OUTPUT_INVALID),
+    ],
+)
+def test_a_chat_completions_refusal_truncation_or_unparsed_answer_is_typed_with_its_usage(
+    message: dict[str, object], finish: str, code: str
+) -> None:
+    found = structured_call(openai_model(completion(message, finish)), records.schema(["spell"]), records_turn("x"))
+    assert (found.parsed, found.failed) == (None, code)
+    assert found.usage is not None
+    assert (found.usage.input, found.usage.output) == (900, 40)
+
+
+def test_a_chat_completions_outage_is_unavailable_with_no_usage() -> None:
+    found = structured_call(openai_model(completion({}, status=503)), records.schema(["spell"]), records_turn("x"))
+    assert found == type(found)(failed=UNAVAILABLE)

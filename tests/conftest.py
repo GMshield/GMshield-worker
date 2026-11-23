@@ -49,6 +49,12 @@ from 0, and no other field, else 400 `job.events_invalid`, as the backend does. 
 tier word may be `model`. Unlike the backend, the stand-in keeps a `model` mark whatever the input's `modelKnowledge`,
 so a test sees every mark the worker posts.
 
+Since contract 1.17.0 (Story 4.2) a done `ingestion` outcome may name next `records` steps over the passages of their
+pages (`input: "passages"`, only with the passages that report carries), and a records step's report must carry
+`records` (and no other step's may): each a type of its claim input's `recordTypes`, a non-blank name, name/value
+fields and 1 to 100 distinct ids, each a passage its `passages` input served, within the backend's limits. An outcome
+may carry `usage` (at most 16, as an events batch's), each call's kept once in `usage` by call id.
+
 `main.run` makes the process non-dumpable; an autouse fixture makes the test process dumpable again
 after each test, so one test never changes what the next one sees in `/proc`.
 """
@@ -121,7 +127,7 @@ class StandInPassage:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.16.0"
+    version: str = "1.17.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -424,22 +430,27 @@ def _no_repeats(found: list[tuple[int, int]]) -> bool:
     return all(later[0] > earlier[1] for earlier, later in itertools.pairwise(ordered))
 
 
-def _next_valid(job: StandInJob, following: object, total: int) -> bool:
+def _next_valid(job: StandInJob, following: object, total: int, *, carries: bool = False) -> bool:
     if following is None:
         return True
     if not isinstance(following, list):
         return False
     known = job.output_ids | {job.input.get("inputFileId")}
-    for item in following:
-        if not isinstance(item, dict) or not isinstance(item.get("stage"), str) or not STAGE.fullmatch(item["stage"]):
-            return False
-        first, last = item.get("firstPage"), item.get("lastPage")
-        texts = item.get("input") == "texts"
-        if (first is None) != (last is None) or (not texts and item.get("input") not in known):
-            return False
-        if first is not None and not (_page(first, total) and _page(last, total) and first <= last):
-            return False
-    return True
+    return all(_next_item_valid(item, known, total, carries=carries) for item in following)
+
+
+def _next_item_valid(item: object, known: set[Any], total: int, *, carries: bool) -> bool:
+    if not isinstance(item, dict) or not isinstance(item.get("stage"), str) or not STAGE.fullmatch(item["stage"]):
+        return False
+    first, last = item.get("firstPage"), item.get("lastPage")
+    texts = item.get("input") == "texts"
+    # Story 4.2: a records step reads the passages of its pages, which only a report carrying them may ask.
+    over_passages = item.get("input") == "passages"
+    if over_passages != (item["stage"] == "records") or (over_passages and (first is None or not carries)):
+        return False
+    if (first is None) != (last is None) or (not texts and not over_passages and item.get("input") not in known):
+        return False
+    return first is None or (_page(first, total) and _page(last, total) and first <= last)
 
 
 def _report_total(job: StandInJob, result: dict[str, Any]) -> int | None:
@@ -593,6 +604,58 @@ def _page_views_valid(result: dict[str, Any]) -> bool:
     return all(_view_valid(view, read, seen) for view in views)
 
 
+MAX_RECORDS = 1_000
+MAX_RECORD_NAME = 200
+MAX_FIELDS = 64
+MAX_FIELD_NAME = 200
+MAX_FIELD_VALUE = 8_000
+MAX_RECORD_PASSAGES = 100
+
+
+def _filled(value: object, limit: int) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and len(value) <= limit
+
+
+def _given_passages(job: StandInJob) -> set[str]:
+    """The ids of the passages a records step's `passages` input served."""
+    lines = job.inputs.get("passages", b"").decode("utf-8").splitlines()
+    return {json.loads(line)["id"] for line in lines if line.strip()}
+
+
+def _record_valid(item: object, types: list[str], given: set[str]) -> bool:
+    if not isinstance(item, dict) or item.get("type") not in types or not _filled(item.get("name"), MAX_RECORD_NAME):
+        return False
+    fields, ids = item.get("fields"), item.get("passageIds")
+    if not isinstance(fields, list) or len(fields) > MAX_FIELDS or not isinstance(ids, list):
+        return False
+    if not all(
+        isinstance(pair, dict)
+        and _filled(pair.get("name"), MAX_FIELD_NAME)
+        and _filled(pair.get("value"), MAX_FIELD_VALUE)
+        for pair in fields
+    ):
+        return False
+    return 1 <= len(ids) <= MAX_RECORD_PASSAGES and len(set(ids)) == len(ids) and all(i in given for i in ids)
+
+
+RECORDS_REPORT_KEYS = frozenset({"pipelineVersion", "pageTotal", "records", "next"})
+
+
+def _records_valid(job: StandInJob, result: dict[str, Any]) -> bool:
+    """A records step's report carries its records (Story 4.2) and nothing else (an empty `next` at most), and no
+    other step's carries records."""
+    found = result.get("records")
+    if (job.input.get("input") == "passages") != (found is not None):
+        return False
+    if found is None:
+        return True
+    if not set(result) <= RECORDS_REPORT_KEYS or result.get("next"):
+        return False
+    types = job.input.get("recordTypes") or []
+    given = _given_passages(job)
+    return isinstance(found, list) and len(found) <= MAX_RECORDS and all(_record_valid(i, types, given) for i in found)
+
+
 def ingestion_result_valid(job: StandInJob, result: object) -> bool:
     """The backend's rules for a done `ingestion` step (`IngestionSteps.Report.of` and its range checks): a pipeline
     version; the page total (the report's, or the chain's from the claim input, the same when both are given); an
@@ -607,9 +670,10 @@ def ingestion_result_valid(job: StandInJob, result: object) -> bool:
         total is not None
         and _files_valid(job, result)
         and _pages_valid(result, total)
-        and _next_valid(job, result.get("next"), total)
+        and _next_valid(job, result.get("next"), total, carries=result.get("passages") is not None)
         and _passages_valid(result, total)
         and _page_views_valid(result)
+        and _records_valid(job, result)
     )
 
 
@@ -622,14 +686,33 @@ def index_result_valid(result: object) -> bool:
     )
 
 
+def _usage_valid(usage: object) -> bool:
+    keys = ("input", "cacheRead", "cacheWrite", "output", "reasoning")
+    return (
+        isinstance(usage, list)
+        and len(usage) <= 16
+        and all(
+            isinstance(item, dict)
+            and isinstance(item.get("callId"), str)
+            and all(type(item.get(k)) is int and item[k] >= 0 for k in keys)
+            and type(item.get("estimated", False)) is bool
+            for item in usage
+        )
+    )
+
+
 def _outcome(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     outcome = json.loads(body)
     done = outcome["outcome"] == "done"
+    if not _usage_valid(outcome.get("usage") or []):
+        return problem(400, "request.invalid")
     if done and job.kind == "ingestion" and not ingestion_result_valid(job, outcome.get("result")):
         return problem(400, "job.result_invalid")
     if done and job.kind == "index.change" and not index_result_valid(outcome.get("result")):
         return problem(400, "job.result_invalid")
     job.outcomes.append(outcome)
+    for item in outcome.get("usage") or []:
+        state.usage.setdefault(item["callId"], item)
     if outcome["outcome"] == "failed":
         delivered = any(batch["events"] for batch in state.batches.get(job.job_id, []))
         last = outcome.get("retry") is False or job.attempt >= state.max_attempts or delivered

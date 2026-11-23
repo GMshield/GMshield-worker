@@ -33,7 +33,17 @@ size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in 
   boxes or range) and the `outline`. From pipeline "7", a PDF's passages step whose claim input names the version's
   cleaned `original` first downloads it and reads its bookmarks with `clean.py bookmarks` in the sandbox, so section
   paths follow the file's own bookmarks; a child that fails or writes something else leaves no bookmarks (the paths
-  then come from the headings alone), and the original is deleted before the text files come.
+  then come from the headings alone), and the original is deleted before the text files come. From pipeline "8"
+  (Story 4.2), the report also asks one `records` step per run of `RECORDS_PAGES` pages that holds a passage, over the
+  passages of those pages (`input: "passages"`): the backend mints the passages' ids, so it serves them only then.
+- `records` (Story 4.2; any format; the passages of its pages as JSON Lines, and the record types in the claim
+  input's `recordTypes`): `records.py` builds the prompt and checks the answer, and one structured call of the claim's
+  model (`models.chat.chat_model`, `RECORDS_TIMEOUT_SECONDS`, `models.structured.structured_call`) reads them; the
+  report gives the `records` kept, and the outcome the call's usage under its worker-minted call id. A refusal, a
+  truncation, or a prompt filter's flag (`model.question_flagged`, `model.source_flagged`) fails the step with its code
+  and `retry: false` (`RECORDS_FINAL`), an outage or an answer that did not parse with its code
+  (the backend retries while attempts remain); a claim without a model fails with `model.input_invalid`, a provider
+  this worker cannot call with its code, both `retry: false`. The backend never fails the version for a records step.
 
 Before anything is downloaded, a step whose input names the chain's `pipelineVersion` checks it against this worker's:
 another one fails the step with `ingestion.pipeline_changed` and `retry: false`, and the backend restarts the chain.
@@ -56,6 +66,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -63,7 +74,18 @@ import httpx
 
 from gmshield_worker.backend.client import ClaimedJob, Outcome
 from gmshield_worker.backend.files import FileTransferError, StoredOutput
-from gmshield_worker.ingestion import PIPELINE_VERSION, clean, images, layout, ocr, passages, sandbox, text, triage
+from gmshield_worker.ingestion import (
+    PIPELINE_VERSION,
+    clean,
+    images,
+    layout,
+    ocr,
+    passages,
+    records,
+    sandbox,
+    text,
+    triage,
+)
 from gmshield_worker.ingestion.errors import (
     FILE_UNREADABLE,
     PASSWORD_REQUIRED,
@@ -73,6 +95,11 @@ from gmshield_worker.ingestion.errors import (
     StepFailed,
 )
 from gmshield_worker.log import TraceLog
+from gmshield_worker.models.chat import chat_model
+from gmshield_worker.models.output import Usage, new_call_id
+from gmshield_worker.models.providers import ProviderUnavailable
+from gmshield_worker.models.structured import structured_call
+from gmshield_worker.settings import ModelKeys
 from gmshield_worker.workdir import step_folder
 
 KIND = "ingestion"
@@ -83,6 +110,7 @@ OCR = "ocr"
 TEXT = "text"
 PASSAGES = "passages"
 IMAGES = "images"
+RECORDS = "records"
 PDF = "pdf"
 # The format of an image set's version (Story 1.21): its pages are read as a PDF's once assembled.
 IMAGE_SET = "images"
@@ -94,6 +122,16 @@ TEXTS = "texts"
 TEXTS_FILE = "texts.json"
 # The file the clean child writes the original's bookmarks to, in a passages step (pipeline "7").
 BOOKMARKS_FILE = "bookmarks.json"
+# A records step's input (Story 4.2): the passages of its pages, and the file it holds them in.
+PASSAGES_INPUT = "passages"
+PASSAGES_FILE = "passages.jsonl"
+# The pages one records step reads: ten pages hold a dense spell chapter (around 30 spells) in one structured answer.
+RECORDS_PAGES = 10
+# One records call's limits: its connect, read or write wait (the answer comes whole, so this bounds the call within the
+# step's 10 minutes) and its answer's tokens.
+RECORDS_TIMEOUT_SECONDS = 480.0
+RECORDS_MAX_TOKENS = 16_000
+MODEL_INPUT_INVALID = "model.input_invalid"
 UNIT = "worker.ingestion"
 SOURCE_FILE = "source.pdf"
 SOURCE_TEXT = "source.txt"
@@ -121,6 +159,10 @@ STAGES = frozenset(
         (LAYOUT, IMAGE_SET),
         (OCR, IMAGE_SET),
         (PASSAGES, IMAGE_SET),
+        (RECORDS, PDF),
+        (RECORDS, "txt"),
+        (RECORDS, "markdown"),
+        (RECORDS, IMAGE_SET),
     }
 )
 # The most image pages one `ocr` step reads: the worker owns this size. Ten pages must stay well inside a step's
@@ -150,6 +192,8 @@ MAX_PICTURE_SIDE = 10_000
 MAX_LINES = 10_000
 MAX_LINE = 4_096
 MAX_PAGE_TEXT = 16_384
+# A records call's failures that no other attempt changes (Story 4.2): a refusal and a truncation end the step at once.
+RECORDS_FINAL = frozenset({"model.refused", "model.truncated", "model.question_flagged", "model.source_flagged"})
 
 
 class FileRoutes(Protocol):
@@ -423,6 +467,8 @@ class IngestionStep:
     runner: Runner = field(default=sandbox.run_child)
     clock: Callable[[], float] = field(default=time.monotonic)
     artifacts: str = field(default_factory=lambda: os.environ.get("DOCLING_ARTIFACTS_PATH", DOCLING_ARTIFACTS))
+    # The providers' keys (Story 4.2): only a records step calls a model.
+    keys: ModelKeys = field(default_factory=ModelKeys)
 
     def __call__(self, job: ClaimedJob, cancel: threading.Event, /) -> Outcome:
         log = TraceLog(UNIT, job.trace_id)
@@ -443,7 +489,9 @@ class IngestionStep:
             return Outcome.failed(failed.code, retry=None if failed.retry else False)
         started = time.monotonic()
         log.info("ingestion.step_started", jobId=job_id, stage=stage, attempt=job.attempt)
-        run = {
+        # The usage of the step's model calls (a records step's only), reported with the outcome however it ends.
+        usage: list[Usage] = []
+        stages: dict[str, Callable[..., tuple[dict[str, Any], dict[str, int]]]] = {
             CLEAN: self._clean,
             IMAGES: self._images,
             TRIAGE: self._triage,
@@ -451,18 +499,20 @@ class IngestionStep:
             OCR: self._ocr,
             TEXT: self._text,
             PASSAGES: self._passages,
-        }[checked.stage]
+            RECORDS: partial(self._records, usage=usage),
+        }
+        run = stages[checked.stage]
         try:
             with step_folder(self.work_dir, job_id, job.trace_id) as folder:
                 result, counts = run(job, checked, cancel, folder, log)
         except StepFailed as failed:
             log.warn("ingestion.step_failed", jobId=job_id, stage=stage, code=failed.code, retry=failed.retry)
-            return Outcome.failed(failed.code, retry=None if failed.retry else False)
+            return Outcome.failed(failed.code, retry=None if failed.retry else False, usage=usage)
         except (httpx.HTTPError, FileTransferError, OSError) as error:
             log.warn(
                 "ingestion.step_failed", jobId=job_id, stage=stage, code=STEP_FAILED, errorType=type(error).__name__
             )
-            return Outcome.failed(STEP_FAILED)
+            return Outcome.failed(STEP_FAILED, usage=usage)
         log.info(
             "ingestion.step_done",
             jobId=job_id,
@@ -471,7 +521,7 @@ class IngestionStep:
             seconds=round(time.monotonic() - started, 3),
             workerMaxRssKib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         )
-        return Outcome.done(result)
+        return Outcome.done(result, usage=usage)
 
     # --- the stages
 
@@ -839,19 +889,80 @@ class IngestionStep:
             for record in records:
                 cutter.page(record)
         found, outline = cutter.finish()
+        following = records_steps((item["page"] for item in found), checked.page_total or 0)
         result = {
             "pipelineVersion": PIPELINE_VERSION,
             "pageTotal": checked.page_total,
             "passages": found,
             "outline": outline,
-            "next": [],
+            "next": following,
         }
         return result, {
             "texts": len(checked.texts),
             "bookmarks": len(bookmarks),
             "passages": len(found),
             "sections": len(outline),
+            "records": len(following),
         }
+
+    def _records(
+        self,
+        job: ClaimedJob,
+        checked: StepInput,
+        cancel: threading.Event,
+        folder: Path,
+        log: TraceLog,
+        *,
+        usage: list[Usage],
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """The records of the step's pages (Story 4.2): their passages, then one structured call of the claim's model.
+        The call's usage goes into `usage` before anything can fail."""
+        job_id = str(job.job_id)
+        first, last = checked.first_page, checked.last_page
+        if job.model is None:
+            raise StepFailed(MODEL_INPUT_INVALID, retry=False)
+        if checked.name != PASSAGES_INPUT or first is None or last is None:
+            raise StepFailed(STEP_FAILED, retry=False)
+        try:
+            types = records.record_types(job.input.get("recordTypes"))
+        except records.RecordsInputInvalid as error:
+            raise StepFailed(STEP_FAILED, retry=False) from error
+        path = folder / PASSAGES_FILE
+        size = self.files.download(job, PASSAGES_INPUT, path)
+        log.info("ingestion.input_downloaded", jobId=job_id, size=size)
+        _stop_if_cancelled(cancel)
+        try:
+            given = records.read_passages(path, first, last)
+        except records.RecordsInputInvalid as error:
+            raise StepFailed(STEP_FAILED, retry=False) from error
+        path.unlink()
+        found: list[dict[str, Any]] = []
+        dropped = 0
+        if given:
+            try:
+                model = chat_model(job.model, self.keys, max_tokens=RECORDS_MAX_TOKENS, timeout=RECORDS_TIMEOUT_SECONDS)
+            except ProviderUnavailable as unavailable:
+                raise StepFailed(unavailable.code, retry=False) from unavailable
+            call_id = new_call_id()
+            started = time.monotonic()
+            answer = structured_call(model, records.schema(types), records.messages(given, types), call_id=call_id)
+            if answer.usage is not None:
+                usage.append(answer.usage)
+            log.info(
+                "ingestion.records_called",
+                jobId=job_id,
+                callId=call_id,
+                passages=len(given),
+                seconds=round(time.monotonic() - started, 3),
+                failed=answer.failed or "none",
+            )
+            if answer.failed is not None:
+                raise StepFailed(answer.failed, retry=answer.failed not in RECORDS_FINAL)
+            kept = records.checked(answer.parsed, given, types)
+            found, dropped = kept.records, kept.dropped
+        result = {"pipelineVersion": PIPELINE_VERSION, "pageTotal": checked.page_total, "records": found, "next": []}
+        by_type = {kind: sum(1 for item in found if item["type"] == kind) for kind in types}
+        return result, {"passages": len(given), "records": len(found), "dropped": dropped, **by_type}
 
     def _bookmarks(
         self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog
@@ -942,6 +1053,17 @@ class IngestionStep:
 def passages_step(total: int) -> dict[str, Any]:
     """The next step over every text file of the version (Story 1.18): its pages are all of them."""
     return {"stage": PASSAGES, "firstPage": 1, "lastPage": total, "input": TEXTS}
+
+
+def records_steps(pages: Iterable[int], total: int) -> list[dict[str, Any]]:
+    """The records steps after the passages (Story 4.2): one per run of `RECORDS_PAGES` pages, from page 1, that holds
+    a passage; a run with none asks nothing."""
+    held = set(pages)
+    return [
+        {"stage": RECORDS, "firstPage": first, "lastPage": last, "input": PASSAGES_INPUT}
+        for first, last in cut([(1, total)], RECORDS_PAGES)
+        if any(first <= page <= last for page in held)
+    ]
 
 
 def _succeeded(child: sandbox.ChildResult) -> bool:
