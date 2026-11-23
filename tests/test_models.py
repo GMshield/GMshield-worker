@@ -365,6 +365,28 @@ def test_the_fake_handed_one_tier_answers_with_no_tier_marker() -> None:
     assert "Alternativa" not in display(events)
 
 
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_the_fake_cites_a_record_block_by_its_id_and_reads_its_tier_like_a_passages(provider: str) -> None:
+    # Story 4.3 part C: a record block after the passages, as `lanes.answer.user_turn` writes it.
+    record = f'<record id="{B}" tier="campaign" type="spell"><name>Luz</name><field name="Nível">0</field></record>'
+    turn = tiered_turn((A, "system")).replace("\n</documents>", f"\n{record}\n</documents>")
+    markers = CitationMarkers([A])
+    markers.give([B], records=True)
+    markers.give_tiers(["system", "campaign"])
+    events: list[ModelEvent] = []
+    stream_call(
+        chat_model(choice(provider), FAKE),
+        [SystemMessage("s"), HumanMessage(turn)],
+        markers=markers,
+        emit=events.append,
+    )
+
+    cited = [event for event in events if isinstance(event, Citation)]
+    # Two tiers: the record's campaign version leads, the passage's system version follows.
+    assert [(event.passage_id, event.record) for event in cited] == [(B, True), (A, False)]
+    assert [event.tier for event in events if isinstance(event, TierMark)] == ["campaign", "system"]
+
+
 # ---- model knowledge (Story 3.8)
 
 

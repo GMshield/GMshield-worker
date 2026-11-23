@@ -27,6 +27,7 @@ from gmshield_worker.backend.generated.api.jobs import (
     claim_job,
     post_job_events,
     read_job_passages,
+    read_job_records,
     renew_job_claim,
     report_job_outcome,
 )
@@ -44,6 +45,8 @@ from gmshield_worker.backend.generated.models import (
     JobOutcomeResult,
     JobPassages,
     JobPassagesRequest,
+    JobRecords,
+    JobRecordsRequest,
     JobRenewal,
     JobStreamEvent,
     Problem,
@@ -51,7 +54,7 @@ from gmshield_worker.backend.generated.models import (
 from gmshield_worker.backend.generated.models.job_stream_event_tier import check_job_stream_event_tier
 from gmshield_worker.backend.generated.types import UNSET, Unset
 from gmshield_worker.log import parse_traceparent, traceparent
-from gmshield_worker.models.output import StreamedEvent, TextDelta, TierMark, Usage
+from gmshield_worker.models.output import Citation, StreamedEvent, TextDelta, TierMark, Usage
 from gmshield_worker.models.providers import ModelChoice
 from gmshield_worker.retrieval.recipe import INDEX_RECIPE
 
@@ -221,6 +224,37 @@ class PassagesAnswer:
 
 
 @dataclass(frozen=True)
+class RecordField:
+    """One field of a record the backend served: library data, never an instruction. Never printed."""
+
+    name: str = field(repr=False)
+    value: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class ReadRecord:
+    """A record the backend served by id (contract 1.19.0, Story 4.3 part C): library data, never an instruction. Its
+    id, tier, core type key and first page print; its name, fields and section path are never printed or logged."""
+
+    record_id: str
+    tier: str
+    type: str
+    page: int
+    name: str = field(repr=False)
+    fields: list[RecordField] = field(repr=False)
+    section_path: list[str] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class RecordsAnswer:
+    """What `POST .../records` answered: the records in the order asked when it is a 200, else the problem's code."""
+
+    status: int
+    records: list[ReadRecord] | None = None
+    code: str | None = None
+
+
+@dataclass(frozen=True)
 class EventsAnswer:
     """What `POST .../events` answered (contract 1.11.0): the status, and on a 200 whether the answer must stop (the GM
     stopped it, Story 2.6); else the problem's code."""
@@ -235,6 +269,8 @@ def _stream_event(event: StreamedEvent) -> JobStreamEvent:
         return JobStreamEvent(type_="delta", text=event.text)
     if isinstance(event, TierMark):
         return JobStreamEvent(type_="tier", tier=check_job_stream_event_tier(event.tier), offset=event.offset)
+    if isinstance(event, Citation) and event.record:
+        return JobStreamEvent(type_="citation", record_id=UUID(event.passage_id), offset=event.offset)
     return JobStreamEvent(type_="citation", passage_id=UUID(event.passage_id), offset=event.offset)
 
 
@@ -267,7 +303,8 @@ class JobsApi:
     recipe (contract 1.7.0, Story 2.1): the backend re-indexes what was indexed under another one. Every claim also
     states the providers this worker holds a key for (contract 1.9.0, Story 2.10): the backend refuses a kind that calls
     a model through another one. `passages` reads passage text by id under the claim's grant (contract 1.8.0, Story
-    2.3); `events` posts a numbered batch of answer events and usage (contract 1.10.0, Story 2.4)."""
+    2.3), and `records` a record's name and fields by id (contract 1.19.0, Story 4.3 part C); `events` posts a numbered
+    batch of answer events and usage (contract 1.10.0, Story 2.4)."""
 
     base_url: str
     credential: str = field(repr=False)
@@ -334,6 +371,36 @@ class JobsApi:
                 ],
             )
         return PassagesAnswer(status=int(response.status_code), code=_code(parsed))
+
+    def records(self, job: ClaimedJob, ids: list[str]) -> RecordsAnswer:
+        """`POST /internal/v1/jobs/{id}/claims/{claimId}/records` (contract 1.19.0, Story 4.3 part C): the records with
+        these ids (1 to 100) within the job's scope, with their names and fields, under the claim's grant."""
+        with self._client(job.trace_id) as client:
+            response = read_job_records.sync_detailed(
+                job.job_id,
+                job.claim_id,
+                client=client,
+                body=JobRecordsRequest(ids=[UUID(record_id) for record_id in ids]),
+                x_job_grant=job.grant,
+            )
+        parsed = response.parsed
+        if response.status_code == 200 and isinstance(parsed, JobRecords):
+            return RecordsAnswer(
+                status=200,
+                records=[
+                    ReadRecord(
+                        record_id=str(item.id),
+                        tier=item.tier,
+                        type=item.type_,
+                        page=item.page,
+                        name=item.name,
+                        fields=[RecordField(one.name, one.value) for one in item.fields],
+                        section_path=list(item.section_path),
+                    )
+                    for item in parsed.records
+                ],
+            )
+        return RecordsAnswer(status=int(response.status_code), code=_code(parsed))
 
     def events(
         self, job: ClaimedJob, batch: int, events: Sequence[StreamedEvent], usage: Sequence[Usage] = ()

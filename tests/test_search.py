@@ -23,14 +23,23 @@ import httpx
 import pytest
 from qdrant_client import QdrantClient, models
 
-from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome, PassagesAnswer, ReadPassage
+from gmshield_worker.backend.client import (
+    ClaimedJob,
+    JobsApi,
+    Outcome,
+    PassagesAnswer,
+    ReadPassage,
+    ReadRecord,
+    RecordField,
+    RecordsAnswer,
+)
 from gmshield_worker.lanes import question
 from gmshield_worker.lanes import search as lane_search
 from gmshield_worker.log import TraceLog, new_trace_id
 from gmshield_worker.retrieval import embedding, keywords, search, store
 from gmshield_worker.settings import IndexSettings
 from tests import retrieval_fixtures
-from tests.conftest import StandIn, StandInPassage, log_lines
+from tests.conftest import StandIn, StandInPassage, StandInRecord, log_lines
 
 CREDENTIAL = "w" * 64
 KEY = bytes(range(32))
@@ -1518,9 +1527,91 @@ def test_a_record_type_filter_leaves_only_records_of_that_type_and_reads_no_pend
     assert all(prefetch.filter == expected for prefetch in query["prefetch"])
 
 
-def test_an_answer_never_gets_a_record_even_where_records_are_indexed(
-    stand_in: StandIn, with_records: RecordLibrary
+def serve_records(stand_in: StandIn, lib: RecordLibrary) -> None:
+    """The backend holds each record point of `lib` as a record of the SRD source, named after its fixture passage."""
+    for key, record_id in {**lib.items, **lib.spells}.items():
+        item = BY_KEY[key]
+        record_type = "item" if key in lib.items else "spell"
+        stand_in.records[record_id] = StandInRecord(
+            SRD, record_type, item.title, [("Fonte", "SRD")], item.page, list(item.section_path)
+        )
+
+
+def find_sources(stand_in: StandIn, lib: Library, text: str, tiers: list[dict[str, Any]]) -> search.Sources:
+    """`find_sources` with a record reader, as an answer calls it (Story 4.3 part C)."""
+    job = claim(stand_in, question_input(text, tiers))
+    api = JobsApi(stand_in.url, CREDENTIAL)
+    return search.find_sources(
+        job,
+        search.question_input(job.input),
+        embedder=retrieval_fixtures.RecordedOllama().embedder(),
+        stores=lambda: local(lib.spy),
+        reader=api,
+        log=TraceLog("test", job.trace_id),
+        record_reader=api,
+    )
+
+
+def records_requests(stand_in: StandIn) -> list[list[str]]:
+    return [json.loads(item["body"])["ids"] for item in stand_in.requests if item["path"].endswith("/records")]
+
+
+def test_an_answer_gets_records_only_through_the_records_search(
+    stand_in: StandIn, with_records: RecordLibrary, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    serve_fixtures(stand_in)
+    serve_records(stand_in, with_records)
+    text = SEARCHES["s-fire-damage"].query
+    tiers = [tier("campaign", [PT]), tier("system", [SRD])]
+    passages_only = find(stand_in, Library(with_records.spy), text, tiers)
+    before = len(with_records.spy.queries)
+
+    found = find_sources(stand_in, Library(with_records.spy), text, tiers)
+
+    # The passages are exactly what the passages search alone hands over: no record takes a passage's slot.
+    assert [item.passage_id for item in found.passages] == [item.passage_id for item in passages_only]
+    assert with_records.records.isdisjoint(item.passage_id for item in found.passages)
+    # The records come from their own search, at most 4 a tier, each read through the records route only.
+    records = [item.record_id for item in found.records]
+    assert with_records.spells["srd-fireball"] in records
+    assert set(records) <= with_records.records
+    assert 0 < len(records) <= search.RECORD_LIMIT
+    assert {item.tier for item in found.records} == {"system"}
+    fireball = next(item for item in found.records if item.record_id == with_records.spells["srd-fireball"])
+    assert (fireball.type, fireball.name, fireball.page) == (
+        "spell",
+        BY_KEY["srd-fireball"].title,
+        BY_KEY["srd-fireball"].page,
+    )
+    assert [(one.name, one.value) for one in fireball.fields] == [("Fonte", "SRD")]
+    assert BY_KEY["srd-fireball"].title not in repr(found)
+    assert records_requests(stand_in) == [records]
+    assert all(with_records.records.isdisjoint(call) for call in passages_requests(stand_in))
+    # Per tier, the passages query as before, then a records-only query of 4 points (any type, never a passage).
+    queries = with_records.spy.queries[before:]
+    assert len(queries) == 4
+    assert_filtered(queries[0], [PT])
+    assert_filtered(queries[2], [SRD])
+    for query, sources in ((queries[1], [PT]), (queries[3], [SRD])):
+        expected = models.Filter(
+            must=[
+                models.FieldCondition(key="owner", match=models.MatchValue(value=OWNER)),
+                models.FieldCondition(key="source", match=models.MatchAny(any=sources)),
+            ],
+            must_not=[models.IsEmptyCondition(is_empty=models.PayloadField(key="record_type"))],
+        )
+        assert query["query_filter"] == expected
+        assert all(prefetch.filter == expected for prefetch in query["prefetch"])
+        assert query["limit"] == search.RECORD_LIMIT
+        assert query["with_payload"] == models.PayloadSelectorInclude(include=["record_type"])
+    # The done line keeps the passages' ids and adds the records' ids, nothing of a record's name or field.
+    done = [line for line in log_lines(capsys.readouterr().out) if line["event"] == "retrieval.search_done"]
+    assert done[-1]["ids"] == [item.passage_id for item in found.passages]
+    assert done[-1]["records"] == records
+    assert done[0]["records"] == []
+
+
+def test_a_search_without_a_record_reader_never_queries_records(stand_in: StandIn, with_records: RecordLibrary) -> None:
     serve_fixtures(stand_in)
     before = len(with_records.spy.queries)
 
@@ -1528,9 +1619,49 @@ def test_an_answer_never_gets_a_record_even_where_records_are_indexed(
 
     assert ids
     assert with_records.records.isdisjoint(ids)
-    query = with_records.spy.queries[before]
-    assert query["with_payload"] is False
-    assert models.IsEmptyCondition(is_empty=models.PayloadField(key="record_type")) in query["query_filter"].must
+    queries = with_records.spy.queries[before:]
+    assert len(queries) == 1
+    assert queries[0]["with_payload"] is False
+    assert models.IsEmptyCondition(is_empty=models.PayloadField(key="record_type")) in queries[0]["query_filter"].must
+    assert records_requests(stand_in) == []
+
+
+def test_a_refused_records_read_fails_the_answer_with_its_code_and_one_down_is_retryable(
+    stand_in: StandIn, with_records: RecordLibrary
+) -> None:
+    serve_fixtures(stand_in)
+    serve_records(stand_in, with_records)
+    text = SEARCHES["s-fire-damage"].query
+
+    stand_in.records_status = 403
+    with pytest.raises(search.SearchFailed) as refused:
+        find_sources(stand_in, Library(with_records.spy), text, [tier("system", [SRD])])
+    stand_in.records_status, stand_in.records_code = 503, "server.unavailable"
+    with pytest.raises(search.SearchFailed) as down:
+        find_sources(stand_in, Library(with_records.spy), text, [tier("system", [SRD])])
+
+    assert (refused.value.code, refused.value.retry) == ("scope.passage_refused", False)
+    assert (down.value.code, down.value.retry) == (search.RECORDS_UNAVAILABLE, True)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        RecordsAnswer(200, []),
+        RecordsAnswer(200, [ReadRecord("r1", "campaign", "spell", 1, "Luz", [RecordField("Nível", "0")], [])]),
+        RecordsAnswer(403),
+    ],
+)
+def test_a_records_answer_out_of_order_of_another_tier_or_refused_without_a_code_fails(answer: RecordsAnswer) -> None:
+    class Reader:
+        def records(self, job: ClaimedJob, ids: list[str]) -> RecordsAnswer:
+            return answer
+
+    with pytest.raises(search.SearchFailed) as failed:
+        search.read_records(Reader(), fake_job(), ["r1"], {"r1": "system"})
+
+    expected = (search.RECORDS_REFUSED, False) if answer.status == 403 else (search.RECORDS_UNAVAILABLE, True)
+    assert (failed.value.code, failed.value.retry) == expected
 
 
 def test_the_records_are_counted_in_the_done_line_by_ids_only(

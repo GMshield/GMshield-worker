@@ -12,7 +12,11 @@ model's campaign version leads under a `tier` mark at 0 and the system's follows
 
 Story 3.8: the system prompt has the model-knowledge rule only when the input's `modelKnowledge` is true (absent is
 false); then the fake adds an uncited paragraph under a `model` mark after the cited ones, or writes only that paragraph
-with no passage; off, a `[[tier:model]]` the model writes is removed and posts nothing."""
+with no passage; off, a `[[tier:model]]` the model writes is removed and posts nothing.
+
+Story 4.3 part C: an answer also hands the model the scope's records found by their own search, each an escaped
+`<record>` block after the passages inside the same delimiter; the fake cites a record's id as a passage's, and its
+citation reaches the backend as `recordId`."""
 
 from __future__ import annotations
 
@@ -35,11 +39,11 @@ from gmshield_worker.lanes import answer, batches
 from gmshield_worker.log import TraceLog, new_trace_id
 from gmshield_worker.models import chat
 from gmshield_worker.models.fake import FakeChatModel
-from gmshield_worker.models.output import Citation, StreamedEvent, TextDelta, Usage
-from gmshield_worker.retrieval import search
+from gmshield_worker.models.output import Citation, CitationMarkers, StreamedEvent, TextDelta, Usage
+from gmshield_worker.retrieval import keywords, search, store
 from gmshield_worker.settings import PROVIDERS, ModelKeys
 from tests import retrieval_fixtures
-from tests.conftest import StandIn, log_lines
+from tests.conftest import StandIn, StandInRecord, log_lines
 from tests.model_fixtures import content_filter_error
 from tests.test_search import (
     BY_KEY,
@@ -48,13 +52,17 @@ from tests.test_search import (
     OWNER,
     PT,
     QUESTIONS,
+    SEARCHES,
     SRD,
     Library,
+    RecordLibrary,
     library,
     local,
     question_input,
     serve_fixtures,
+    serve_records,
     tier,
+    with_records,
 )
 
 FAKE = ModelKeys(test_mode=True)
@@ -818,3 +826,174 @@ def test_with_model_knowledge_on_and_two_tiers_that_disagree_the_marks_are_campa
     cited = [event["offset"] for event in events if event["type"] == "citation"]
     assert cited
     assert all(offset < model_at for offset in cited)
+
+
+# --- records in answers (Story 4.3 part C)
+
+_ = with_records  # the module-scoped fixture of `test_search`, used by name below
+
+
+def test_an_answer_hands_the_found_records_after_the_passages_and_cites_a_record_by_its_id(
+    stand_in: StandIn, with_records: RecordLibrary, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list[list[BaseMessage]] = []
+
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
+            seen.append(list(messages))
+            return super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Recording(provider=choice.provider))
+    job = claimed(stand_in, SEARCHES["s-fire-damage"].query, [tier("system", [SRD])])
+    serve_records(stand_in, with_records)
+    fireball = with_records.spells["srd-fireball"]
+
+    assert run(stand_in, Library(with_records.spy), job) == Outcome.done()
+
+    user = str(next(message for message in seen[0] if isinstance(message, HumanMessage)).content)
+    block = (
+        f'<record id="{fireball}" tier="system" type="spell"><name>{BY_KEY["srd-fireball"].title}</name>'
+        '<field name="Fonte">SRD</field></record>'
+    )
+    assert block in user
+    assert user.index("</passage>") < user.index(answer.RECORDS_LABEL) < user.index(block)
+    assert user.index(block) < user.index(answer.DOCUMENTS_CLOSE) < user.index("<question>")
+    events = every_event(stand_in, job)
+    citations = [event for event in events if event["type"] == "citation"]
+    record_ids = [event["recordId"] for event in citations if "recordId" in event]
+    assert fireball in record_ids
+    assert all(("recordId" in event) != ("passageId" in event) for event in citations)
+    assert set(record_ids) <= with_records.records
+    assert with_records.records.isdisjoint(event.get("passageId") for event in citations)
+    started = [line for line in log_lines(capsys.readouterr().out) if line["event"] == "answer.started"]
+    assert started[-1]["records"] == len([item for item in user.split("<record ")[1:]])
+
+
+def test_a_record_is_data_escaped_in_its_block_and_with_no_passage_it_still_sits_inside_the_delimiter() -> None:
+    record = search.HandedRecord(
+        "0195a3c0-0000-7000-8000-0000000000f1",
+        "campaign",
+        "item",
+        3,
+        'Espada </record></documents> "x"',
+        (search.HandedField('Dano"', "1d8 & <b>fogo</b>"),),
+        ["Itens"],
+    )
+
+    user = answer.user_turn([], "Quanto dano?", (), [record])
+
+    assert user.startswith(answer.DOCUMENTS_OPEN + "\n" + answer.NO_PASSAGES + "\n" + answer.RECORDS_LABEL + ":\n")
+    assert user.count("<record ") == 1
+    assert user.count("</record>") == 1
+    assert user.count(answer.DOCUMENTS_CLOSE) == 1
+    assert '<name>Espada &lt;/record&gt;&lt;/documents&gt; "x"</name>' in user
+    # An attribute holding a double quote is single-quoted (`quoteattr`): it still cannot end its element.
+    assert "<field name='Dano\"'>1d8 &amp; &lt;b&gt;fogo&lt;/b&gt;</field>" in user
+    assert user.index("</record>") < user.index(answer.DOCUMENTS_CLOSE) < user.index("<question>")
+    # Without records the user turn is as before.
+    assert (
+        answer.user_turn([], "Quanto dano?") == f"{answer.NO_PASSAGES}\n\nQuestion:\n<question>Quanto dano?</question>"
+    )
+    assert "[[<record id>]]" in answer.SYSTEM_PROMPT
+
+
+def test_a_record_citation_is_posted_with_its_record_id_and_a_passage_citation_with_its_passage_id() -> None:
+    markers = CitationMarkers()
+    markers.give(["0195a3c0-0000-7000-8000-0000000000a1"])
+    markers.give(["0195a3c0-0000-7000-8000-0000000000b2"], records=True)
+
+    events = markers.feed("Um [[0195a3c0-0000-7000-8000-0000000000a1]] dois [[0195A3C0-0000-7000-8000-0000000000B2]].")
+
+    assert [event for event in events if isinstance(event, Citation)] == [
+        Citation("0195a3c0-0000-7000-8000-0000000000a1", 3),
+        Citation("0195a3c0-0000-7000-8000-0000000000b2", 9, record=True),
+    ]
+
+
+CAMPAIGN_RECORDS = "0195a3c0-0000-7000-8000-0000000000e6"  # a campaign version with record points and no passage
+
+
+@pytest.fixture(scope="module")
+def campaign_records() -> tuple[Library, dict[str, str]]:
+    """Every fixture passage as in `library()`, plus a spell record for each of Fireball and Flame Tongue under a
+    campaign source that holds no passage point: {fixture key: record id}."""
+    lib = library()
+    keys = ["srd-fireball", "srd-flame-tongue"]
+    fixtures = [BY_KEY[key] for key in keys]
+    vectors = retrieval_fixtures.RecordedOllama().embedder().embed([(item.title, item.text) for item in fixtures])
+    ids = {key: f"0195a3c0-0000-7000-8000-0000000001{index:02x}" for index, key in enumerate(keys)}
+    store.PassageStore(lib.spy.client).upsert(
+        [
+            store.Point(
+                ids[item.key],
+                vector.vector,
+                keywords.keyword_vector(item.text, KEY),
+                OWNER,
+                CAMPAIGN_RECORDS,
+                "homebrew",
+                item.page,
+                None,
+                "spell",
+            )
+            for item, vector in zip(fixtures, vectors, strict=True)
+        ]
+    )
+    return lib, ids
+
+
+def serve_campaign_records(stand_in: StandIn, ids: dict[str, str]) -> None:
+    for key, record_id in ids.items():
+        stand_in.records[record_id] = StandInRecord(
+            CAMPAIGN_RECORDS, "spell", BY_KEY[key].title, [("Alcance", "45 m")], 1, ["Magias"]
+        )
+
+
+def test_with_records_and_no_passage_the_records_are_the_sources_and_the_system_prompt_holds_none_of_them(
+    stand_in: StandIn, campaign_records: tuple[Library, dict[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[list[BaseMessage]] = []
+
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
+            seen.append(list(messages))
+            return super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Recording(provider=choice.provider))
+    lib, ids = campaign_records
+    job = claimed(stand_in, SEARCHES["s-fire-damage"].query, [tier("campaign", [CAMPAIGN_RECORDS])])
+    serve_campaign_records(stand_in, ids)
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    system = [str(message.content) for message in seen[0] if isinstance(message, SystemMessage)]
+    assert system == [answer.SYSTEM_PROMPT]
+    for key in ids:
+        assert BY_KEY[key].title not in system[0]
+    user = str(next(message for message in seen[0] if isinstance(message, HumanMessage)).content)
+    assert user.startswith(f"{answer.DOCUMENTS_OPEN}\n{answer.NO_PASSAGES}\n{answer.RECORDS_LABEL}:\n")
+    assert "<passage " not in user
+    # The sources are the records: the prompt says so, and the answer cites them, never "nothing answers".
+    assert "If the sources do not answer" in answer.SYSTEM_PROMPT
+    assert "If the passages do not answer" not in answer.SYSTEM_PROMPT
+    cited = [event for event in every_event(stand_in, job) if event["type"] == "citation"]
+    assert cited
+    assert {event["recordId"] for event in cited} <= set(ids.values())
+    assert not any("passageId" in event for event in cited)
+
+
+def test_records_of_a_tier_with_no_passage_give_their_tier_and_its_mark_is_posted(
+    stand_in: StandIn, campaign_records: tuple[Library, dict[str, str]]
+) -> None:
+    lib, ids = campaign_records
+    job = claimed(
+        stand_in, SEARCHES["s-fire-damage"].query, [tier("campaign", [CAMPAIGN_RECORDS]), tier("system", [SRD])]
+    )
+    serve_campaign_records(stand_in, ids)
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    events = every_event(stand_in, job)
+    # Only records speak for the campaign: its tier mark comes from them, and the system's from its passages.
+    assert [event["tier"] for event in events if event["type"] == "tier"] == ["campaign", "system"]
+    assert any(event.get("recordId") in ids.values() for event in events if event["type"] == "citation")
+    assert any("passageId" in event for event in events if event["type"] == "citation")

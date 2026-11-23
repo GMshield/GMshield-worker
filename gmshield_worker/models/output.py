@@ -6,7 +6,8 @@ hands its events, in order, to `emit`:
 - `TextDelta(text)`: display text, with the citation markers removed;
 - `Citation(passage_id, offset)`: the model wrote `[[<passage id>]]` after a statement; the offset is where the marker
   stood, in code points of the display text. Only the ids that were given to the model (`CitationMarkers.give`) are
-  kept: a marker with any other id is removed and cites nothing;
+  kept: a marker with any other id is removed and cites nothing. Story 4.3 part C: a record id given to the model
+  (`CitationMarkers.give(ids, records=True)`) is cited the same way, as `Citation(record_id, offset, record=True)`;
 - `TierMark(tier, offset)` (Story 3.7): the model wrote `[[tier:<word>]]` to open one tier's version of the answer
   (the sources disagree); the offset is where the marker stood. Only a tier of a passage handed to the model
   (`CitationMarkers.give_tiers`, copied from the backend's label, never worked out here) is kept: any other word is
@@ -101,10 +102,12 @@ class TextDelta:
 
 @dataclass(frozen=True)
 class Citation:
-    """A given passage id, cited at this code-point offset of the display text."""
+    """A given passage id, cited at this code-point offset of the display text; from Story 4.3 part C a given record
+    id (`record` true), cited the same way."""
 
     passage_id: str
     offset: int
+    record: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,6 +162,7 @@ class CitationMarkers:
 
     def __init__(self, given: Iterable[str] = ()) -> None:
         self._given: dict[str, str] = {}
+        self._records: set[str] = set()
         self._tiers: set[str] = set()
         self._held = ""
         self._offset = 0
@@ -169,10 +173,13 @@ class CitationMarkers:
         """The length of the display text so far, in code points."""
         return self._offset
 
-    def give(self, ids: Iterable[str]) -> None:
-        """Ids handed to the model (tool results, user-turn data): only these may be cited."""
+    def give(self, ids: Iterable[str], *, records: bool = False) -> None:
+        """Ids handed to the model (tool results, user-turn data): only these may be cited. With `records` (Story 4.3
+        part C) they are records' ids, and a citation of one says so."""
         for passage_id in ids:
             self._given.setdefault(passage_id.lower(), passage_id)
+            if records:
+                self._records.add(passage_id.lower())
 
     def give_tiers(self, tiers: Iterable[str]) -> None:
         """The tiers of the passages handed to the model, as the backend labelled them, and `MODEL_TIER` when the
@@ -202,7 +209,7 @@ class CitationMarkers:
                 self._text(plain, events)
                 cited = self._given.get(inside.lower())
                 if cited is not None:
-                    events.append(Citation(cited, self._offset))
+                    events.append(Citation(cited, self._offset, inside.lower() in self._records))
                 position = close + len(CLOSE)
                 continue
             tier = _TIER_MARKER.fullmatch(inside) if close >= 0 else None
