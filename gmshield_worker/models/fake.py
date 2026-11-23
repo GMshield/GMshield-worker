@@ -20,6 +20,11 @@ turn change it:
 - `fake:tool`: when `read_passages` is bound and no tool result is in the conversation yet, a call of `read_passages`
   with the passage ids of the user turn; once the results are in, the answer cites them.
 
+Story 4.2: when the records schema (`RECORDS_TOOL`, as `ingestion.records` names it) is bound as structured output,
+the answer is one call of it: a record for each `fake:record <type> <name>` line of a passage block (`<passage
+id="…" …>`), with one field and that passage's id, and no record otherwise, so the pipeline's end-to-end run reads
+prose into no record. `fake:refusal` and `fake:truncated` give no call and their stop, `fake:outage` fails as above.
+
 Story 3.10: the earlier turns of a conversation (`<earlier-turn>` elements, as `lanes.answer.user_turn` writes them) are
 left out before anything is read from a user turn, so a directive or an id in an earlier question or answer neither
 changes the answer nor is cited: directives and cited ids come from the question and the passages only.
@@ -50,6 +55,12 @@ OUTAGE = "fake:outage"
 TRUNCATED = "fake:truncated"
 TOOL = "fake:tool"
 READ_PASSAGES = "read_passages"
+# Story 4.2: the records step's structured output, and the line that asks the fake for one record.
+RECORDS_TOOL = "extracted_records"
+RECORD = "fake:record"
+_RECORD_BLOCK = re.compile(r'<passage id="([0-9a-f-]{36})"[^>]*>(.*?)</passage>', re.ASCII | re.DOTALL)
+# The name starts with a character that is no blank, so no run of blanks is ever matched two ways (linear).
+_RECORD_LINE = re.compile(r"fake:record[ \t]+([a-z_]{1,32})[ \t]+([^\s<][^\n<]{0,199})")
 _PASSAGE_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.ASCII)
 # A data block's id and tier, as `lanes.answer.user_turn` writes them.
 _TIERED = re.compile(r'<passage id="([0-9a-f-]{36})" tier="([a-z]+)"', re.ASCII)
@@ -83,6 +94,22 @@ def _without_history(text: str) -> str:
 def _digest(messages: Sequence[BaseMessage]) -> str:
     joined = "\x00".join(f"{message.type}:{_text(message)}" for message in messages)
     return hashlib.sha256(joined.encode()).hexdigest()[:24]
+
+
+def fake_records(text: str) -> list[dict[str, Any]]:
+    """The fake's records (Story 4.2): one per `fake:record <type> <name>` line of each passage block, in order."""
+    found: list[dict[str, Any]] = []
+    for passage_id, body in _RECORD_BLOCK.findall(text):
+        for kind, name in _RECORD_LINE.findall(body):
+            found.append(
+                {
+                    "type": kind,
+                    "name": name.strip(),
+                    "fields": [{"name": "Fonte", "value": "simulada"}],
+                    "passageIds": [passage_id],
+                }
+            )
+    return found
 
 
 def answer_text(
@@ -150,7 +177,11 @@ class FakeChatModel(BaseChatModel):
             chunk = generation.message
             if isinstance(chunk, AIMessageChunk):
                 whole = chunk if whole is None else whole + chunk
-        message = AIMessage(content="") if whole is None else AIMessage(**whole.model_dump(exclude={"type"}))
+        message = (
+            AIMessage(content="")
+            if whole is None
+            else AIMessage(**whole.model_dump(exclude={"type", "tool_call_chunks", "chunk_position"}))
+        )
         return ChatResult(generations=[ChatGeneration(message=message)])
 
     def _stream(
@@ -170,6 +201,10 @@ class FakeChatModel(BaseChatModel):
         anthropic = self.provider == ANTHROPIC
         response_id = f"msg_fake{digest}" if anthropic else f"chatcmpl-fake{digest}"
         words = sum(len(_text(message).split()) for message in messages)
+
+        if RECORDS_TOOL in tools:
+            yield from self._records(asked, response_id, words, anthropic=anthropic, digest=digest)
+            return
 
         if TOOL in asked and READ_PASSAGES in tools and not results:
             ids = list(dict.fromkeys(_PASSAGE_ID.findall(asked)))
@@ -199,6 +234,24 @@ class FakeChatModel(BaseChatModel):
         for piece in pieces:
             yield self._chunk(AIMessageChunk(content=piece), response_id, first=False)
         yield self._last(stop_reason, response_id, words, len(pieces))
+
+    def _records(
+        self, asked: str, response_id: str, words: int, *, anthropic: bool, digest: str
+    ) -> Iterator[ChatGenerationChunk]:
+        """The structured answer of a records step (Story 4.2): one call of `RECORDS_TOOL`, or a refusal's or a
+        truncation's stop with no call."""
+        if REFUSAL in asked:
+            yield self._chunk(AIMessageChunk(content=""), response_id, first=True)
+            yield self._last("refusal" if anthropic else "content_filter", response_id, words, 0)
+            return
+        if TRUNCATED in asked:
+            yield self._chunk(AIMessageChunk(content=""), response_id, first=True)
+            yield self._last("max_tokens" if anthropic else "length", response_id, words, 1)
+            return
+        args = json.dumps({"records": fake_records(asked)}, ensure_ascii=False)
+        call = tool_call_chunk(name=RECORDS_TOOL, args=args, id=f"call_fake{digest[:12]}", index=0)
+        yield self._chunk(AIMessageChunk(content="", tool_call_chunks=[call]), response_id, first=True)
+        yield self._last("tool_use" if anthropic else "tool_calls", response_id, words, 1)
 
     def _chunk(self, message: AIMessageChunk, response_id: str, *, first: bool) -> ChatGenerationChunk:
         if self.provider != ANTHROPIC:

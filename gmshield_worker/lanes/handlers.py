@@ -3,8 +3,9 @@ claims, renews and reports. `cancel` is set when the work must stop (the claim w
 lapsed, or the worker is stopping): a handler checks it and returns early, and the lane then
 reports nothing.
 
-`ingestion` (Story 1.15, `gmshield_worker.ingestion.step`), `index.change` and `index.removal` (Story 2.1,
-`gmshield_worker.retrieval.indexing`), `question.answer` (Story 2.4, `gmshield_worker.lanes.answer`) and
+`ingestion` (Story 1.15, `gmshield_worker.ingestion.step`; its records steps call a model from Story 4.2),
+`index.change` and `index.removal` (Story 2.1, `gmshield_worker.retrieval.indexing`), `question.answer` (Story 2.4,
+`gmshield_worker.lanes.answer`) and
 `library.search` (Story 3.9, `gmshield_worker.lanes.search`) run in every mode; `probe`, `test.question` (Story 2.3,
 `gmshield_worker.lanes.question`) and `test.model` (Story 2.10, `gmshield_worker.lanes.model_probe`) in test mode
 only. The index and question handlers open a Qdrant client of
@@ -39,7 +40,7 @@ def handlers_for(settings: Settings) -> Mapping[str, Handler]:
     embedder = Embedder(settings.index.ollama_url)
     reader = JobsApi(settings.backend_url, settings.worker_credential)
     found: dict[str, Handler] = {
-        step.KIND: step.IngestionStep(files, settings.work_dir),
+        step.KIND: step.IngestionStep(files, settings.work_dir, keys=settings.models),
         indexing.CHANGE: indexing.IndexChange(files, embedder, stores),
         indexing.REMOVAL: indexing.IndexRemoval(stores),
         answer.KIND: answer.AnswerJob(reader, embedder, stores, settings.models),

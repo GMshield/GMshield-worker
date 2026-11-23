@@ -7,6 +7,10 @@
 - `STAGE_UNKNOWN`: a stage or format this worker does not run (`retry: false`).
 - `PIPELINE_CHANGED` (Story 1.16): the chain was started by another pipeline version than this worker's
   (`retry: false`); the backend restarts the chain from the cleaned original.
+
+A records step (Story 4.2) fails with its model's code instead (`model.refused`, `model.truncated`,
+`model.unavailable`, `model.output_invalid`, `model.input_invalid`, `model.provider_*`): the backend never fails the
+version for it, and marks the step's pages unread once it ends.
 """
 
 from __future__ import annotations

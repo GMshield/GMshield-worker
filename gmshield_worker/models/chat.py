@@ -76,8 +76,15 @@ class _ChatAnthropic(ChatAnthropic):
         return message, block_start
 
 
-def build_chat_model(choice: ModelChoice, where: Endpoint, *, max_tokens: int = DEFAULT_MAX_TOKENS) -> BaseChatModel:
-    """The provider's chat model at this endpoint. Calls nothing."""
+def build_chat_model(
+    choice: ModelChoice,
+    where: Endpoint,
+    *,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout: float = REQUEST_TIMEOUT_SECONDS,
+) -> BaseChatModel:
+    """The provider's chat model at this endpoint, each call limited to `timeout` seconds of connect, read or write
+    (Story 4.2: a records step waits longer for its one whole structured answer). Calls nothing."""
     key = SecretStr(where.api_key)
     if where.provider == ANTHROPIC:
         return _ChatAnthropic(
@@ -88,7 +95,7 @@ def build_chat_model(choice: ModelChoice, where: Endpoint, *, max_tokens: int = 
             stop=None,
             max_retries=0,
             stream_usage=True,
-            timeout=REQUEST_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     return _ChatOpenAI(
         model=choice.model,
@@ -99,11 +106,17 @@ def build_chat_model(choice: ModelChoice, where: Endpoint, *, max_tokens: int = 
         stream_usage=True,
         max_retries=0,
         max_completion_tokens=max_tokens,
-        timeout=REQUEST_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
 
 
-def chat_model(choice: ModelChoice, keys: ModelKeys, *, max_tokens: int = DEFAULT_MAX_TOKENS) -> BaseChatModel:
+def chat_model(
+    choice: ModelChoice,
+    keys: ModelKeys,
+    *,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    timeout: float = REQUEST_TIMEOUT_SECONDS,
+) -> BaseChatModel:
     """The chat model the claim names: the fake one in test mode, else the provider's at its explicit base URL.
 
     Raises `ProviderUnavailable` (`model.provider_unknown`, `model.provider_key_missing`) when this worker cannot call
@@ -113,4 +126,4 @@ def chat_model(choice: ModelChoice, keys: ModelKeys, *, max_tokens: int = DEFAUL
         if choice.provider not in PROVIDERS:
             raise ProviderUnavailable(PROVIDER_UNKNOWN)
         return FakeChatModel(provider=choice.provider, model_id=choice.model)
-    return build_chat_model(choice, endpoint(keys, choice.provider), max_tokens=max_tokens)
+    return build_chat_model(choice, endpoint(keys, choice.provider), max_tokens=max_tokens, timeout=timeout)

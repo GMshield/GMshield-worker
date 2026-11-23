@@ -221,6 +221,14 @@
           "retry" : {
             "description" : "For failed only: false ends the job at once, without another attempt (an input no attempt can change); absent or true lets the backend retry while attempts remain",
             "type" : "boolean"
+          },
+          "usage" : {
+            "description" : "The usage of the attempt's model calls not posted with events (contract 1.17.0), done or failed, recorded once per call id; absent means none",
+            "items" : {
+              "$ref" : "#/components/schemas/JobCallUsage"
+            },
+            "maxItems" : 16,
+            "type" : "array"
           }
         },
         "required" : [ "outcome" ],
@@ -401,7 +409,7 @@
   },
   "info" : {
     "title" : "GMshield internal API",
-    "version" : "1.16.0"
+    "version" : "1.17.0"
   },
   "openapi" : "3.1.0",
   "paths" : {

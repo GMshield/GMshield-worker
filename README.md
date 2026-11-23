@@ -289,6 +289,40 @@ lockfile and the production image:
     `input: "source"`, the assembled PDF, which is cleaned and split again as `clean` does.
   - The in-image check decodes `tests/image/two-colours.heic` (provenance in `tests/image/test_image.py`) in the
     sandbox and reads two photographed pages, one of them lying on its side with its EXIF orientation, by OCR.
+- **Extract rules, spells and items (Story 4.2 part A, `PIPELINE_VERSION` "8", backend contract 1.17.0).** The
+  passages step's report also asks one `records` step per run of `RECORDS_PAGES` (10) pages that holds a passage:
+  `{stage: "records", firstPage, lastPage, input: "passages"}` (`step.records_steps`). The backend mints the passages'
+  ids, so a records step can only follow them.
+  - A records step's claim input names `input: "passages"` and `recordTypes` (the core keys `rule`, `spell`, `item`),
+    and its claim carries the `model` (only a records step calls one). It downloads `passages`, the JSON Lines
+    `{id, page, sectionPath, text}` of its pages, checked (`records.read_passages`: an id of its own each, a page of the
+    run, the backend's limits); a malformed input or `recordTypes` fails with `ingestion.step_failed` and
+    `retry: false`.
+  - One structured call (`models.structured.structured_call`, `chat_model` with `RECORDS_TIMEOUT_SECONDS` 480 and
+    `RECORDS_MAX_TOKENS` 16,000; no streaming): Chat Completions (Azure OpenAI, OpenAI) through strict structured
+    outputs (`method="json_schema"`), any other model through a forced tool call. The prompt follows Story 2.8:
+    `records.SYSTEM_PROMPT` is fixed, instructions only; the one user turn holds the type names
+    (`<record-type>…</record-type>`) and the passages (`<passage id page section>…</passage>`), each escaped, inside
+    the document delimiter (`models.documents`, shared with the answer lane), then the fixed `records.REQUEST`.
+  - The answer (`records.schema`: `records`, each `{type, name, fields: [{name, value}], passageIds}`) is checked by
+    `records.checked`: a record of a type not given, with a blank name, a malformed field or a passage id that was not
+    given is dropped (counted as `dropped` in `ingestion.step_done`); blank name/value pairs are left out. The report
+    is `{pipelineVersion, pageTotal, records, next: []}`; the outcome carries the call's usage under the worker-minted
+    call id (`Outcome.usage`, `JobOutcome.usage` from contract 1.17.0), done or failed.
+  - Failures: `model.refused`, `model.truncated`, `model.question_flagged` and `model.source_flagged` (a refusal, a
+    content filter, the length stop, a prompt filter's flag; the OpenAI SDK's `LengthFinishReasonError` and
+    `ContentFilterFinishReasonError` too) with `retry: false` (`RECORDS_FINAL`); `model.unavailable` and
+    `model.output_invalid` (an answer that does not parse) for a retry; `model.input_invalid` (no model in the claim)
+    and `model.provider_*` with `retry: false`. The backend never fails the version for a records step: once it ends
+    failed, its pages are marked unread in the quality report. A step with no passage calls nothing.
+  - Test mode: the fake model answers the records schema with one record per `fake:record <type> <name>` line of a
+    passage block, and none otherwise (`models/fake.py`), so the pipeline's end-to-end run reads its prose into no
+    record. Lines carry ids, counts and timings only (`ingestion.records_called` names the call id).
+  - A reprocess (Reprocessar) mints every passage of the version again, so the backend removes all its records and
+    the passages step asks every records step again: one model call per 10-page run that holds a passage, not only
+    for the reread pages.
+  - Deploy the backend (internal contract 1.17.0) first: `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.17.0. A chain started
+    under pipeline "7" restarts under "8" (`ingestion.pipeline_changed`).
 - **Index an accepted material (Story 2.1, AD-10, backend contract 1.7.0 or later).** Every claim states the
   worker's `INDEX_RECIPE` (`retrieval/recipe.py`; bump it on any change to the model, the embedding input, the
   splitting or the keyword scheme): the backend re-indexes each source recorded under another one. From backend
@@ -509,7 +543,7 @@ lockfile and the production image:
 
   - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
     `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4, 1.11.0 from Story 2.6, 1.13.0 from Story
-    3.5, 1.14.0 from Story 3.7, 1.15.0 from Story 3.8, 1.16.0 from Story 3.10).
+    3.5, 1.14.0 from Story 3.7, 1.15.0 from Story 3.8, 1.16.0 from Story 3.10, 1.17.0 from Story 4.2).
 - **The answer to a question (Story 2.4, `question.answer`, backend contract 1.10.0).** Registered in every mode
   (`lanes/answer.py`), on the interactive lane.
   - The claim's input is the backend's question input (`retrieval.search.question_input`; else

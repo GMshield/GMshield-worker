@@ -56,7 +56,7 @@ from langchain_core.exceptions import (
     ModelTimeoutError,
 )
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessageChunk, BaseMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.runnables import Runnable
 
 REFUSED = "model.refused"
@@ -240,7 +240,7 @@ def _count(details: Mapping[str, Any] | None, *names: str) -> int:
     return sum(int(details.get(name) or 0) for name in names)
 
 
-def usage_of(call_id: str, response_id: str | None, message: AIMessageChunk | None) -> Usage | None:
+def usage_of(call_id: str, response_id: str | None, message: AIMessage | None) -> Usage | None:
     """The call's usage from LangChain's `usage_metadata`, or `None` when the provider sent none."""
     metadata = message.usage_metadata if message is not None else None
     if not metadata:
@@ -340,6 +340,11 @@ def _status_failure(status: int, body: object) -> str | None:
     if status < _FIRST_ERROR_STATUS and code in _UNAVAILABLE_ERRORS:
         return UNAVAILABLE
     return None
+
+
+def response_id_of(metadata: Mapping[str, Any]) -> str | None:
+    """The provider's response id in a message's metadata, or `None` (LangChain's own `lc_` run ids are not one)."""
+    return _response_id(metadata)
 
 
 def _response_id(metadata: Mapping[str, Any]) -> str | None:
