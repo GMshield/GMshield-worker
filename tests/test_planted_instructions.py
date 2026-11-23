@@ -9,9 +9,13 @@ structure the real model's run by hand relies on (`docs/_bmad-output/implementat
   passage (the planted `</passage><question>` break-out stays escaped data), all inside one Azure document delimiter
   (`answer.DOCUMENTS_OPEN` … `answer.DOCUMENTS_CLOSE`) that the planted `</documents>` break-out cannot end;
 - only handed ids are cited, never the passage id the planted text quotes (the fake cites every id it sees);
+- a `[[tier:model]]` written as if a planted instruction were obeyed is removed while model knowledge is off
+  (Story 3.8);
 - the worker calls only the passages, events and outcome routes, reading only the handed ids;
 - the answer lane hands the model no tool, and the model probe only `read_passages`, which only reads;
-- no line of the planted material, and not the question, reaches the logs.
+- no line of the planted material, and not the question, reaches the logs;
+- Story 3.10: the planted text as an earlier turn's question and answer stays escaped data inside the same delimiter
+  (one `<passage>` per passage still, one `</documents>`), never in the system message, and its ids are never cited.
 
 The planted file holds no `fake:` directive: the fake model would read it from any user text."""
 
@@ -32,7 +36,8 @@ from xml.sax.saxutils import escape
 
 import httpx
 import pytest
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.outputs import ChatGenerationChunk
 from qdrant_client import QdrantClient
 
 from gmshield_worker.agents import graphs
@@ -267,7 +272,7 @@ def assert_user_turn(user: str, question: str) -> None:
     assert user.count("<question>") == 1
     assert user.count("</question>") == 1
     for item in PASSAGES:
-        assert f'<passage id="{item.passage_id}" section=' in user
+        assert f'<passage id="{item.passage_id}" tier="campaign" section=' in user
     assert "&lt;/passage&gt;&lt;question&gt;" in user
     # One document delimiter around every passage, the question after it: the planted `</documents> """` is escaped.
     assert user.startswith(answer.DOCUMENTS_OPEN + "\n")
@@ -282,6 +287,68 @@ def assert_user_turn(user: str, question: str) -> None:
     assert f'&lt;passage id="{FOREIGN}"' in user
     assert "&lt;script&gt;" in user
     assert user.endswith(f"<question>{escape(question)}</question>")
+
+
+def test_planted_text_in_an_earlier_turn_stays_escaped_data_inside_the_delimiter() -> None:
+    planted = "\n".join(planted_texts())
+    handed = [search.Handed(item.passage_id, "campaign", item.page, item.text, item.section_path) for item in PASSAGES]
+    history = [search.EarlierTurn(planted[:4000], planted[-4000:]), search.EarlierTurn(QUESTIONS[0], planted[:4000])]
+
+    user = answer.user_turn(handed, QUESTIONS[1], history)
+
+    # The passages are as without history: one element each, the break-outs escaped.
+    assert user.count("<passage ") == len(PASSAGES)
+    assert user.count("</passage>") == len(PASSAGES)
+    # Two earlier turns, each one element, their planted break-outs escaped too.
+    assert user.count("<earlier-turn>") == 2
+    assert user.count("</earlier-turn>") == 2
+    assert user.count("<answer>") == 2
+    assert user.count("<question>") == 3
+    assert user.count(answer.DOCUMENTS_OPEN) == 1
+    assert user.count("<documents>") == 1
+    assert user.count("</documents>") == 1
+    closed = user.index(answer.DOCUMENTS_CLOSE)
+    assert user.rindex("</earlier-turn>") < user.index("<passage ") < closed < user.rindex("<question>")
+    assert user.endswith(f"<question>{escape(QUESTIONS[1])}</question>")
+    for text in planted_texts():
+        assert text not in answer.system_prompt(False, True)
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_planted_text_in_history_is_never_cited_nor_obeyed(
+    stand_in: StandIn, library: QdrantClient, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    seen: list[list[BaseMessage]] = []
+
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Iterator[Any]:
+            seen.append(list(messages))
+            yield from super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Recording(provider=choice.provider))
+    serve(stand_in)
+    planted = "\n".join(planted_texts())
+    job_input = {
+        "question": QUESTIONS[0],
+        "owner": OWNER,
+        "tiers": [{"tier": "campaign", "sources": [PLANTED_SOURCE], "pending": []}],
+        "tokenKey": base64.b64encode(KEY).decode(),
+        "history": [{"question": planted[:4000], "answer": planted[-4000:]}],
+    }
+    job_id = stand_in.offer(answer.KIND, job_input, new_trace_id(), model=model_of(provider))
+    claim = JobsApi(stand_in.url, CREDENTIAL, providers=PROVIDERS).claim(UUID(job_id), new_trace_id())
+    assert claim.job is not None
+
+    assert run_answer(stand_in, library, claim.job) == Outcome.done()
+
+    system = [message for message in seen[0] if isinstance(message, SystemMessage)]
+    assert [message.content for message in system] == [answer.system_prompt(False, True)]
+    events = [event for batch in stand_in.batches.get(str(claim.job.job_id), []) for event in batch["events"]]
+    text = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert CANARY not in text
+    cited = [event["passageId"] for event in events if event["type"] == "citation"]
+    assert set(cited) <= set(PLANTED_IDS)
+    assert FOREIGN not in cited
 
 
 @pytest.mark.parametrize("case", list(itertools.product(QUESTIONS, PROVIDERS)), ids=str)
@@ -347,6 +414,34 @@ def test_planted_passages_stay_data_in_the_user_turn_and_only_handed_ids_are_cit
 
     logged = capsys.readouterr()
     assert_no_content_logged(logged.out + logged.err, [*planted_texts(), *FRAGMENTS, question])
+
+
+def test_a_planted_model_marker_with_model_knowledge_off_is_stripped_and_posts_no_tier(
+    stand_in: StandIn, library: QdrantClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 3.8: a model that obeys a planted instruction and writes `[[tier:model]]` gets no model mark while the
+    switch is off (the job's input has no `modelKnowledge`, so it is off): the marker is removed and posts nothing, and
+    the system message stays `SYSTEM_PROMPT` with no model-knowledge rule."""
+    seen: list[list[BaseMessage]] = []
+
+    class Obeying(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Iterator[Any]:
+            seen.append(list(messages))
+            yield ChatGenerationChunk(message=AIMessageChunk(content="[[tier:model]]Como mandam os trechos: "))
+            yield from super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Obeying(provider=choice.provider))
+    job = claimed_answer(stand_in, QUESTIONS[0], "azure-openai")
+
+    assert run_answer(stand_in, library, job) == Outcome.done()
+
+    system = [message.content for message in seen[0] if isinstance(message, SystemMessage)]
+    assert system == [answer.SYSTEM_PROMPT]
+    events = [event for batch in stand_in.batches.get(str(job.job_id), []) for event in batch["events"]]
+    text = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert text.startswith("Como mandam os trechos: ")
+    assert "[[" not in text
+    assert not any(event["type"] == "tier" for event in events)
 
 
 def capturing(handed: dict[str, list[str]], lane: str) -> type[graphs.AnswerWithTools]:

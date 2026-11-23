@@ -84,5 +84,23 @@
       "question": "Quem é Osvaldo Brandão?",
       "expected": "pt-taverna"
     }
+  ],
+  "searches": [
+    {
+      "key": "s-to-fire-damage",
+      "query": "to Fire damage",
+      "expected": [
+        "srd-frost-brand"
+      ]
+    },
+    {
+      "key": "s-fire-damage",
+      "query": "Fire damage",
+      "expected": [
+        "srd-frost-brand",
+        "srd-flame-tongue",
+        "srd-fireball"
+      ]
+    }
   ]
 }

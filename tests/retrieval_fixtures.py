@@ -1,5 +1,6 @@
 """The retrieval fixtures (Story 2.3): SRD 5.2.1 passages (CC-BY-4.0, see `fixtures/retrieval/ATTRIBUTION.txt`) and
-Portuguese passages written for the tests, the fixed questions, and the real embeddinggemma vectors of both, recorded
+Portuguese passages written for the tests, the fixed questions, the library searches' queries (Story 3.9), and the real
+embeddinggemma vectors of all of them, recorded
 once through the Ollama tunnel by `tools/record_embeddings.py` and committed.
 
 `RecordedOllama` answers `/api/embed` from those vectors only: an input that was not recorded (a changed passage,
@@ -44,6 +45,15 @@ class FixtureQuestion:
     expected: str
 
 
+@dataclass(frozen=True)
+class FixtureSearch:
+    """A library search's query (Story 3.9) and the passages whose text holds it verbatim, in fixture order."""
+
+    key: str
+    query: str
+    expected: list[str]
+
+
 def passages() -> list[FixturePassage]:
     raw: dict[str, Any] = json.loads(PASSAGES.read_text(encoding="utf-8"))
     return [
@@ -66,12 +76,19 @@ def questions() -> list[FixtureQuestion]:
     return [FixtureQuestion(**item) for item in raw["questions"]]
 
 
+def searches() -> list[FixtureSearch]:
+    raw: dict[str, Any] = json.loads(QUESTIONS.read_text(encoding="utf-8"))
+    return [FixtureSearch(item["key"], item["query"], list(item["expected"])) for item in raw["searches"]]
+
+
 def inputs() -> list[str]:
     """Every embedding input of the fixtures, in order: each passage's document prompt, then each question's query
-    prompt, exactly as the worker sends them."""
-    return [embedding.embedding_input(item.title, item.text) for item in passages()] + [
-        embedding.query_input(item.question) for item in questions()
-    ]
+    prompt, then each library search's query prompt (Story 3.9), exactly as the worker sends them."""
+    return (
+        [embedding.embedding_input(item.title, item.text) for item in passages()]
+        + [embedding.query_input(item.question) for item in questions()]
+        + [embedding.query_input(item.query) for item in searches()]
+    )
 
 
 def recorded() -> dict[str, list[float]]:

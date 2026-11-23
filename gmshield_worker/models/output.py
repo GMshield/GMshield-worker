@@ -7,6 +7,11 @@ hands its events, in order, to `emit`:
 - `Citation(passage_id, offset)`: the model wrote `[[<passage id>]]` after a statement; the offset is where the marker
   stood, in code points of the display text. Only the ids that were given to the model (`CitationMarkers.give`) are
   kept: a marker with any other id is removed and cites nothing;
+- `TierMark(tier, offset)` (Story 3.7): the model wrote `[[tier:<word>]]` to open one tier's version of the answer
+  (the sources disagree); the offset is where the marker stood. Only a tier of a passage handed to the model
+  (`CitationMarkers.give_tiers`, copied from the backend's label, never worked out here) is kept: any other word is
+  removed and marks nothing. Story 3.8: `model` (`MODEL_TIER`) opens a part from the model's own knowledge, and is
+  given only when the turn's model knowledge is on; otherwise a `[[tier:model]]` is removed like any other word;
 - `Usage(call_id, response_id, input, cache_read, cache_write, output, reasoning, estimated)`, once per call, from the
   model's `usage_metadata`. Input includes the cache reads and writes, output includes the reasoning, as LangChain
   counts them. A call stopped before the provider sent its usage reports an estimate instead (`estimated=True`, Story
@@ -65,8 +70,14 @@ OPEN = "[["
 CLOSE = "]]"
 MAX_MARKER_ID = 64
 _MARKER_ID = re.compile(r"[A-Za-z0-9-]{1,64}", re.ASCII)
-# What may still become a marker once more text arrives: the id so far, and perhaps the first closing bracket.
-_PARTIAL_MARKER = re.compile(r"[A-Za-z0-9-]{0,64}\]?", re.ASCII)
+# Story 3.7: `[[tier:<word>]]`, the word the tier as the backend writes it (any case).
+TIER_PREFIX = "tier:"
+# Story 3.8: the tier word of a part from the model's own knowledge, never a passage's tier.
+MODEL_TIER = "model"
+_TIER_MARKER = re.compile(r"tier:([a-z]{1,16})", re.ASCII | re.IGNORECASE)
+# What may still become a marker once more text arrives: the id (or the tier marker) so far, and perhaps the first
+# closing bracket.
+_PARTIAL_MARKER = re.compile(r"(?:[A-Za-z0-9-]{0,64}|tier:[a-z]{0,16})\]?", re.ASCII | re.IGNORECASE)
 
 # The stop reasons of each provider's stream (Chat Completions `finish_reason`, Anthropic `stop_reason`).
 _TRUNCATED_STOPS = frozenset({"length", "max_tokens", "model_context_window_exceeded"})
@@ -97,6 +108,15 @@ class Citation:
 
 
 @dataclass(frozen=True)
+class TierMark:
+    """A handed passage's tier (Story 3.7), or `model` (Story 3.8): that tier's version of the answer, or the model's
+    own knowledge, starts at this code-point offset of the display text."""
+
+    tier: str
+    offset: int
+
+
+@dataclass(frozen=True)
 class Usage:
     """One call's tokens, reported once under the worker's call id, with the provider's response id when there is
     one."""
@@ -119,7 +139,8 @@ class ModelFailed:
     code: str
 
 
-type ModelEvent = TextDelta | Citation | Usage | ModelFailed
+type StreamedEvent = TextDelta | Citation | TierMark
+type ModelEvent = TextDelta | Citation | TierMark | Usage | ModelFailed
 type Emit = Callable[[ModelEvent], None]
 
 
@@ -129,7 +150,8 @@ def new_call_id() -> str:
 
 
 class CitationMarkers:
-    """Removes `[[<passage id>]]` markers from streamed text and turns the given ids into citations.
+    """Removes `[[<passage id>]]` and `[[tier:<word>]]` markers from streamed text and turns the given ids into
+    citations and the given tiers into tier marks.
 
     The display offset runs across every call of one answer, so a graph that calls the model again after a tool keeps
     counting where the last call stopped.
@@ -137,6 +159,7 @@ class CitationMarkers:
 
     def __init__(self, given: Iterable[str] = ()) -> None:
         self._given: dict[str, str] = {}
+        self._tiers: set[str] = set()
         self._held = ""
         self._offset = 0
         self.give(given)
@@ -151,10 +174,15 @@ class CitationMarkers:
         for passage_id in ids:
             self._given.setdefault(passage_id.lower(), passage_id)
 
-    def feed(self, text: str) -> list[TextDelta | Citation]:
+    def give_tiers(self, tiers: Iterable[str]) -> None:
+        """The tiers of the passages handed to the model, as the backend labelled them, and `MODEL_TIER` when the
+        turn's model knowledge is on: only these may be marked."""
+        self._tiers.update(tier.lower() for tier in tiers)
+
+    def feed(self, text: str) -> list[StreamedEvent]:
         """The events of one more piece of text; a possible marker at its end is held back."""
         buffer, self._held = self._held + text, ""
-        events: list[TextDelta | Citation] = []
+        events: list[StreamedEvent] = []
         plain: list[str] = []
         position = 0
         while position < len(buffer):
@@ -177,20 +205,28 @@ class CitationMarkers:
                     events.append(Citation(cited, self._offset))
                 position = close + len(CLOSE)
                 continue
+            tier = _TIER_MARKER.fullmatch(inside) if close >= 0 else None
+            if tier is not None:
+                self._text(plain, events)
+                word = tier.group(1).lower()
+                if word in self._tiers:
+                    events.append(TierMark(word, self._offset))
+                position = close + len(CLOSE)
+                continue
             # Not a marker: the first bracket is text, and the scan goes on from the second.
             plain.append("[")
             position = start + 1
         self._text(plain, events)
         return events
 
-    def flush(self) -> list[TextDelta | Citation]:
+    def flush(self) -> list[StreamedEvent]:
         """What was held back at the end of the stream is text: a marker that never closed cites nothing."""
         held, self._held = self._held, ""
-        events: list[TextDelta | Citation] = []
+        events: list[StreamedEvent] = []
         self._text([held], events)
         return events
 
-    def _text(self, plain: list[str], events: list[TextDelta | Citation]) -> None:
+    def _text(self, plain: list[str], events: list[StreamedEvent]) -> None:
         text = "".join(plain)
         plain.clear()
         if text:
@@ -361,7 +397,7 @@ class _Streamed:
 def _read(
     stream: Any,
     markers: CitationMarkers,
-    send: Callable[[TextDelta | Citation], None],
+    send: Callable[[StreamedEvent], None],
     should_stop: Callable[[], bool] | None,
     into: _Streamed,
 ) -> None:
@@ -401,7 +437,7 @@ def stream_call(
     streamed = _Streamed()
     failed: str | None = None
 
-    def send(event: TextDelta | Citation) -> None:
+    def send(event: StreamedEvent) -> None:
         if isinstance(event, TextDelta):
             streamed.emitted += len(event.text)
         emit(event)

@@ -31,6 +31,7 @@ from gmshield_worker.models.output import (
     ModelEvent,
     ModelFailed,
     TextDelta,
+    TierMark,
     Usage,
 )
 from gmshield_worker.models.providers import ProviderUnavailable
@@ -55,6 +56,8 @@ def event_view(event: ModelEvent) -> dict[str, Any]:
             return {"type": "delta", "text": text}
         case Citation(passage_id=passage_id, offset=offset):
             return {"type": "citation", "passageId": passage_id, "offset": offset}
+        case TierMark(tier=tier, offset=offset):
+            return {"type": "tier", "tier": tier, "offset": offset}
         case Usage():
             return {"type": "usage", **usage_view(event)}
         case ModelFailed(code=code):

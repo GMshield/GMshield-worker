@@ -1,9 +1,13 @@
 """Finding the passages that answer a question (Story 2.3, AD-10): `find_passages`.
 
 The question input is the backend's (`Scopes.questionInput`), never computed here: `{question, owner, tiers: [{tier,
-sources, pending}], tokenKey}`, the tiers in order (campaign, then system), `pending` the ids of the tier's passages
+sources, pending}], tokenKey}`, the tiers in order (campaign, system, then other from internal contract 1.13.0, Story
+3.5; the backend works out each tier, the worker never does), `pending` the ids of the tier's passages
 that are not indexed yet (their index change has not ended, or it failed; the backend lists at most the first 5,000 of
-each tier), and `tokenKey` Base64 of the owner's 32-byte token key.
+each tier), and `tokenKey` Base64 of the owner's 32-byte token key. From internal contract 1.16.0 (Story 3.10) it may
+carry `history: [{question, answer}]`, the conversation's earlier turns oldest first (at most `MAX_HISTORY`, each answer
+at most `MAX_HISTORY_ANSWER` code points): checked here and handed to the model as data only (`lanes.answer`); the
+search below never reads it.
 
 1. When no tier has a source, nothing is asked of Ollama, Qdrant or the backend: the list is empty.
 2. The question is embedded with the indexing model under embeddinggemma's query prompt (`Embedder.embed_query`), and
@@ -11,24 +15,28 @@ each tier), and `tokenKey` Base64 of the owner's 32-byte token key.
 3. Per tier with sources, one Qdrant search (`PassageStore.search`): dense and sparse prefetches fused by RRF, `LIMIT`
    points, the owner and source filters always on. A tier without sources issues no query.
 4. Pending: once every tier is searched, the first `MAX_PENDING` ids of each tier's `pending`, in input order, are read
-   by id in pages of `PAGE` (the backend's most ids per call, `JobPassageReads.MAX_IDS`), at most `PARALLEL` pages at
-   a time, the tiers' pages in turns (campaign, system, campaign, ..., then the rest of the longer one), under one
+   by id in pages of `PAGE` (the backend's most ids per call, `JobPassageReads.MAX_IDS`), at most `PARALLEL` pages at a
+   time, the tiers' pages in turns (campaign, system, other, campaign, ..., then the rest of the longer ones), under one
    deadline `PENDING_BUDGET_SECONDS` after the question's first pending read (`read_pending`), so the first words stay
    within NFR-14's 5 s: no page starts after it, and a page not back by it is dropped, never waited for. Each page is
-   tokenized as it comes back, inside the deadline: each passage keeps only the question's distinct folded tokens of
-   two characters or more (`question_terms`, from `keywords.tokens`, never an HMAC) that it contains, and its text is
-   let go. After the deadline only the counting runs: each token weighs BM25's ln(1 + (N - df + 0.5) / (df + 0.5)), N
-   the pending passages read for the question (both tiers) and df how many of them contain it (`rarity`); passages
-   are ordered by the weight of the rarest question token they contain, then by the sum of their tokens' weights, so
-   the passage naming what the question is about (a monster, a spell, a person) comes first; those with no token are
-   dropped and ties keep input order (`rank_pending`). That ranking is fused with the tier's
-   Qdrant results as a third RRF list (`fuse`), `LIMIT` ids. An id found both ways is one entry whose scores add up,
-   as RRF does. The ids not read (past `MAX_PENDING`, in pages the deadline left out, or in pages it dropped) are
-   skipped and logged as a count per tier (`retrieval.pending_skipped`). A question with no token of two characters or
-   more can match no pending passage: its pending passages are not read at all.
+   tokenized as it comes back, inside the deadline: each passage keeps only the question's distinct folded tokens of two
+   characters or more (`question_terms`, from `keywords.tokens`, never an HMAC) that it contains, and its text is let
+   go. After the deadline only the counting runs: each token weighs BM25's ln(1 + (N - df + 0.5) / (df + 0.5)), N the
+   pending passages read for the question (every tier) and df how many of them contain it (`rarity`); passages are
+   ordered by the weight of the rarest question token they contain, then by the sum of their tokens' weights, so the
+   passage naming what the question is about (a monster, a spell, a person) comes first; those with no token are dropped
+   and ties keep input order (`rank_pending`). That ranking is fused with the tier's Qdrant results as a third RRF list
+   (`fuse`), `LIMIT` ids. An id found both ways is one entry whose scores add up, as RRF does. The ids not read (past
+   `MAX_PENDING`, in pages the deadline left out, or in pages it dropped) are skipped and logged as a count per tier
+   (`retrieval.pending_skipped`). A question with no token of two characters or more can match no pending passage: its
+   pending passages are not read at all.
 5. The text of every found id, in rank order, campaign tier first, is read in one call to `POST …/passages` (contract
    1.8.0): the handed-over list is `[Handed(id, tier, text, section_path, page)]`. Library text reaches the worker by
    no other path, and nothing of it reaches Qdrant.
+
+The library search (Story 3.9, `lanes/search.py`) reuses steps 1 to 4 (`rank_tiers`) on the backend's search input
+(`Scopes.searchInput`: the same shape with `query`, 1 to `MAX_QUERY` code points, in place of `question`;
+`question_input(raw, field="query")`), with its own limit per tier, and keeps each id's fused score.
 
 Failures (`SearchFailed`): Ollama `retrieval.embedding_unavailable` and Qdrant `retrieval.store_unavailable`, both
 retryable (nothing has been sent yet); a question the model refuses as too long `retrieval.question_too_long`; a refusal
@@ -62,19 +70,25 @@ from gmshield_worker.retrieval.indexing import StoreFactory
 from gmshield_worker.retrieval.keywords import KEY_BYTES, query_vector, tokens
 from gmshield_worker.retrieval.store import RRF_K, Found, StoreFailed
 
-TIERS = ("campaign", "system")
+TIERS = ("campaign", "system", "other")
 LIMIT = 8
 # The most pending ids of a tier the worker reads: as many as the backend lists (`Scopes.MAX_PENDING`).
 MAX_PENDING = 5000
 # The most ids of one passages call (the backend's `JobPassageReads.MAX_IDS`).
 PAGE = 100
-# The most passages calls of a question's pending reads at a time, both tiers together. 8, not 4: on roberto-server
+# The most passages calls of a question's pending reads at a time, every tier together. 8, not 4: on roberto-server
 # while indexing loaded it (2026-11-19), 4 read about 2,100-2,900 of 3,900 pending passages in the 1.5 s and 8 read
 # all 3,721 in about 1 s.
 PARALLEL = 8
-# The pending reads' deadline, from the question's first pending read, for both tiers together.
+# The pending reads' deadline, from the question's first pending read, for every tier together.
 PENDING_BUDGET_SECONDS = 1.5
 MAX_QUESTION = 4000
+# The longest search query, in code points (the backend's `Scopes.MAX_QUERY`, Story 3.9).
+MAX_QUERY = 500
+# Story 3.10: the most earlier turns a question input carries, and the longest earlier answer, in code points (the
+# backend's `Conversations.HISTORY_TURNS` and `HISTORY_ANSWER`).
+MAX_HISTORY = 6
+MAX_HISTORY_ANSWER = 4000
 INPUT_INVALID = "retrieval.input_invalid"
 EMBEDDING_UNAVAILABLE = "retrieval.embedding_unavailable"
 STORE_UNAVAILABLE = "retrieval.store_unavailable"
@@ -106,11 +120,27 @@ class TierScope:
 
 
 @dataclass(frozen=True)
+class EarlierTurn:
+    """An earlier turn of the question's conversation (Story 3.10): data for the model only, never searched with and
+    never a source. Its question and answer are never printed."""
+
+    question: str = field(repr=False)
+    answer: str = field(repr=False)
+
+
+@dataclass(frozen=True)
 class QuestionInput:
+    """The checked question input. `model_knowledge` (Story 3.8, contract 1.15.0) is the turn's frozen switch: whether
+    the model may add its own knowledge, each such part under `[[tier:model]]`; absent from the input, it is off.
+    `history` (Story 3.10, contract 1.16.0) is the conversation's earlier turns, oldest first; absent, there is none.
+    Retrieval reads `question` alone."""
+
     owner: str
     tiers: tuple[TierScope, ...]
     question: str = field(repr=False)
     token_key: bytes = field(repr=False)
+    model_knowledge: bool = False
+    history: tuple[EarlierTurn, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -160,10 +190,33 @@ def _tiers(value: object) -> tuple[TierScope, ...]:
     return tuple(found)
 
 
-def question_input(raw: dict[str, Any]) -> QuestionInput:
-    """The question input, checked; `InputInvalid` otherwise."""
-    question = raw.get("question")
-    if not isinstance(question, str) or not 1 <= len(question) <= MAX_QUESTION:
+def _history(value: object) -> tuple[EarlierTurn, ...]:
+    """The earlier turns (Story 3.10): a list of at most `MAX_HISTORY` objects of exactly `question` (1 to
+    `MAX_QUESTION` code points) and `answer` (0 to `MAX_HISTORY_ANSWER`), both strings."""
+    if not isinstance(value, list) or len(value) > MAX_HISTORY:
+        raise InputInvalid
+    found: list[EarlierTurn] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"question", "answer"}:
+            raise InputInvalid
+        question, earlier_answer = item["question"], item["answer"]
+        if not isinstance(question, str) or not 1 <= len(question) <= MAX_QUESTION:
+            raise InputInvalid
+        if not isinstance(earlier_answer, str) or len(earlier_answer) > MAX_HISTORY_ANSWER:
+            raise InputInvalid
+        found.append(EarlierTurn(question, earlier_answer))
+    return tuple(found)
+
+
+def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionInput:
+    """The question input, checked; `InputInvalid` otherwise. With `field="query"` (Story 3.9) it is the backend's
+    search input instead: the same shape, its text (1 to `MAX_QUERY` code points) under `query`, kept as `question`;
+    a search input carries no `history`."""
+    if field not in ("question", "query"):
+        raise ValueError(field)
+    question = raw.get(field)
+    longest = MAX_QUESTION if field == "question" else MAX_QUERY
+    if not isinstance(question, str) or not 1 <= len(question) <= longest:
         raise InputInvalid
     encoded = raw.get("tokenKey")
     if not isinstance(encoded, str):
@@ -174,8 +227,18 @@ def question_input(raw: dict[str, Any]) -> QuestionInput:
         raise InputInvalid from error
     if len(key) != KEY_BYTES:
         raise InputInvalid
+    model_knowledge = raw.get("modelKnowledge", False)
+    if not isinstance(model_knowledge, bool):
+        raise InputInvalid
+    if field == "query" and "history" in raw:
+        raise InputInvalid
     return QuestionInput(
-        owner=_uuid(raw.get("owner")), tiers=_tiers(raw.get("tiers")), question=question, token_key=key
+        owner=_uuid(raw.get("owner")),
+        tiers=_tiers(raw.get("tiers")),
+        question=question,
+        token_key=key,
+        model_knowledge=model_knowledge,
+        history=_history(raw["history"]) if "history" in raw else (),
     )
 
 
@@ -222,18 +285,25 @@ def rank_pending(passages: Sequence[PendingPassage], weights: dict[str, float]) 
     return [passage_id for rarest, _, passage_id in ranked if rarest > 0]
 
 
-def fuse(found: Sequence[Found], pending: Sequence[str], limit: int = LIMIT) -> list[str]:
-    """Qdrant's fused results with the pending ranking as a third RRF list: a pending id at rank r (from 0) scores
-    1 / (r + RRF_K), as Qdrant scores each of its prefetches. An id found both ways is one entry whose two scores add
-    up, as RRF sums across lists; a tie keeps Qdrant's order, then the pending order."""
+def fused(found: Sequence[Found], pending: Sequence[str], limit: int = LIMIT) -> list[tuple[str, float]]:
+    """Qdrant's fused results with the pending ranking as a third RRF list, each id with its score: a pending id at
+    rank r (from 0) scores 1 / (r + RRF_K), as Qdrant scores each of its prefetches. An id found both ways is one entry
+    whose two scores add up, as RRF sums across lists; a tie keeps Qdrant's order, then the pending order."""
     scores: dict[str, float] = {item.passage_id: item.score for item in found}
     for rank, passage_id in enumerate(pending):
         scores[passage_id] = scores.get(passage_id, 0.0) + 1.0 / (rank + RRF_K)
-    return sorted(scores, key=lambda passage_id: -scores[passage_id])[:limit]
+    ranked = sorted(scores, key=lambda passage_id: -scores[passage_id])[:limit]
+    return [(passage_id, scores[passage_id]) for passage_id in ranked]
 
 
-def _read(reader: PassageReader, job: ClaimedJob, ids: list[str], tiers: dict[str, str]) -> list[ReadPassage]:
-    """The passages with these ids, in this order, each of the expected tier; `SearchFailed` otherwise."""
+def fuse(found: Sequence[Found], pending: Sequence[str], limit: int = LIMIT) -> list[str]:
+    """The ids of `fused`, best first."""
+    return [passage_id for passage_id, _ in fused(found, pending, limit)]
+
+
+def read_passages(reader: PassageReader, job: ClaimedJob, ids: list[str], tiers: dict[str, str]) -> list[ReadPassage]:
+    """The passages with these ids (1 to `PAGE`), in this order, each of the expected tier; `SearchFailed`
+    otherwise."""
     try:
         answer = reader.passages(job, ids)
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
@@ -271,9 +341,10 @@ def terms_in(text: str, terms: frozenset[str]) -> frozenset[str]:
 def _read_terms(
     reader: PassageReader, job: ClaimedJob, ids: list[str], tiers: dict[str, str], terms: frozenset[str]
 ) -> list[PendingPassage]:
-    """A page of pending passages (`_read`), each kept as its id and the `terms` its folded text contains
+    """A page of pending passages (`read_passages`), each kept as its id and the `terms` its folded text contains
     (`terms_in`)."""
-    return [PendingPassage(item.passage_id, terms_in(item.text, terms)) for item in _read(reader, job, ids, tiers)]
+    read = read_passages(reader, job, ids, tiers)
+    return [PendingPassage(item.passage_id, terms_in(item.text, terms)) for item in read]
 
 
 @dataclass(frozen=True)
@@ -357,7 +428,31 @@ class _Timings:
         self.started = now
 
 
-def find_passages(
+@dataclass(frozen=True)
+class TierRanking:
+    """One searched tier's fused ranking (`fused`): its ids, best first, each with its RRF score."""
+
+    tier: str
+    scored: list[tuple[str, float]]
+
+    @property
+    def ids(self) -> list[str]:
+        return [passage_id for passage_id, _ in self.scored]
+
+
+@dataclass
+class Ranked:
+    """What `rank_tiers` found: each searched tier's ranking in tier order (empty when no tier has a source), how many
+    pending passages it read and skipped, and its timings so far (None when no tier has a source: nothing was timed)."""
+
+    tiers: list[TierRanking]
+    searched: int
+    fetched: int
+    skipped: int
+    timings: _Timings | None
+
+
+def rank_tiers(
     job: ClaimedJob,
     checked: QuestionInput,
     *,
@@ -366,13 +461,15 @@ def find_passages(
     reader: PassageReader,
     log: TraceLog,
     clock: Callable[[], float] = time.monotonic,
-) -> list[Handed]:
-    """The passages that answer the question within its scope, as the module says."""
+    limit: int = LIMIT,
+) -> Ranked:
+    """Steps 1 to 4 of the module: each tier with sources searched in Qdrant (`limit` points) and its pending passages
+    ranked, fused into at most `limit` ids per tier with their scores. No passage text is read but the pending
+    passages' (to rank them)."""
     job_id = str(job.job_id)
     searched = [tier for tier in checked.tiers if tier.sources]
     if not searched:
-        log.info("retrieval.search_done", jobId=job_id, tiers=0, handed=0)
-        return []
+        return Ranked([], 0, 0, 0, None)
     timings = _Timings(clock)
     try:
         dense = embedder.embed_query(checked.question)
@@ -385,7 +482,7 @@ def find_passages(
         with stores() as store:
             store.ensure_collection()
             for tier in searched:
-                found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, LIMIT)))
+                found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, limit)))
                 timings.lap("searchSeconds")
     except StoreFailed as error:
         raise SearchFailed(STORE_UNAVAILABLE, retry=True) from error
@@ -405,7 +502,7 @@ def find_passages(
         )
         timings.lap("pendingSeconds")
     weights = rarity(item for tier_read in read.values() for item in tier_read.passages)
-    ranked: list[tuple[str, list[str]]] = []
+    ranked: list[TierRanking] = []
     fetched = skipped = 0
     for tier, tier_found in found:
         unread = len(tier.pending) - min(len(tier.pending), MAX_PENDING)
@@ -418,26 +515,48 @@ def find_passages(
         if unread > 0:
             skipped += unread
             log.info("retrieval.pending_skipped", jobId=job_id, tier=tier.tier, skipped=unread)
-        ranked.append((tier.tier, fuse(tier_found, matching)))
+        ranked.append(TierRanking(tier.tier, fused(tier_found, matching, limit)))
     if read:
         timings.lap("rankSeconds")
-    tiers = {passage_id: tier for tier, ids in ranked for passage_id in ids}
+    return Ranked(ranked, len(searched), fetched, skipped, timings)
+
+
+def find_passages(
+    job: ClaimedJob,
+    checked: QuestionInput,
+    *,
+    embedder: Embedder,
+    stores: StoreFactory,
+    reader: PassageReader,
+    log: TraceLog,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[Handed]:
+    """The passages that answer the question within its scope, as the module says."""
+    job_id = str(job.job_id)
+    ranked = rank_tiers(
+        job, checked, embedder=embedder, stores=stores, reader=reader, log=log, clock=clock, limit=LIMIT
+    )
+    timings = ranked.timings
+    if timings is None:
+        log.info("retrieval.search_done", jobId=job_id, tiers=0, handed=0)
+        return []
+    tiers = {passage_id: tier.tier for tier in ranked.tiers for passage_id in tier.ids}
     ids = list(tiers)
     handed: list[Handed] = []
     if ids:
         handed = [
             Handed(item.passage_id, item.tier, item.page, item.text, list(item.section_path))
-            for item in _read(reader, job, ids, tiers)
+            for item in read_passages(reader, job, ids, tiers)
         ]
         timings.lap("readSeconds")
     log.info(
         "retrieval.search_done",
         jobId=job_id,
-        tiers=len(searched),
+        tiers=ranked.searched,
         handed=len(handed),
         ids=[item.passage_id for item in handed],
-        pendingFetched=fetched,
-        pendingSkipped=skipped,
+        pendingFetched=ranked.fetched,
+        pendingSkipped=ranked.skipped,
         **timings.spent,
     )
     return handed

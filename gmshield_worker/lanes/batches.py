@@ -3,9 +3,9 @@
 The handler hands every model event to `emit` as it comes and never waits: a sender thread of the batcher posts them
 to `POST .../events` under the claim's grant, numbered from 1 per claim.
 
-- The first text delta goes out at once, alone (with any citation before it, at most `max_events` events), so the GM
-  sees the first words as soon as they exist. After it, a batch goes out at most every `interval` (100 ms) or as soon
-  as `max_events` (32) events wait, whichever comes first, with at most `max_events` events.
+- The first text delta goes out at once, alone (with any citation or tier mark before it, at most `max_events`
+  events), so the GM sees the first words as soon as they exist. After it, a batch goes out at most every `interval`
+  (100 ms) or as soon as `max_events` (32) events wait, whichever comes first, with at most `max_events` events.
 - A call's usage rides in the next batch; at the end, what is left goes out, a usage-only batch included.
 - A 5xx or a transport error is retried with the same number, backing off, while the claim lives (`cancel` is set
   once it lapsed, and then the rest is dropped). Any other refusal (4xx) stops the batcher: `refused` names its code.
@@ -26,7 +26,7 @@ from typing import Protocol
 
 from gmshield_worker.backend.client import ClaimedJob, EventsAnswer
 from gmshield_worker.log import TraceLog
-from gmshield_worker.models.output import Citation, ModelEvent, TextDelta, Usage
+from gmshield_worker.models.output import Citation, ModelEvent, StreamedEvent, TextDelta, TierMark, Usage
 
 BATCH_INTERVAL_SECONDS = 0.1
 MAX_EVENTS = 32
@@ -34,7 +34,7 @@ RETRY_INITIAL_SECONDS = 0.2
 RETRY_MAX_SECONDS = 2.0
 EVENTS_REFUSED = "worker.events_refused"
 
-type StreamEvent = TextDelta | Citation
+type StreamEvent = StreamedEvent
 
 
 class EventPoster(Protocol):
@@ -89,9 +89,10 @@ class EventBatcher:
         self._thread.start()
 
     def emit(self, event: ModelEvent) -> None:
-        """Takes one model event: a delta or a citation to post, a usage to ride along; a failure is not posted."""
+        """Takes one model event: a delta, a citation or a tier mark to post, a usage to ride along; a failure is not
+        posted."""
         with self._condition:
-            if isinstance(event, TextDelta | Citation):
+            if isinstance(event, TextDelta | Citation | TierMark):
                 if self.stop:
                     return
                 self._events.append(event)
