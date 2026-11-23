@@ -39,7 +39,9 @@ size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in 
 - `records` (Story 4.2; any format; the passages of its pages as JSON Lines, and the record types in the claim
   input's `recordTypes`): `records.py` builds the prompt and checks the answer, and one structured call of the claim's
   model (`models.chat.chat_model`, `RECORDS_TIMEOUT_SECONDS`, `models.structured.structured_call`) reads them; the
-  report gives the `records` kept, and the outcome the call's usage under its worker-minted call id. A refusal, a
+  report gives the `records` kept and, from Story 4.4, the `proposals` kept (record types and terms the passages name,
+  each with its quotes; always present, empty when none), and the outcome the call's usage under its worker-minted call
+  id. A refusal, a
   truncation, or a prompt filter's flag (`model.question_flagged`, `model.source_flagged`) fails the step with its code
   and `retry: false` (`RECORDS_FINAL`), an outage or an answer that did not parse with its code
   (the backend retries while attempts remain); a claim without a model fails with `model.input_invalid`, a provider
@@ -937,7 +939,8 @@ class IngestionStep:
             raise StepFailed(STEP_FAILED, retry=False) from error
         path.unlink()
         found: list[dict[str, Any]] = []
-        dropped = 0
+        proposed: list[dict[str, Any]] = []
+        dropped = proposals_dropped = 0
         if given:
             try:
                 model = chat_model(job.model, self.keys, max_tokens=RECORDS_MAX_TOKENS, timeout=RECORDS_TIMEOUT_SECONDS)
@@ -960,9 +963,23 @@ class IngestionStep:
                 raise StepFailed(answer.failed, retry=answer.failed not in RECORDS_FINAL)
             kept = records.checked(answer.parsed, given, types)
             found, dropped = kept.records, kept.dropped
-        result = {"pipelineVersion": PIPELINE_VERSION, "pageTotal": checked.page_total, "records": found, "next": []}
+            proposed, proposals_dropped = kept.proposals, kept.proposals_dropped
+        result = {
+            "pipelineVersion": PIPELINE_VERSION,
+            "pageTotal": checked.page_total,
+            "records": found,
+            "proposals": proposed,
+            "next": [],
+        }
         by_type = {kind: sum(1 for item in found if item["type"] == kind) for kind in types}
-        return result, {"passages": len(given), "records": len(found), "dropped": dropped, **by_type}
+        return result, {
+            "passages": len(given),
+            "records": len(found),
+            "dropped": dropped,
+            "proposals": len(proposed),
+            "proposalsDropped": proposals_dropped,
+            **by_type,
+        }
 
     def _bookmarks(
         self, job: ClaimedJob, checked: StepInput, cancel: threading.Event, folder: Path, log: TraceLog

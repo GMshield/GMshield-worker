@@ -145,7 +145,7 @@ class StandInRecord:
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.19.0"
+    version: str = "1.20.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -689,14 +689,40 @@ def _record_valid(item: object, types: list[str], given: set[str]) -> bool:
     return 1 <= len(ids) <= MAX_RECORD_PASSAGES and len(set(ids)) == len(ids) and all(i in given for i in ids)
 
 
-RECORDS_REPORT_KEYS = frozenset({"pipelineVersion", "pageTotal", "records", "next"})
+RECORDS_REPORT_KEYS = frozenset({"pipelineVersion", "pageTotal", "records", "proposals", "next"})
+MAX_PROPOSALS = 20
+MAX_PROPOSAL_NAME = 120
+MAX_DEFINITION = 500
+MAX_EXAMPLES = 3
+MAX_QUOTE = 200
+
+
+def _proposal_valid(item: object, given: set[str]) -> bool:
+    """A records report's proposal (Story 4.4) as `IngestionSteps.Report.proposals` takes it: a kind, a name, a
+    definition within its limit, and at most three examples, each a passage id and a quote (whether the quote is in its
+    passage, the backend checks and drops; here a given passage is required too, as the worker only cites those)."""
+    if not isinstance(item, dict) or item.get("kind") not in {"record_type", "term"}:
+        return False
+    name, definition, examples = item.get("name"), item.get("definition", ""), item.get("examples")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= MAX_PROPOSAL_NAME:
+        return False
+    if not isinstance(definition, str) or len(definition) > MAX_DEFINITION:
+        return False
+    if not isinstance(examples, list) or len(examples) > MAX_EXAMPLES:
+        return False
+    return all(
+        isinstance(example, dict) and example.get("passageId") in given and _filled(example.get("quote"), MAX_QUOTE)
+        for example in examples
+    )
 
 
 def _records_valid(job: StandInJob, result: dict[str, Any]) -> bool:
-    """A records step's report carries its records (Story 4.2) and nothing else (an empty `next` at most), and no
-    other step's carries records."""
+    """A records step's report carries its records (Story 4.2) and its proposals (Story 4.4) and nothing else (an empty
+    `next` at most), and no other step's carries records or proposals."""
     found = result.get("records")
     if (job.input.get("input") == "passages") != (found is not None):
+        return False
+    if found is None and "proposals" in result:
         return False
     if found is None:
         return True
@@ -704,7 +730,21 @@ def _records_valid(job: StandInJob, result: dict[str, Any]) -> bool:
         return False
     types = job.input.get("recordTypes") or []
     given = _given_passages(job)
-    return isinstance(found, list) and len(found) <= MAX_RECORDS and all(_record_valid(i, types, given) for i in found)
+    return (
+        _proposals_valid(result.get("proposals", []), given)
+        and isinstance(found, list)
+        and len(found) <= MAX_RECORDS
+        and all(_record_valid(i, types, given) for i in found)
+    )
+
+
+def _proposals_valid(proposals: object, given: set[str]) -> bool:
+    """A records report's proposals (Story 4.4): at most `MAX_PROPOSALS`, each as `_proposal_valid` says."""
+    return (
+        isinstance(proposals, list)
+        and len(proposals) <= MAX_PROPOSALS
+        and all(_proposal_valid(item, given) for item in proposals)
+    )
 
 
 def ingestion_result_valid(job: StandInJob, result: object) -> bool:

@@ -24,7 +24,9 @@ PDF's passages step reads the cleaned original's bookmarks, and a section path i
 Docling heading under it (Docling's heading levels no longer nest); passages are joined to about `PASSAGE_TARGET`
 (1,200) code points, the first of each section up to `PASSAGE_LIMIT`. "8" (Story 4.2): the passages step also asks
 a `records` step per run of 10 pages that holds a passage, over the passages of those pages; `records.py` reads their
-rules, spells and items through the claim's model, in-process (it reads only the backend's passages).
+rules, spells and items through the claim's model, in-process (it reads only the backend's passages). "9" (Story 4.4):
+the same call also proposes the record types and terms its passages name or define, each with up to three quotes and a
+term with its quoted definition, and a records report carries them as `proposals` (internal contract 1.20.0).
 """
 
-PIPELINE_VERSION = "8"
+PIPELINE_VERSION = "9"

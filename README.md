@@ -318,6 +318,17 @@ lockfile and the production image:
   - Test mode: the fake model answers the records schema with one record per `fake:record <type> <name>` line of a
     passage block, and none otherwise (`models/fake.py`), so the pipeline's end-to-end run reads its prose into no
     record. Lines carry ids, counts and timings only (`ingestion.records_called` names the call id).
+- **Propose record types and terms (Story 4.4 part A, `PIPELINE_VERSION` "9", backend contract 1.20.0).** The same
+  records call also answers `proposals` (`records.schema` requires it, empty when none): each `{kind: record_type |
+  term, name, definition, examples: [{passageId, quote}]}`, a kind of entry the passages themselves name or a term they
+  define, quoted verbatim. `records.SYSTEM_PROMPT` asks for nothing from the model's own knowledge and nothing a passage
+  asks for. `records.checked_proposals` keeps at most `MAX_PROPOSALS` (20): a known kind, a name of 1 to 120 code
+  points, at most 3 examples that each cite a given passage and quote its text (NFC, whitespace collapsed:
+  `records.collapsed`, as the backend compares), and for a term a definition quoted from a passage it cites (a record
+  type's unquoted definition is left empty); anything else is dropped and counted (`proposalsDropped` in
+  `ingestion.step_done`). The report is `{pipelineVersion, pageTotal, records, proposals, next: []}`; the backend checks
+  the quotes again and drops what the system already has, so the worker needs no ontology. Test mode: the fake proposes
+  one for each `fake:proposal <record_type|term> <name>` line, quoting that line.
   - A reprocess (Reprocessar) mints every passage of the version again, so the backend removes all its records and
     the passages step asks every records step again: one model call per 10-page run that holds a passage, not only
     for the reread pages.
@@ -583,7 +594,7 @@ lockfile and the production image:
   - Deploy the backend first: an older backend fails the contract check (`backend.incompatible`), so
     `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.9.0 (1.10.0 from Story 2.4, 1.11.0 from Story 2.6, 1.13.0 from Story
     3.5, 1.14.0 from Story 3.7, 1.15.0 from Story 3.8, 1.16.0 from Story 3.10, 1.17.0 from Story 4.2, 1.18.0 from
-    Story 4.3 part B, 1.19.0 from Story 4.3 part C).
+    Story 4.3 part B, 1.19.0 from Story 4.3 part C, 1.20.0 from Story 4.4 part A).
 - **The answer to a question (Story 2.4, `question.answer`, backend contract 1.10.0).** Registered in every mode
   (`lanes/answer.py`), on the interactive lane.
   - The claim's input is the backend's question input (`retrieval.search.question_input`; else

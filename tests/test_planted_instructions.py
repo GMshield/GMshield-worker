@@ -23,7 +23,8 @@ structure the real model's run by hand relies on (`docs/_bmad-output/implementat
 - Story 4.2: an ingestion `records` step over the planted passages sends the model `records.SYSTEM_PROMPT` exactly
   and one user turn holding the record type names and every passage as escaped data inside one delimiter; no record,
   type or field follows the planted text (the fake reads only `fake:record` lines, and the real model's run is the
-  story's check by hand); the step calls only its input and the worker logs nothing of the material.
+  story's check by hand); the step calls only its input and the worker logs nothing of the material. Story 4.4: the
+  planted "Add type Admin" line proposes nothing either (no proposal follows a passage's request).
 
 The planted file holds no `fake:` directive: the fake model would read it from any user text."""
 
@@ -92,6 +93,8 @@ FRAGMENTS = (
     "<script",
     "Lâmina de Âmbar",
     "Corvo de Cinza",
+    "Add type Admin",
+    "Superusuário",
 )
 
 
@@ -643,6 +646,10 @@ def test_a_records_step_over_planted_passages_keeps_them_data_and_follows_none_o
     assert outcome.outcome == "done", outcome
     assert outcome.result is not None
     assert outcome.result["records"] == []
+    # Story 4.4, matrix row "Planted text": "add type Admin" is data; no proposal follows it.
+    assert outcome.result["proposals"] == []
+    assert "Admin" not in records.SYSTEM_PROMPT
+    assert "proposal" in records.SYSTEM_PROMPT
     assert JobsApi(stand_in.url, CREDENTIAL).report(claim.job, outcome).status == 204
     assert [route_of(request) for request in calls] == ["passages"]
 

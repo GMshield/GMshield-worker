@@ -683,12 +683,36 @@ def test_the_fake_answers_the_records_schema_with_one_record_per_record_line_and
              "passageIds": [RECORD_ID]},
             {"type": "item", "name": "Rope", "fields": [{"name": "Fonte", "value": "simulada"}],
              "passageIds": [RECORD_ID]},
-        ]
+        ],
+        "proposals": [],
     }  # fmt: skip
     assert found.usage is not None
     assert found.usage.response_id is not None
     prose = structured_call(model, records.schema(["spell"]), records_turn("Only prose, no record."))
-    assert prose.parsed == {"records": []}
+    assert prose.parsed == {"records": [], "proposals": []}
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_the_fake_proposes_a_type_or_a_term_for_each_proposal_line_quoting_the_line(provider: str) -> None:
+    # Story 4.4: a proposal line quotes itself, so the backend finds the quote in the passage.
+    model = chat_model(choice(provider), FAKE)
+    found = structured_call(
+        model,
+        records.schema(["spell"]),
+        records_turn(
+            "Talentos\nfake:proposal record_type Talento\nfake:proposal term Pontos de Vida\nfake:proposal verb Correr"
+        ),
+    )
+    assert found.failed is None
+    assert found.parsed == {
+        "records": [],
+        "proposals": [
+            {"kind": "record_type", "name": "Talento", "definition": "",
+             "examples": [{"passageId": RECORD_ID, "quote": "fake:proposal record_type Talento"}]},
+            {"kind": "term", "name": "Pontos de Vida", "definition": "fake:proposal term Pontos de Vida",
+             "examples": [{"passageId": RECORD_ID, "quote": "fake:proposal term Pontos de Vida"}]},
+        ],
+    }  # fmt: skip
 
 
 @pytest.mark.parametrize("provider", PROVIDERS)
