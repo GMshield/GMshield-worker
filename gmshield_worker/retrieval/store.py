@@ -15,9 +15,10 @@ Qdrant's reciprocal rank fusion (`FusionQuery(Fusion.RRF)`, whose constant is `R
 `owner == the job's owner AND source IN the tier's sources` and the kinds' condition on the query and on each prefetch,
 every time. The kinds (`Kinds`) say which points a search may answer:
 
-- `PASSAGES` (a question's answer): `record_type is empty` too. Qdrant's `is_empty` matches a point that has no
-  `record_type` (or a null or empty one), so an answer never gets a record's id (records join answers in Story 4.3 part
-  C).
+- `PASSAGES` (a question's answer passages): `record_type is empty` too. Qdrant's `is_empty` matches a point that has
+  no `record_type` (or a null or empty one), so this search never gets a record's id.
+- `RECORDS` (Story 4.3 part C, an answer's records search): `must_not record_type is empty`, so only record points, of
+  any type, and no passage. An answer runs it beside its passages search, so records never take a passage's slot.
 - `EVERYTHING` (Story 4.3 part B, the library search): no condition on `record_type`, so passages and records come back
   mixed by their fused rank.
 - `records_of(key)` (a library search with a record-type filter): `record_type == key`, so only records of that core
@@ -81,14 +82,16 @@ class Found:
 
 @dataclass(frozen=True)
 class Kinds:
-    """Which points a search may answer, as the module says: passages only (`records` false), or passages and records,
-    or only the records of one core type (`record_type`)."""
+    """Which points a search may answer, as the module says: passages only (`records` false), passages and records,
+    records only (`passages` false), or only the records of one core type (`record_type`)."""
 
     records: bool = False
     record_type: str | None = None
+    passages: bool = True
 
 
 PASSAGES = Kinds()
+RECORDS = Kinds(records=True, passages=False)
 EVERYTHING = Kinds(records=True)
 
 
@@ -136,7 +139,7 @@ def _source_filter(owner: str, source: str) -> models.Filter:
 
 def _sources_filter(owner: str, sources: Sequence[str], kinds: Kinds = PASSAGES) -> models.Filter:
     """The owner's points of these sources that `kinds` allows: passage points only (a record's point has a
-    `record_type`), every point, or the record points of one core type."""
+    `record_type`), every point, every record point, or the record points of one core type."""
     must: list[models.Condition] = [
         models.FieldCondition(key=OWNER, match=models.MatchValue(value=owner)),
         models.FieldCondition(key=SOURCE, match=models.MatchAny(any=list(sources))),
@@ -145,6 +148,10 @@ def _sources_filter(owner: str, sources: Sequence[str], kinds: Kinds = PASSAGES)
         must.append(models.IsEmptyCondition(is_empty=models.PayloadField(key=RECORD_TYPE)))
     elif kinds.record_type is not None:
         must.append(models.FieldCondition(key=RECORD_TYPE, match=models.MatchValue(value=kinds.record_type)))
+    elif not kinds.passages:
+        return models.Filter(
+            must=must, must_not=[models.IsEmptyCondition(is_empty=models.PayloadField(key=RECORD_TYPE))]
+        )
     return models.Filter(must=must)
 
 

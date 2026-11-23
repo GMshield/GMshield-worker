@@ -33,6 +33,12 @@ search below never reads it.
 5. The text of every found id, in rank order, campaign tier first, is read in one call to `POST …/passages` (contract
    1.8.0): the handed-over list is `[Handed(id, tier, text, section_path, page)]`. Library text reaches the worker by
    no other path, and nothing of it reaches Qdrant.
+6. Story 4.3 part C (contract 1.19.0), an answer only (`find_sources` with a record reader): per tier, beside its
+   passages search and with the same vectors, one more Qdrant query for record points only (`store.RECORDS`, any core
+   type, `RECORD_LIMIT` points), so records never take a passage's slot and passages rank exactly as before. The found
+   record ids, in rank order, campaign tier first, are read in one call to `POST …/records`, never `…/passages`: the
+   handed-over records are `[HandedRecord(id, tier, type, name, fields, page, section_path)]`. A record id never
+   reaches the pending ranking. `retrieval.search_done` keeps `ids` (the passages) and adds `records` (the record ids).
 
 The library search (Story 3.9, `lanes/search.py`) reuses steps 1 to 4 (`rank_tiers`) on the backend's search input
 (`Scopes.searchInput`: the same shape with `query`, 1 to `MAX_QUERY` code points, in place of `question`;
@@ -45,7 +51,8 @@ Failures (`SearchFailed`): Ollama `retrieval.embedding_unavailable` and Qdrant `
 retryable (nothing has been sent yet); a question the model refuses as too long `retrieval.question_too_long`; a refusal
 of the backend (4xx) its own code (`scope.passage_refused`, ...), or `retrieval.passages_refused` when it names none,
 with no retry; any other failure of the passages route
-`retrieval.passages_unavailable`, retryable. An input that is not the backend's is `InputInvalid`. Lines carry ids,
+`retrieval.passages_unavailable`, retryable. The records route fails the same way, with `retrieval.records_refused` and
+`retrieval.records_unavailable`. An input that is not the backend's is `InputInvalid`. Lines carry ids,
 counts and timings: never the question, a text, a token or the key.
 """
 
@@ -66,15 +73,17 @@ from typing import Any, Protocol
 
 import httpx
 
-from gmshield_worker.backend.client import ClaimedJob, PassagesAnswer, ReadPassage
+from gmshield_worker.backend.client import ClaimedJob, PassagesAnswer, ReadPassage, ReadRecord, RecordsAnswer
 from gmshield_worker.log import TraceLog
 from gmshield_worker.retrieval.embedding import Embedder, EmbeddingFailed
 from gmshield_worker.retrieval.indexing import CORE_TYPES, StoreFactory
 from gmshield_worker.retrieval.keywords import KEY_BYTES, query_vector, tokens
-from gmshield_worker.retrieval.store import PASSAGES, RRF_K, Found, Kinds, StoreFailed
+from gmshield_worker.retrieval.store import PASSAGES, RECORDS, RRF_K, Found, Kinds, StoreFailed
 
 TIERS = ("campaign", "system", "other")
 LIMIT = 8
+# Story 4.3 part C: the most record points an answer's records search finds per tier, beside its `LIMIT` passages.
+RECORD_LIMIT = 4
 # The most pending ids of a tier the worker reads: as many as the backend lists (`Scopes.MAX_PENDING`).
 MAX_PENDING = 5000
 # The most ids of one passages call (the backend's `JobPassageReads.MAX_IDS`).
@@ -97,6 +106,8 @@ EMBEDDING_UNAVAILABLE = "retrieval.embedding_unavailable"
 STORE_UNAVAILABLE = "retrieval.store_unavailable"
 PASSAGES_UNAVAILABLE = "retrieval.passages_unavailable"
 PASSAGES_REFUSED = "retrieval.passages_refused"
+RECORDS_UNAVAILABLE = "retrieval.records_unavailable"
+RECORDS_REFUSED = "retrieval.records_refused"
 _UUID = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", re.ASCII)
 
 
@@ -159,10 +170,47 @@ class Handed:
     section_path: list[str] = field(repr=False)
 
 
+@dataclass(frozen=True)
+class HandedField:
+    """One field of a handed record: never printed."""
+
+    name: str = field(repr=False)
+    value: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class HandedRecord:
+    """A record handed over for the question (Story 4.3 part C): its id, its tier, its core type key and its first page;
+    its name, fields and section path never printed."""
+
+    record_id: str
+    tier: str
+    type: str
+    page: int
+    name: str = field(repr=False)
+    fields: tuple[HandedField, ...] = field(repr=False)
+    section_path: list[str] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class Sources:
+    """What `find_sources` hands over: the passages, then (an answer only) the records, each in rank order."""
+
+    passages: list[Handed]
+    records: list[HandedRecord] = field(default_factory=list)
+
+
 class PassageReader(Protocol):
     """Reading passages by id under the claim's grant (`backend.client.JobsApi`, or a stand-in in tests)."""
 
     def passages(self, job: ClaimedJob, ids: list[str]) -> PassagesAnswer: ...
+
+
+class RecordReader(Protocol):
+    """Reading records by id under the claim's grant (`backend.client.JobsApi`, or a stand-in in tests; Story 4.3 part
+    C)."""
+
+    def records(self, job: ClaimedJob, ids: list[str]) -> RecordsAnswer: ...
 
 
 def _uuid(value: object) -> str:
@@ -330,6 +378,23 @@ def read_passages(reader: PassageReader, job: ClaimedJob, ids: list[str], tiers:
     raise SearchFailed(PASSAGES_UNAVAILABLE, retry=True)
 
 
+def read_records(reader: RecordReader, job: ClaimedJob, ids: list[str], tiers: dict[str, str]) -> list[ReadRecord]:
+    """The records with these ids (1 to `PAGE`), in this order, each of the expected tier; `SearchFailed`
+    otherwise."""
+    try:
+        answer = reader.records(job, ids)
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
+        raise SearchFailed(RECORDS_UNAVAILABLE, retry=True) from error
+    if answer.status == 200 and answer.records is not None:
+        read = answer.records
+        if [item.record_id for item in read] != ids or any(item.tier != tiers[item.record_id] for item in read):
+            raise SearchFailed(RECORDS_UNAVAILABLE, retry=True)
+        return read
+    if 400 <= answer.status < 500:
+        raise SearchFailed(answer.code or RECORDS_REFUSED, retry=False)
+    raise SearchFailed(RECORDS_UNAVAILABLE, retry=True)
+
+
 @functools.lru_cache(maxsize=64)
 def _terms_pattern(terms: frozenset[str]) -> re.Pattern[str] | None:
     """One regex for the ASCII terms, each a whole word: `\\b(?:term|…)\\b`; None when no term is ASCII."""
@@ -443,11 +508,13 @@ class _Timings:
 @dataclass(frozen=True)
 class TierRanking:
     """One searched tier's fused ranking (`fused`): its ids, best first, each with its RRF score, and (Story 4.3
-    part B) which of them are records' points."""
+    part B) which of them are records' points; (Story 4.3 part C) the ids of its separate records search, best
+    first."""
 
     tier: str
     scored: list[tuple[str, float]]
     records: frozenset[str] = frozenset()
+    found_records: tuple[str, ...] = ()
 
     @property
     def ids(self) -> list[str]:
@@ -477,10 +544,12 @@ def rank_tiers(
     clock: Callable[[], float] = time.monotonic,
     limit: int = LIMIT,
     kinds: Kinds = PASSAGES,
+    records: int = 0,
 ) -> Ranked:
     """Steps 1 to 4 of the module: each tier with sources searched in Qdrant (`limit` points of the `kinds` it may
     answer) and its pending passages ranked, fused into at most `limit` ids per tier with their scores. No passage text
-    is read but the pending passages' (to rank them); with a record-type filter no pending passage is read at all."""
+    is read but the pending passages' (to rank them); with a record-type filter no pending passage is read at all.
+    With `records` above 0 (step 6), each tier is also searched for at most that many record points."""
     job_id = str(job.job_id)
     searched = [tier for tier in checked.tiers if tier.sources]
     if not searched:
@@ -493,11 +562,15 @@ def rank_tiers(
     sparse = query_vector(checked.question, checked.token_key)
     timings.lap("embedSeconds")
     found: list[tuple[TierScope, list[Found]]] = []
+    found_records: dict[str, tuple[str, ...]] = {}
     try:
         with stores() as store:
             store.ensure_collection()
             for tier in searched:
                 found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, limit, kinds=kinds)))
+                if records > 0:
+                    hits = store.search(checked.owner, tier.sources, dense, sparse, records, kinds=RECORDS)
+                    found_records[tier.tier] = tuple(item.passage_id for item in hits if item.record)
                 timings.lap("searchSeconds")
     except StoreFailed as error:
         raise SearchFailed(STORE_UNAVAILABLE, retry=True) from error
@@ -532,8 +605,10 @@ def rank_tiers(
         if unread > 0:
             skipped += unread
             log.info("retrieval.pending_skipped", jobId=job_id, tier=tier.tier, skipped=unread)
-        records = frozenset(item.passage_id for item in tier_found if item.record)
-        ranked.append(TierRanking(tier.tier, fused(tier_found, matching, limit), records))
+        found_ids = frozenset(item.passage_id for item in tier_found if item.record)
+        ranked.append(
+            TierRanking(tier.tier, fused(tier_found, matching, limit), found_ids, found_records.get(tier.tier, ()))
+        )
     if read:
         timings.lap("rankSeconds")
     return Ranked(ranked, len(searched), fetched, skipped, timings)
@@ -549,15 +624,39 @@ def find_passages(
     log: TraceLog,
     clock: Callable[[], float] = time.monotonic,
 ) -> list[Handed]:
-    """The passages that answer the question within its scope, as the module says."""
+    """The passages that answer the question within its scope, as the module says (steps 1 to 5)."""
+    return find_sources(job, checked, embedder=embedder, stores=stores, reader=reader, log=log, clock=clock).passages
+
+
+def find_sources(
+    job: ClaimedJob,
+    checked: QuestionInput,
+    *,
+    embedder: Embedder,
+    stores: StoreFactory,
+    reader: PassageReader,
+    log: TraceLog,
+    clock: Callable[[], float] = time.monotonic,
+    record_reader: RecordReader | None = None,
+) -> Sources:
+    """The passages and, with a `record_reader` (an answer, Story 4.3 part C), the records that answer the question
+    within its scope, as the module says."""
     job_id = str(job.job_id)
     ranked = rank_tiers(
-        job, checked, embedder=embedder, stores=stores, reader=reader, log=log, clock=clock, limit=LIMIT
+        job,
+        checked,
+        embedder=embedder,
+        stores=stores,
+        reader=reader,
+        log=log,
+        clock=clock,
+        limit=LIMIT,
+        records=RECORD_LIMIT if record_reader is not None else 0,
     )
     timings = ranked.timings
     if timings is None:
-        log.info("retrieval.search_done", jobId=job_id, tiers=0, handed=0)
-        return []
+        log.info("retrieval.search_done", jobId=job_id, tiers=0, handed=0, records=[])
+        return Sources([])
     tiers = {passage_id: tier.tier for tier in ranked.tiers for passage_id in tier.ids}
     ids = list(tiers)
     handed: list[Handed] = []
@@ -567,14 +666,31 @@ def find_passages(
             for item in read_passages(reader, job, ids, tiers)
         ]
         timings.lap("readSeconds")
+    record_tiers = {record_id: tier.tier for tier in ranked.tiers for record_id in tier.found_records}
+    records: list[HandedRecord] = []
+    if record_reader is not None and record_tiers:
+        records = [
+            HandedRecord(
+                item.record_id,
+                item.tier,
+                item.type,
+                item.page,
+                item.name,
+                tuple(HandedField(one.name, one.value) for one in item.fields),
+                list(item.section_path),
+            )
+            for item in read_records(record_reader, job, list(record_tiers), record_tiers)
+        ]
+        timings.lap("recordsSeconds")
     log.info(
         "retrieval.search_done",
         jobId=job_id,
         tiers=ranked.searched,
         handed=len(handed),
         ids=[item.passage_id for item in handed],
+        records=[item.record_id for item in records],
         pendingFetched=ranked.fetched,
         pendingSkipped=ranked.skipped,
         **timings.spent,
     )
-    return handed
+    return Sources(handed, records)

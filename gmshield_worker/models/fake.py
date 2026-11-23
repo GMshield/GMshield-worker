@@ -25,6 +25,10 @@ the answer is one call of it: a record for each `fake:record <type> <name>` line
 id="…" …>`), with one field and that passage's id, and no record otherwise, so the pipeline's end-to-end run reads
 prose into no record. `fake:refusal` and `fake:truncated` give no call and their stop, `fake:outage` fails as above.
 
+Story 4.3 part C: a record block of the user turn (`<record id="…" tier="…" …>`, as `lanes.answer.user_turn` writes
+it after the passages) is cited by its id as a passage is, in the order the blocks come, with its tier like a
+passage's.
+
 Story 3.10: the earlier turns of a conversation (`<earlier-turn>` elements, as `lanes.answer.user_turn` writes them) are
 left out before anything is read from a user turn, so a directive or an id in an earlier question or answer neither
 changes the answer nor is cited: directives and cited ids come from the question and the passages only.
@@ -62,8 +66,8 @@ _RECORD_BLOCK = re.compile(r'<passage id="([0-9a-f-]{36})"[^>]*>(.*?)</passage>'
 # The name starts with a character that is no blank, so no run of blanks is ever matched two ways (linear).
 _RECORD_LINE = re.compile(r"fake:record[ \t]+([a-z_]{1,32})[ \t]+([^\s<][^\n<]{0,199})")
 _PASSAGE_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.ASCII)
-# A data block's id and tier, as `lanes.answer.user_turn` writes them.
-_TIERED = re.compile(r'<passage id="([0-9a-f-]{36})" tier="([a-z]+)"', re.ASCII)
+# A data block's id and tier, as `lanes.answer.user_turn` writes them: a passage's or (Story 4.3 part C) a record's.
+_TIERED = re.compile(r'<(?:passage|record) id="([0-9a-f-]{36})" tier="([a-z]+)"', re.ASCII)
 TIER_ORDER = ("campaign", "system", "other")
 # Story 3.8: the marker the model-knowledge rule names in the system message, and that opens the fake's model paragraph.
 MODEL_MARKER = "[[tier:model]]"

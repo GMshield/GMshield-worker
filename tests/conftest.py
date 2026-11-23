@@ -25,6 +25,11 @@ Since Story 2.3 (contract 1.8.0) it serves `POST .../passages` as the backend's 
 `tiers`, else 403 `scope.passage_refused` with nothing returned; each answered once, in the order asked, labelled
 with the tier whose sources hold it. `passages_status` forces a refusal with `passages_code` instead.
 
+Since Story 4.3 part C (contract 1.19.0) it serves `POST .../records` the same way over `records` (`StandInRecord`:
+1 to 100 ids, else 400 `job.records_invalid`; any id not a record of a tier's source 403 `scope.passage_refused`, a
+passage's id included), each with its tier, core type, name, fields, page and section path; `records_status` forces a
+refusal with `records_code`. A citation event names exactly one of `passageId` and `recordId`.
+
 Since Story 2.10 (contract 1.9.0) a claim may state `providers` (at most 8 words of `[a-z0-9-]{1,32}`, else 400), each
 list kept in `stated_providers`. A job offered with `model=` calls a model: its claim answers that `model`, unless the
 worker did not state its provider, when the job ends `failed` with `job.provider_unavailable` (`ended_code`), no
@@ -81,7 +86,7 @@ PR_SET_DUMPABLE = 4
 PIPELINE_VERSION = re.compile(r"[A-Za-z0-9._-]{1,32}")
 CLAIMS = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims")
 CLAIM_ROUTE = re.compile(
-    r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs|passages|events)"
+    r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs|passages|records|events)"
 )
 INPUT_ROUTE = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/inputs/([^/]+)")
 
@@ -123,11 +128,24 @@ class StandInPassage:
     page: int
 
 
+@dataclass(frozen=True)
+class StandInRecord:
+    """A record the backend holds (Story 4.3 part C): its source (a version id), core type, name, fields (name, value)
+    in order, first page and section path."""
+
+    source: str
+    type: str
+    name: str
+    fields: list[tuple[str, str]]
+    page: int
+    section_path: list[str]
+
+
 @dataclass
 class StandIn:
     """Answers `GET /internal/v1/version` with `version`, or with `status` and a raw `body`."""
 
-    version: str = "1.18.0"
+    version: str = "1.19.0"
     status: int = 200
     body: bytes | None = None
     requests: list[dict[str, str]] = field(default_factory=list)
@@ -149,6 +167,9 @@ class StandIn:
     passages: dict[str, StandInPassage] = field(default_factory=dict)
     passages_status: int | None = None
     passages_code: str = "scope.passage_refused"
+    records: dict[str, StandInRecord] = field(default_factory=dict)
+    records_status: int | None = None
+    records_code: str = "scope.passage_refused"
     batches: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     usage: dict[str, dict[str, Any]] = field(default_factory=dict)
     events_status: int | None = None
@@ -298,7 +319,7 @@ def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tu
     job = _granted(state, job_id, claim_id, headers.get("x-job-grant"))
     if job is None:
         return problem(403, "job.grant_refused")
-    answers = {"outputs": _output, "passages": _passages, "outcome": _outcome, "events": _events}
+    answers = {"outputs": _output, "passages": _passages, "records": _records, "outcome": _outcome, "events": _events}
     return _renewal(state, job) if action == "renewals" else answers[action](state, job, body)
 
 
@@ -335,6 +356,32 @@ def _passages(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     return 200, {"passages": found}
 
 
+def _records(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
+    ids = json.loads(body).get("ids")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 100 or any(not isinstance(item, str) for item in ids):
+        return problem(400, "job.records_invalid")
+    if state.records_status is not None:
+        return problem(state.records_status, state.records_code)
+    found = []
+    for record_id in dict.fromkeys(ids):
+        record = state.records.get(record_id)
+        tier = _tier_of(job, record.source) if record is not None else None
+        if record is None or tier is None:
+            return problem(403, "scope.passage_refused")
+        found.append(
+            {
+                "id": record_id,
+                "tier": tier,
+                "type": record.type,
+                "name": record.name,
+                "fields": [{"name": name, "value": value} for name, value in record.fields],
+                "page": record.page,
+                "sectionPath": record.section_path,
+            }
+        )
+    return 200, {"records": found}
+
+
 EVENT_TYPES = ("delta", "citation", "tier")
 TIER_WORDS = ("campaign", "system", "other", "model")
 
@@ -348,7 +395,11 @@ def _events_valid(body: dict[str, Any]) -> bool:
             return False
         if event["type"] == "delta" and not (isinstance(event.get("text"), str) and event["text"]):
             return False
-        if event["type"] == "citation" and not (type(event.get("offset")) is int and event["offset"] >= 0):
+        if event["type"] == "citation" and not (
+            type(event.get("offset")) is int
+            and event["offset"] >= 0
+            and (isinstance(event.get("passageId"), str)) != (isinstance(event.get("recordId"), str))
+        ):
             return False
         if event["type"] == "tier" and not (
             event.get("tier") in TIER_WORDS
