@@ -1,16 +1,22 @@
-"""The Qdrant collection `passages` (Story 2.1, AD-10): one point per passage, its id the passage's id.
+"""The Qdrant collection `passages` (Story 2.1, AD-10): one point per passage, its id the passage's id, and (Story 4.2
+part B) one point per record of an accepted version, its id the record's id.
 
 The collection is created when missing: the named vectors `dense` (768 dimensions, cosine) and `sparse` (Qdrant's
-`idf` modifier), a tenant keyword index on `owner` and a keyword index on `source`. A point's payload is exactly
-`{owner, source, kind, page, language}`, plus `record_type` only when a record has one (never in Story 2.1): no text,
-no title, no name, nothing a GM can switch. An upsert of the same passage writes the same point again, so a retried
-job leaves one point per passage. A removal deletes by a filter on owner and source, never by a list of ids, so it is
-safe to repeat and also takes what an index change wrote before it was cancelled.
+`idf` modifier), a tenant keyword index on `owner`, and keyword indexes on `source` and `record_type` (whichever index
+is missing is added to an existing collection). A passage's point has the payload exactly `{owner, source, kind, page,
+language}`; a record's point has exactly `{owner, source, kind, page, language, record_type}`, its page the record's
+first page and `record_type` its core type's key: no text, no title, no name, no field, nothing a GM can switch. An
+upsert of the same passage or record writes the same point again, so a retried job leaves one point per item. A
+removal deletes by a filter on owner and source, never by a list of ids, so it is safe to repeat, takes a version's
+record points with its passage points, and also takes what an index change wrote before it was cancelled.
 
 A search (Story 2.3) is one `query_points` call per tier: a dense and a sparse prefetch (`PREFETCH` each) fused by
 Qdrant's reciprocal rank fusion (`FusionQuery(Fusion.RRF)`, whose constant is `RRF_K`), `limit` points, with the filter
-`owner == the job's owner AND source IN the tier's sources` on the query and on each prefetch, every time. It answers
-ids and fused scores only (no payload, no vector). A question with no keyword token has no sparse prefetch.
+`owner == the job's owner AND source IN the tier's sources AND record_type is empty` on the query and on each prefetch,
+every time. Qdrant's `is_empty` matches a point that has no `record_type` (or a null or empty one), so passage search
+never answers a record's id, which the backend could not read back as a passage (records are searched from Story 4.3).
+It answers ids and fused scores only (no payload, no vector). A question with no keyword token has no sparse
+prefetch.
 
 The client speaks REST (no gRPC) to `GMSHIELD_QDRANT_URL` with the API key, an https URL verified against the private
 authority's certificate, ignoring proxy settings from the environment. Any failure of Qdrant raises `StoreFailed`
@@ -39,6 +45,7 @@ DENSE = "dense"
 SPARSE = "sparse"
 OWNER = "owner"
 SOURCE = "source"
+RECORD_TYPE = "record_type"
 STORE_UNAVAILABLE = "index.store_unavailable"
 TIMEOUT_SECONDS = 30
 PREFETCH = 40
@@ -64,7 +71,8 @@ class Found:
 
 @dataclass(frozen=True)
 class Point:
-    """One passage's point: its id, its two vectors and the facts of its payload."""
+    """One point: its id (`passage_id`, a passage's or a record's id), its two vectors and the facts of its payload;
+    `record_type` only for a record's point."""
 
     passage_id: str
     dense: list[float]
@@ -85,7 +93,7 @@ class Point:
             "language": self.language,
         }
         if self.record_type is not None:
-            found["record_type"] = self.record_type
+            found[RECORD_TYPE] = self.record_type
         return found
 
 
@@ -99,10 +107,12 @@ def _source_filter(owner: str, source: str) -> models.Filter:
 
 
 def _sources_filter(owner: str, sources: Sequence[str]) -> models.Filter:
+    """The owner's passage points of these sources: a record's point (it has a `record_type`) is left out."""
     return models.Filter(
         must=[
             models.FieldCondition(key=OWNER, match=models.MatchValue(value=owner)),
             models.FieldCondition(key=SOURCE, match=models.MatchAny(any=list(sources))),
+            models.IsEmptyCondition(is_empty=models.PayloadField(key=RECORD_TYPE)),
         ]
     )
 
@@ -114,11 +124,13 @@ class PassageStore:
     client: QdrantClient
 
     def ensure_collection(self) -> None:
-        """Creates the collection when it does not exist, and whichever of its two payload indexes is missing (a start
-        that stopped between the two is finished by the next job)."""
+        """Creates the collection when it does not exist, and whichever of its three payload indexes is missing (a start
+        that stopped between them is finished by the next job, and a collection made before Story 4.2 part B gets its
+        `record_type` index)."""
         indexes = {
             OWNER: models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD, is_tenant=True),
             SOURCE: models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD),
+            RECORD_TYPE: models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD),
         }
         try:
             if not self.client.collection_exists(COLLECTION):
@@ -158,7 +170,8 @@ class PassageStore:
             raise StoreFailed from error
 
     def remove(self, owner: str, source: str) -> None:
-        """Deletes every point of the owner's source, by a filter on both; nothing when there is none."""
+        """Deletes every point of the owner's source, by a filter on both (its passages' and its records' points);
+        nothing when there is none."""
         try:
             self.client.delete(
                 COLLECTION, points_selector=models.FilterSelector(filter=_source_filter(owner, source)), wait=True

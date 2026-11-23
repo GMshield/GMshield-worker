@@ -1,20 +1,29 @@
-"""The index job handlers (Story 2.1, AD-10): `index.change` writes a run of a version's passages into Qdrant,
-`index.removal` deletes a version's points.
+"""The index job handlers (Story 2.1, AD-10): `index.change` writes a run of a version's passages, or of its records,
+into Qdrant; `index.removal` deletes a version's points.
 
-`index.change`: the claim input is `{source, owner, kind, language, tokenKey, passages}` (the version's id, its owner's
-id, the material's kind and language or null, Base64 of the owner's 32-byte token key, and the name of the input that
-holds the run). The run, at most 200 passages, is read whole from that input as JSON Lines `{id, ordinal, page, title,
-text}`; then, `BATCH` passages at a time, each passage is embedded (`embedding.py`), its keyword vector computed under
-the token key (`keywords.py`) and its point upserted (`store.py`), the claim's cancellation checked between batches.
-The result is `{indexRecipe, points}`. A re-run upserts the same ids.
+`index.change`: the claim input is `{source, owner, kind, language, tokenKey}` (the version's id, its owner's id, the
+material's kind and language or null, Base64 of the owner's 32-byte token key) and exactly one of `passages` or
+`records`: the name of the input that holds the run, and what the run is.
+
+- A passages run, at most 200 passages, is read whole from its input as JSON Lines `{id, ordinal, page, title, text}`
+  (`read_passages`). Each passage is embedded with its title in the title slot (`embedding.py`) and its keyword vector
+  computed over its text.
+- A records run (Story 4.2 part B), about 200 records cut at a page's end by the backend, is read whole from its input
+  as JSON Lines `{id, page, type, name, fields: [{name, value}]}` (`read_records`: a record's first page and its core
+  type's key). Each record is embedded with its name in the title slot and its fields as `name: value` lines as the
+  text (its name alone when it has none), the two cut together to `RECORD_TEXT_LIMIT` (16,384) code points, name
+  first; its keyword vector is computed over the same name and text. Its point's payload adds `record_type`.
+
+Either way, `BATCH` items at a time, each point is upserted with the item's id as the point id (`store.py`), the
+claim's cancellation checked between batches. The result is `{indexRecipe, points}`. A re-run upserts the same ids.
 
 `index.removal`: the claim input is `{source, owner}`; every point of that owner's source is deleted by a filter.
 
-Failures: an input that is not the backend's fails with `INPUT_INVALID` and `retry: false`; a passage still too long
-after its splits with `index.passage_too_long` and `retry: false`; Ollama with `index.embedding_unavailable`, Qdrant
-with `index.store_unavailable` and the backend's input route with `INPUT_UNAVAILABLE`, all three retried by the
-backend. Every line names ids, counts, codes and times: never a text, a title, a token or the key, which the input
-holds with `repr=False`.
+Failures: an input that is not the backend's fails with `INPUT_INVALID` and `retry: false`; a passage or a record
+still too long after its splits with `index.passage_too_long` and `retry: false`; Ollama with
+`index.embedding_unavailable`, Qdrant with `index.store_unavailable` and the backend's input route with
+`INPUT_UNAVAILABLE`, all three retried by the backend. Every line names ids, counts, codes and times: never a text, a
+title, a record's name or field, a token or the key, which the input holds with `repr=False`.
 """
 
 from __future__ import annotations
@@ -46,9 +55,16 @@ UNIT = "worker.index"
 INPUT_INVALID = "index.input_invalid"
 INPUT_UNAVAILABLE = "index.input_unavailable"
 CANCELLED = "index.cancelled"
-# The backend's run is at most 200 passages of at most 16,384 code points: far below this.
+# The backend's run is at most 200 passages of at most 16,384 code points, or about 200 records, each from one records
+# step's bounded answer: far below this.
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_PAGE = 1_000_000
+PASSAGES = "passages"
+RECORDS = "records"
+# A record's embedded text, its name and its fields' lines together, is cut to this many code points.
+RECORD_TEXT_LIMIT = 16_384
+# The core vocabulary's keys (Story 4.1): a record's type as the backend stores it.
+CORE_TYPES = frozenset({"rule", "spell", "item", "creature", "character_sheet", "encounter", "dungeon", "note"})
 _UUID = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", re.ASCII)
 _INPUT_NAME = re.compile(r"[a-z][a-z0-9_.-]{0,63}", re.ASCII)
 # A material's kind (`rulebook`, `campaign_notes`, ...) or language (`pt-BR`, `en`), as the backend checks them.
@@ -56,7 +72,7 @@ _CODE = re.compile(r"[A-Za-z0-9_-]{1,16}", re.ASCII)
 
 
 class InputInvalid(ValueError):
-    """The claim's input or the passages are not what the backend sends. Names nothing."""
+    """The claim's input, the passages or the records are not what the backend sends. Names nothing."""
 
 
 class PassageFiles(Protocol):
@@ -74,8 +90,10 @@ class ChangeInput:
     owner: str
     kind: str | None
     language: str | None
-    passages: str
+    # The name of the input that holds the run; `records` tells a records run from a passages run.
+    input_name: str
     token_key: bytes = field(repr=False)
+    records: bool = False
 
 
 @dataclass(frozen=True)
@@ -85,6 +103,30 @@ class Passage:
     page: int
     title: str = field(repr=False)
     text: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class Record:
+    """One record of a records run: its id, its first page, its core type's key, its name and its fields in order."""
+
+    record_id: str
+    page: int
+    record_type: str
+    name: str = field(repr=False)
+    fields: tuple[tuple[str, str], ...] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _Item:
+    """What one point is made of: its id, its page, the embedding's title and text, the keyword vector's text, and the
+    record type of a record's point (None for a passage's)."""
+
+    point_id: str
+    page: int
+    title: str = field(repr=False)
+    text: str = field(repr=False)
+    keyword_text: str = field(repr=False)
+    record_type: str | None = None
 
 
 def _uuid(value: object) -> str:
@@ -102,9 +144,13 @@ def _code(value: object) -> str | None:
 
 
 def change_input(raw: dict[str, Any]) -> ChangeInput:
-    """The `index.change` input, checked; `InputInvalid` otherwise."""
-    passages = raw.get("passages")
-    if not isinstance(passages, str) or not _INPUT_NAME.fullmatch(passages):
+    """The `index.change` input, checked: exactly one of `passages` and `records` names the input; `InputInvalid`
+    otherwise."""
+    named = [key for key in (PASSAGES, RECORDS) if key in raw]
+    if len(named) != 1:
+        raise InputInvalid
+    input_name = raw[named[0]]
+    if not isinstance(input_name, str) or not _INPUT_NAME.fullmatch(input_name):
         raise InputInvalid
     encoded = raw.get("tokenKey")
     if not isinstance(encoded, str):
@@ -120,8 +166,9 @@ def change_input(raw: dict[str, Any]) -> ChangeInput:
         owner=_uuid(raw.get("owner")),
         kind=_code(raw.get("kind")),
         language=_code(raw.get("language")),
-        passages=passages,
+        input_name=input_name,
         token_key=key,
+        records=named[0] == RECORDS,
     )
 
 
@@ -130,11 +177,9 @@ def removal_input(raw: dict[str, Any]) -> tuple[str, str]:
     return _uuid(raw.get("owner")), _uuid(raw.get("source"))
 
 
-def read_passages(body: bytes) -> list[Passage]:
-    """The run's JSON Lines, each `{id, ordinal, page, title, text}`, in order with no id twice; `InputInvalid`
-    otherwise. Lines end at `\n` only: a text may hold U+2028, U+0085 and other Unicode line breaks, which JSON
-    writes unescaped."""
-    found: list[Passage] = []
+def _lines(body: bytes) -> list[dict[str, Any]]:
+    """The input's JSON Lines, each an object; `InputInvalid` otherwise. Lines end at `\n` only."""
+    found: list[dict[str, Any]] = []
     for line in body.split(b"\n"):
         if not line.strip():
             continue
@@ -144,6 +189,16 @@ def read_passages(body: bytes) -> list[Passage]:
             raise InputInvalid from error
         if not isinstance(item, dict):
             raise InputInvalid
+        found.append(item)
+    return found
+
+
+def read_passages(body: bytes) -> list[Passage]:
+    """The run's JSON Lines, each `{id, ordinal, page, title, text}`, in order with no id twice; `InputInvalid`
+    otherwise. Lines end at `\n` only: a text may hold U+2028, U+0085 and other Unicode line breaks, which JSON
+    writes unescaped."""
+    found: list[Passage] = []
+    for item in _lines(body):
         ordinal, page, title, text = item.get("ordinal"), item.get("page"), item.get("title"), item.get("text")
         if (
             type(ordinal) is not int
@@ -160,6 +215,62 @@ def read_passages(body: bytes) -> list[Passage]:
     if len({passage.passage_id for passage in found}) != len(found):
         raise InputInvalid
     return found
+
+
+def _fields(value: object) -> tuple[tuple[str, str], ...]:
+    """A record's fields: a list of `{name, value}`, both strings; `InputInvalid` otherwise."""
+    if not isinstance(value, list):
+        raise InputInvalid
+    found: list[tuple[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"name", "value"}:
+            raise InputInvalid
+        name, text = item["name"], item["value"]
+        if not isinstance(name, str) or not isinstance(text, str):
+            raise InputInvalid
+        found.append((name, text))
+    return tuple(found)
+
+
+def read_records(body: bytes) -> list[Record]:
+    """The records run's JSON Lines, each `{id, page, type, name, fields: [{name, value}]}`: a UUID id (no id twice),
+    a page within 1 to `MAX_PAGE`, a type among the core keys, a non-empty name, and fields of name/value strings;
+    `InputInvalid` otherwise."""
+    found: list[Record] = []
+    for item in _lines(body):
+        page, record_type, name = item.get("page"), item.get("type"), item.get("name")
+        if (
+            type(page) is not int
+            or not 1 <= page <= MAX_PAGE
+            or not isinstance(record_type, str)
+            or record_type not in CORE_TYPES
+            or not isinstance(name, str)
+            or not name.strip()
+        ):
+            raise InputInvalid
+        found.append(Record(_uuid(item.get("id")), page, record_type, name, _fields(item.get("fields"))))
+    if len({record.record_id for record in found}) != len(found):
+        raise InputInvalid
+    return found
+
+
+def record_text(record: Record) -> tuple[str, str]:
+    """A record's embedded title and text: its name, then its fields as `name: value` lines (its name alone when it has
+    none), the two cut together to `RECORD_TEXT_LIMIT` code points, name first."""
+    title = record.name[:RECORD_TEXT_LIMIT]
+    lines = "\n".join(f"{name}: {value}" for name, value in record.fields)
+    text = lines[: RECORD_TEXT_LIMIT - len(title)] if lines else title[: RECORD_TEXT_LIMIT - len(title)]
+    return title, text
+
+
+def _passage_item(passage: Passage) -> _Item:
+    return _Item(passage.passage_id, passage.page, passage.title, passage.text, passage.text)
+
+
+def _record_item(record: Record) -> _Item:
+    title, text = record_text(record)
+    keyword_text = f"{title}\n{text}" if record.fields else title
+    return _Item(record.record_id, record.page, title, text, keyword_text, record.record_type)
 
 
 def _failed(code: str, *, retry: bool) -> Outcome:
@@ -181,9 +292,19 @@ class IndexChange:
         started = self.clock()
         try:
             checked = change_input(job.input)
-            log.info("index.change_started", jobId=job_id, source=checked.source, attempt=job.attempt)
-            passages = read_passages(self.files.read(job, checked.passages, MAX_INPUT_BYTES))
-            points, split = self._index(checked, passages, cancel)
+            log.info(
+                "index.change_started",
+                jobId=job_id,
+                source=checked.source,
+                recordsRun=checked.records,
+                attempt=job.attempt,
+            )
+            body = self.files.read(job, checked.input_name, MAX_INPUT_BYTES)
+            if checked.records:
+                items = [_record_item(record) for record in read_records(body)]
+            else:
+                items = [_passage_item(passage) for passage in read_passages(body)]
+            points, split = self._index(checked, items, cancel)
         except (InputInvalid, EmbeddingFailed, StoreFailed, httpx.HTTPError, FileTransferError, OSError) as error:
             return _failure(error, log, job_id, "index.change_failed")
         if points is None:
@@ -193,37 +314,38 @@ class IndexChange:
             "index.change_done",
             jobId=job_id,
             source=checked.source,
-            passages=len(passages),
+            **{RECORDS if checked.records else PASSAGES: len(items)},
             points=points,
             splitPassages=split,
             seconds=round(self.clock() - started, 3),
         )
         return Outcome.done({"indexRecipe": INDEX_RECIPE, "points": points})
 
-    def _index(self, checked: ChangeInput, passages: list[Passage], cancel: threading.Event) -> tuple[int | None, int]:
-        """Embeds and upserts the passages a batch at a time: the points written (None once cancelled) and how many
-        passages were split for embedding."""
+    def _index(self, checked: ChangeInput, items: list[_Item], cancel: threading.Event) -> tuple[int | None, int]:
+        """Embeds and upserts the passages or records a batch at a time: the points written (None once cancelled) and
+        how many were split for embedding."""
         points = split = 0
         with self.stores() as store:
             store.ensure_collection()
-            for start in range(0, len(passages), BATCH):
+            for start in range(0, len(items), BATCH):
                 if cancel.is_set():
                     return None, split
-                batch = passages[start : start + BATCH]
-                embedded = self.embedder.embed([(passage.title, passage.text) for passage in batch])
+                batch = items[start : start + BATCH]
+                embedded = self.embedder.embed([(item.title, item.text) for item in batch])
                 store.upsert(
                     [
                         Point(
-                            passage_id=passage.passage_id,
+                            passage_id=item.point_id,
                             dense=vector.vector,
-                            sparse=keyword_vector(passage.text, checked.token_key),
+                            sparse=keyword_vector(item.keyword_text, checked.token_key),
                             owner=checked.owner,
                             source=checked.source,
                             kind=checked.kind,
-                            page=passage.page,
+                            page=item.page,
                             language=checked.language,
+                            record_type=item.record_type,
                         )
-                        for passage, vector in zip(batch, embedded, strict=True)
+                        for item, vector in zip(batch, embedded, strict=True)
                     ]
                 )
                 points += len(batch)

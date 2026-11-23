@@ -74,6 +74,11 @@ def embedder(fake: FakeOllama) -> embedding.Embedder:
     return embedding.Embedder("http://stand-in-ollama:11434", transport=httpx.MockTransport(fake))
 
 
+def close_32(stored: list[Any], expected: list[float]) -> bool:
+    """A vector as Qdrant keeps it (32-bit floats) against the expected one."""
+    return all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(stored, expected, strict=True))
+
+
 def close(first: list[float], second: list[float]) -> bool:
     return all(math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12) for a, b in zip(first, second, strict=True))
 
@@ -463,11 +468,36 @@ def test_the_collection_has_its_two_vectors_and_its_tenant_and_source_indexes() 
     assert params.vectors["dense"].distance == models.Distance.COSINE
     assert params.sparse_vectors is not None
     assert params.sparse_vectors["sparse"].modifier == models.Modifier.IDF
-    # Local mode keeps no payload index, so both are asked for again: each with its own parameters.
-    assert recording.indexes[:2] == [
+    # Local mode keeps no payload index, so all three are asked for again: each with its own parameters.
+    assert recording.indexes[:3] == [
         ("owner", models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD, is_tenant=True)),
         ("source", models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD)),
+        ("record_type", models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD)),
     ]
+    assert recording.indexes[3:6] == recording.indexes[:3]
+
+
+class WithIndexes(Recording):
+    """A local client whose collection already has the payload indexes named in `present`."""
+
+    def __init__(self, present: set[str]) -> None:
+        super().__init__()
+        self.present = present
+
+    def get_collection(self, collection: str) -> Any:
+        found = self.client.get_collection(collection)
+        keyword = models.PayloadIndexInfo(data_type=models.PayloadSchemaType.KEYWORD, points=0)
+        schema = dict.fromkeys(self.present, keyword)
+        return found.model_copy(update={"payload_schema": schema})
+
+
+def test_a_collection_from_before_records_gets_only_its_record_type_index() -> None:
+    recording = WithIndexes({"owner", "source"})
+    passages = store.PassageStore(recording)  # type: ignore[arg-type]
+
+    passages.ensure_collection()
+
+    assert recording.indexes == [("record_type", models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD))]
 
 
 def test_a_points_payload_is_exactly_its_facts_and_an_upsert_again_keeps_one_point() -> None:
@@ -485,8 +515,15 @@ def test_a_points_payload_is_exactly_its_facts_and_an_upsert_again_keeps_one_poi
     assert stored.payload == {"owner": OWNER, "source": SOURCE, "kind": "rulebook", "page": 1, "language": None}
     assert isinstance(stored.vector, dict)
     assert set(stored.vector) == {"dense", "sparse"}
-    record = dataclasses_replace(point(first), record_type="0195a3c0-0000-7000-8000-0000000000dd")
-    assert set(record.payload()) == {"owner", "source", "kind", "page", "language", "record_type"}
+    record = dataclasses_replace(point(first), record_type="spell")
+    assert record.payload() == {
+        "owner": OWNER,
+        "source": SOURCE,
+        "kind": "rulebook",
+        "page": 1,
+        "language": None,
+        "record_type": "spell",
+    }
 
 
 def dataclasses_replace(value: store.Point, **changes: Any) -> store.Point:
@@ -741,3 +778,236 @@ def test_an_index_removal_deletes_its_sources_points_only_and_is_safe_to_repeat(
 def test_the_index_handlers_run_in_every_mode() -> None:
     found = handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))
     assert {"index.change", "index.removal"} <= set(found)
+
+
+# --- Story 4.2 part B: the records run
+
+
+def offer_records(stand_in: StandIn, items: list[dict[str, Any]], **overrides: Any) -> Indexed:
+    stand_in.credential = CREDENTIAL
+    job_input = {
+        "source": SOURCE,
+        "owner": OWNER,
+        "kind": "rulebook",
+        "language": "pt-BR",
+        "tokenKey": base64.b64encode(KEY).decode(),
+        "records": "records",
+        **overrides,
+    }
+    job_id = stand_in.offer("index.change", job_input, new_trace_id(), inputs={"records": lines(items)})
+    answer = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(job_id), new_trace_id())
+    assert answer.job is not None
+    return Indexed(answer.job, items)
+
+
+def spells(count: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": str(uuid.uuid4()),
+            "page": 12 + i // 4,
+            "type": ("spell", "item", "rule")[i % 3],
+            "name": f"Bola de Fogo secreta {i}",
+            "fields": [{"name": "Nível", "value": str(i)}, {"name": "Alcance", "value": "45 m"}] if i % 2 else [],
+        }
+        for i in range(count)
+    ]
+
+
+def test_a_records_run_writes_one_point_per_record_its_id_the_records_with_exactly_six_payload_keys(
+    stand_in: StandIn, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeOllama()
+    client = QdrantClient(":memory:")
+    indexed = offer_records(stand_in, spells(9))
+
+    outcome = change_handler(stand_in, fake, client)(indexed.job, threading.Event())
+
+    # Matrix row "Accept with records": one point per record, its id the record's id.
+    assert outcome.outcome == "done"
+    assert outcome.result == {"indexRecipe": INDEX_RECIPE, "points": 9}
+    assert index_result_valid(outcome.result)
+    ids = [item["id"] for item in indexed.passages]
+    stored = {str(found.id): found for found in client.retrieve("passages", ids, with_payload=True, with_vectors=True)}
+    assert sorted(stored) == sorted(ids)
+    for item in indexed.passages:
+        found = stored[item["id"]]
+        assert found.payload == {
+            "owner": OWNER,
+            "source": SOURCE,
+            "kind": "rulebook",
+            "page": item["page"],
+            "language": "pt-BR",
+            "record_type": item["type"],
+        }
+        lines_text = "\n".join(f"{field['name']}: {field['value']}" for field in item["fields"])
+        text = lines_text or item["name"]
+        assert isinstance(found.vector, dict)
+        # Qdrant keeps 32-bit floats.
+        dense = embedding.normalized(fake.vector(item["name"], text))
+        stored_dense = found.vector["dense"]
+        assert isinstance(stored_dense, list)
+        assert close_32(stored_dense, dense)
+        sparse = found.vector["sparse"]
+        assert isinstance(sparse, models.SparseVector)
+        expected = keywords.keyword_vector(f"{item['name']}\n{lines_text}" if lines_text else item["name"], KEY)
+        assert dict(zip(sparse.indices, sparse.values, strict=True)) == dict(
+            zip(expected.indices, expected.values, strict=True)
+        )
+    # The embedding's title slot holds the name; its text the fields' lines, or the name alone without fields.
+    sent = [text for call in fake.calls for text in call["input"]]
+    assert "title: Bola de Fogo secreta 0 | text: Bola de Fogo secreta 0" in sent
+    assert "title: Bola de Fogo secreta 1 | text: Nível: 1\nAlcance: 45 m" in sent
+    # Ids and counts only: no name, field, token or key in a log line or a repr.
+    captured = capsys.readouterr()
+    logged = captured.out + captured.err
+    done = [line for line in log_lines(captured.out) if line["event"] == "index.change_done"]
+    assert (done[0]["records"], done[0]["points"]) == (9, 9)
+    for secret in ("secreta", "Bola", "Nível", "Alcance", "45 m", base64.b64encode(KEY).decode()):
+        assert secret not in logged
+    assert "secreta" not in repr(indexing.read_records(lines(indexed.passages)))
+    assert "Alcance" not in repr(indexing.read_records(lines(indexed.passages)))
+
+
+def test_a_huge_records_embedded_and_keyword_text_is_cut_to_16384_code_points_and_its_point_written(
+    stand_in: StandIn,
+) -> None:
+    fake = FakeOllama(limit=100_000)
+    client = QdrantClient(":memory:")
+    name = "Tomo" + "é" * 196
+    fields = [{"name": f"Campo {i}", "value": "palavra" + "ç" * 7_990} for i in range(4)]
+    record_id = str(uuid.uuid4())
+    record: dict[str, Any] = {"id": record_id, "page": 3, "type": "item", "name": name, "fields": fields}
+    title, text = indexing.record_text(indexing.read_records(lines([record]))[0])
+    whole = "\n".join(f"{field['name']}: {field['value']}" for field in fields)
+    assert len(whole) > 16_384
+
+    # Matrix row "Huge record": name first, then the fields' lines, cut together to 16,384 code points.
+    assert title == name
+    assert len(title) + len(text) == indexing.RECORD_TEXT_LIMIT == 16_384
+    assert text == whole[: 16_384 - len(name)]
+    outcome = change_handler(stand_in, fake, client)(offer_records(stand_in, [record]).job, threading.Event())
+
+    assert (outcome.outcome, outcome.result) == ("done", {"indexRecipe": INDEX_RECIPE, "points": 1})
+    assert fake.calls[0]["input"] == [embedding.embedding_input(title, text)]
+    found = client.retrieve("passages", [record_id], with_vectors=True)[0]
+    assert isinstance(found.vector, dict)
+    sparse = found.vector["sparse"]
+    assert isinstance(sparse, models.SparseVector)
+    expected = keywords.keyword_vector(f"{title}\n{text}", KEY)
+    assert sparse.indices == expected.indices
+    # A name past the limit is cut to it and leaves no room for a text.
+    long_name = indexing.Record(record_id, 1, "spell", "n" * 20_000, ())
+    assert [len(part) for part in indexing.record_text(long_name)] == [16_384, 0]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"passages": "passages"},  # both names
+        {"records": None},  # the name is null
+        {"records": "../records"},
+    ],
+)
+def test_a_records_input_that_is_not_the_backends_fails_without_a_retry(
+    stand_in: StandIn, overrides: dict[str, Any]
+) -> None:
+    outcome = change_handler(stand_in, FakeOllama(), QdrantClient(":memory:"))(
+        offer_records(stand_in, spells(1), **overrides).job, threading.Event()
+    )
+    assert (outcome.outcome, outcome.code, outcome.retry) == ("failed", "index.input_invalid", False)
+
+
+def test_an_input_naming_neither_passages_nor_records_is_refused() -> None:
+    raw = {"source": SOURCE, "owner": OWNER, "kind": None, "language": None, "tokenKey": base64.b64encode(KEY).decode()}
+    with pytest.raises(indexing.InputInvalid):
+        indexing.change_input(raw)
+    assert indexing.change_input({**raw, "records": "records"}).records
+    assert not indexing.change_input({**raw, "passages": "passages"}).records
+
+
+RECORD_ID = "0195a3c0-0000-7000-8000-000000000001"
+
+
+def record_line(**changes: Any) -> bytes:
+    item: dict[str, Any] = {"id": RECORD_ID, "page": 1, "type": "spell", "name": "Luz", "fields": [], **changes}
+    return json.dumps(item).encode() + b"\n"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not json\n",
+        b"[]\n",
+        record_line(id="x"),
+        record_line(page=0),
+        record_line(page=1_000_001),
+        record_line(page="1"),
+        record_line(page=True),
+        record_line(type="monster"),
+        record_line(type=["spell"]),
+        record_line(type=None),
+        record_line(name=""),
+        record_line(name="   "),
+        record_line(name=7),
+        record_line(fields=None),
+        record_line(fields=[["Nível", "1"]]),
+        record_line(fields=[{"name": "Nível"}]),
+        record_line(fields=[{"name": "Nível", "value": 1}]),
+        record_line(fields=[{"name": "Nível", "value": "1", "extra": "x"}]),
+        record_line() + record_line(),
+        b"\xff\n",
+    ],
+)
+def test_records_that_are_not_the_backends_are_refused(body: bytes) -> None:
+    with pytest.raises(indexing.InputInvalid):
+        indexing.read_records(body)
+
+
+def test_every_core_type_is_read_and_fields_keep_their_order() -> None:
+    body = b"".join(
+        record_line(id=f"0195a3c0-0000-7000-8000-0000000000{index:02d}", type=core, page=index + 1)
+        for index, core in enumerate(sorted(indexing.CORE_TYPES))
+    )
+    assert [record.record_type for record in indexing.read_records(body)] == sorted(indexing.CORE_TYPES)
+    assert len(indexing.CORE_TYPES) == 8
+    ordered = indexing.read_records(
+        record_line(fields=[{"name": "B", "value": "2"}, {"name": "A", "value": "1"}, {"name": "", "value": ""}])
+    )
+    assert ordered[0].fields == (("B", "2"), ("A", "1"), ("", ""))
+
+
+def test_passage_search_never_answers_a_records_point_and_a_removal_takes_both(stand_in: StandIn) -> None:
+    client = QdrantClient(":memory:")
+    passages = store.PassageStore(client)
+    passages.ensure_collection()
+    passage_id, record_id = str(uuid.uuid4()), str(uuid.uuid4())
+    # The same vectors for both: only the filter tells them apart.
+    passages.upsert([point(passage_id), dataclasses_replace(point(record_id), record_type="spell")])
+    dense = embedding.normalized([1.0] * embedding.DIMENSIONS)
+
+    # Matrix row "Search": the version has record points, and search returns passage ids only.
+    found = passages.search(OWNER, [SOURCE], dense, keywords.query_vector("espada vorpal", KEY), 8)
+    assert [item.passage_id for item in found] == [passage_id]
+    assert passages.count(OWNER, SOURCE) == 2
+
+    # Matrix row "Remove / discard": the removal by owner and source takes the record's point with the passage's.
+    removal = indexing.IndexRemoval(lambda: local(client))
+    job_id = stand_in.offer("index.removal", {"source": SOURCE, "owner": OWNER}, new_trace_id())
+    answer = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(job_id), new_trace_id())
+    assert answer.job is not None
+    assert removal(answer.job, threading.Event()).outcome == "done"
+    assert passages.count(OWNER, SOURCE) == 0
+
+
+def test_a_records_run_with_qdrant_down_is_retryable(stand_in: StandIn) -> None:
+    down = IndexSettings(qdrant_url="http://127.0.0.1:9")
+    handler = indexing.IndexChange(
+        JobFiles(stand_in.url, CREDENTIAL), embedder(FakeOllama()), lambda: store.passage_store(down)
+    )
+
+    # Matrix row "Records run fails": retried by the backend like a passages run.
+    failed = handler(offer_records(stand_in, spells(2)).job, threading.Event())
+    assert (failed.outcome, failed.code, failed.retry) == ("failed", "index.store_unavailable", None)
+    ollama_down = change_handler(stand_in, FakeOllama(status=503), QdrantClient(":memory:"))
+    unavailable = ollama_down(offer_records(stand_in, spells(2)).job, threading.Event())
+    assert (unavailable.outcome, unavailable.code, unavailable.retry) == ("failed", "index.embedding_unavailable", None)
