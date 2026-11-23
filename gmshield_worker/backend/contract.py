@@ -16,7 +16,8 @@ import re
 # 1.16.0 (Story 3.10): a question input carries `history`, the conversation's earlier turns.
 # 1.17.0 (Story 4.2): an ingestion records step (the input `passages`, `recordTypes`, a report's `records`) and the
 # usage an outcome carries.
-MINIMUM_BACKEND_CONTRACT_VERSION = "1.17.0"
+# 1.18.0 (Story 4.3 part B): a library search's input may carry `recordType`, and its result's ids may name records.
+MINIMUM_BACKEND_CONTRACT_VERSION = "1.18.0"
 # The first contract with `PUT /internal/v1/index-recipe`: the worker states its index recipe at every check only to a
 # backend at least this new, and works as before with an older one (the minimum above stays).
 INDEX_RECIPE_CONTRACT_VERSION = "1.12.0"

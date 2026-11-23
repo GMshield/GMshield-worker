@@ -36,7 +36,10 @@ search below never reads it.
 
 The library search (Story 3.9, `lanes/search.py`) reuses steps 1 to 4 (`rank_tiers`) on the backend's search input
 (`Scopes.searchInput`: the same shape with `query`, 1 to `MAX_QUERY` code points, in place of `question`;
-`question_input(raw, field="query")`), with its own limit per tier, and keeps each id's fused score.
+`question_input(raw, field="query")`), with its own limit per tier, and keeps each id's fused score. From internal
+contract 1.18.0 (Story 4.3 part B) it searches records too (`store.EVERYTHING`), and a search input may carry
+`recordType`, a core key (`indexing.CORE_TYPES`), which leaves only that type's records (`store.records_of`): then no
+pending passage is read, since a passage is never a record. An answer still searches passages only (`store.PASSAGES`).
 
 Failures (`SearchFailed`): Ollama `retrieval.embedding_unavailable` and Qdrant `retrieval.store_unavailable`, both
 retryable (nothing has been sent yet); a question the model refuses as too long `retrieval.question_too_long`; a refusal
@@ -66,9 +69,9 @@ import httpx
 from gmshield_worker.backend.client import ClaimedJob, PassagesAnswer, ReadPassage
 from gmshield_worker.log import TraceLog
 from gmshield_worker.retrieval.embedding import Embedder, EmbeddingFailed
-from gmshield_worker.retrieval.indexing import StoreFactory
+from gmshield_worker.retrieval.indexing import CORE_TYPES, StoreFactory
 from gmshield_worker.retrieval.keywords import KEY_BYTES, query_vector, tokens
-from gmshield_worker.retrieval.store import RRF_K, Found, StoreFailed
+from gmshield_worker.retrieval.store import PASSAGES, RRF_K, Found, Kinds, StoreFailed
 
 TIERS = ("campaign", "system", "other")
 LIMIT = 8
@@ -133,6 +136,7 @@ class QuestionInput:
     """The checked question input. `model_knowledge` (Story 3.8, contract 1.15.0) is the turn's frozen switch: whether
     the model may add its own knowledge, each such part under `[[tier:model]]`; absent from the input, it is off.
     `history` (Story 3.10, contract 1.16.0) is the conversation's earlier turns, oldest first; absent, there is none.
+    `record_type` (Story 4.3 part B, contract 1.18.0) is a search's record-type filter, a core key; absent, None.
     Retrieval reads `question` alone."""
 
     owner: str
@@ -141,6 +145,7 @@ class QuestionInput:
     token_key: bytes = field(repr=False)
     model_knowledge: bool = False
     history: tuple[EarlierTurn, ...] = field(default=(), repr=False)
+    record_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -211,7 +216,8 @@ def _history(value: object) -> tuple[EarlierTurn, ...]:
 def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionInput:
     """The question input, checked; `InputInvalid` otherwise. With `field="query"` (Story 3.9) it is the backend's
     search input instead: the same shape, its text (1 to `MAX_QUERY` code points) under `query`, kept as `question`;
-    a search input carries no `history`."""
+    a search input carries no `history`, and may carry `recordType` (Story 4.3 part B), a core key, which a question
+    input never does."""
     if field not in ("question", "query"):
         raise ValueError(field)
     question = raw.get(field)
@@ -232,6 +238,11 @@ def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionI
         raise InputInvalid
     if field == "query" and "history" in raw:
         raise InputInvalid
+    if field == "question" and "recordType" in raw:
+        raise InputInvalid
+    record_type = raw.get("recordType")
+    if record_type is not None and (not isinstance(record_type, str) or record_type not in CORE_TYPES):
+        raise InputInvalid
     return QuestionInput(
         owner=_uuid(raw.get("owner")),
         tiers=_tiers(raw.get("tiers")),
@@ -239,6 +250,7 @@ def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionI
         token_key=key,
         model_knowledge=model_knowledge,
         history=_history(raw["history"]) if "history" in raw else (),
+        record_type=record_type,
     )
 
 
@@ -430,10 +442,12 @@ class _Timings:
 
 @dataclass(frozen=True)
 class TierRanking:
-    """One searched tier's fused ranking (`fused`): its ids, best first, each with its RRF score."""
+    """One searched tier's fused ranking (`fused`): its ids, best first, each with its RRF score, and (Story 4.3
+    part B) which of them are records' points."""
 
     tier: str
     scored: list[tuple[str, float]]
+    records: frozenset[str] = frozenset()
 
     @property
     def ids(self) -> list[str]:
@@ -462,10 +476,11 @@ def rank_tiers(
     log: TraceLog,
     clock: Callable[[], float] = time.monotonic,
     limit: int = LIMIT,
+    kinds: Kinds = PASSAGES,
 ) -> Ranked:
-    """Steps 1 to 4 of the module: each tier with sources searched in Qdrant (`limit` points) and its pending passages
-    ranked, fused into at most `limit` ids per tier with their scores. No passage text is read but the pending
-    passages' (to rank them)."""
+    """Steps 1 to 4 of the module: each tier with sources searched in Qdrant (`limit` points of the `kinds` it may
+    answer) and its pending passages ranked, fused into at most `limit` ids per tier with their scores. No passage text
+    is read but the pending passages' (to rank them); with a record-type filter no pending passage is read at all."""
     job_id = str(job.job_id)
     searched = [tier for tier in checked.tiers if tier.sources]
     if not searched:
@@ -482,11 +497,13 @@ def rank_tiers(
         with stores() as store:
             store.ensure_collection()
             for tier in searched:
-                found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, limit)))
+                found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, limit, kinds=kinds)))
                 timings.lap("searchSeconds")
     except StoreFailed as error:
         raise SearchFailed(STORE_UNAVAILABLE, retry=True) from error
-    capped = [(tier.tier, list(tier.pending[:MAX_PENDING])) for tier, _ in found if tier.pending]
+    capped = [
+        (tier.tier, list(tier.pending[:MAX_PENDING])) for tier, _ in found if tier.pending and kinds.record_type is None
+    ]
     terms = question_terms(checked.question)
     read: dict[str, PendingRead] = {}
     if capped and terms:
@@ -505,7 +522,7 @@ def rank_tiers(
     ranked: list[TierRanking] = []
     fetched = skipped = 0
     for tier, tier_found in found:
-        unread = len(tier.pending) - min(len(tier.pending), MAX_PENDING)
+        unread = len(tier.pending) - min(len(tier.pending), MAX_PENDING) if kinds.record_type is None else 0
         matching: list[str] = []
         tier_read = read.get(tier.tier)
         if tier_read is not None:
@@ -515,7 +532,8 @@ def rank_tiers(
         if unread > 0:
             skipped += unread
             log.info("retrieval.pending_skipped", jobId=job_id, tier=tier.tier, skipped=unread)
-        ranked.append(TierRanking(tier.tier, fused(tier_found, matching, limit)))
+        records = frozenset(item.passage_id for item in tier_found if item.record)
+        ranked.append(TierRanking(tier.tier, fused(tier_found, matching, limit), records))
     if read:
         timings.lap("rankSeconds")
     return Ranked(ranked, len(searched), fetched, skipped, timings)

@@ -12,11 +12,19 @@ record points with its passage points, and also takes what an index change wrote
 
 A search (Story 2.3) is one `query_points` call per tier: a dense and a sparse prefetch (`PREFETCH` each) fused by
 Qdrant's reciprocal rank fusion (`FusionQuery(Fusion.RRF)`, whose constant is `RRF_K`), `limit` points, with the filter
-`owner == the job's owner AND source IN the tier's sources AND record_type is empty` on the query and on each prefetch,
-every time. Qdrant's `is_empty` matches a point that has no `record_type` (or a null or empty one), so passage search
-never answers a record's id, which the backend could not read back as a passage (records are searched from Story 4.3).
-It answers ids and fused scores only (no payload, no vector). A question with no keyword token has no sparse
-prefetch.
+`owner == the job's owner AND source IN the tier's sources` and the kinds' condition on the query and on each prefetch,
+every time. The kinds (`Kinds`) say which points a search may answer:
+
+- `PASSAGES` (a question's answer): `record_type is empty` too. Qdrant's `is_empty` matches a point that has no
+  `record_type` (or a null or empty one), so an answer never gets a record's id (records join answers in Story 4.3 part
+  C).
+- `EVERYTHING` (Story 4.3 part B, the library search): no condition on `record_type`, so passages and records come back
+  mixed by their fused rank.
+- `records_of(key)` (a library search with a record-type filter): `record_type == key`, so only records of that core
+  type, and no passage.
+
+It answers ids and fused scores, and whether each point is a record (only `record_type` of its payload is read, and
+only when records may come back; no vector). A question with no keyword token has no sparse prefetch.
 
 The client speaks REST (no gRPC) to `GMSHIELD_QDRANT_URL` with the API key, an https URL verified against the private
 authority's certificate, ignoring proxy settings from the environment. Any failure of Qdrant raises `StoreFailed`
@@ -63,10 +71,30 @@ class StoreFailed(Exception):
 
 @dataclass(frozen=True)
 class Found:
-    """A point a search found: the passage's id and its fused score."""
+    """A point a search found: its id (a passage's or, from Story 4.3 part B, a record's), its fused score, and
+    whether it is a record's point."""
 
     passage_id: str
     score: float
+    record: bool = False
+
+
+@dataclass(frozen=True)
+class Kinds:
+    """Which points a search may answer, as the module says: passages only (`records` false), or passages and records,
+    or only the records of one core type (`record_type`)."""
+
+    records: bool = False
+    record_type: str | None = None
+
+
+PASSAGES = Kinds()
+EVERYTHING = Kinds(records=True)
+
+
+def records_of(key: str) -> Kinds:
+    """Only the records of the core type `key`."""
+    return Kinds(records=True, record_type=key)
 
 
 @dataclass(frozen=True)
@@ -106,15 +134,18 @@ def _source_filter(owner: str, source: str) -> models.Filter:
     )
 
 
-def _sources_filter(owner: str, sources: Sequence[str]) -> models.Filter:
-    """The owner's passage points of these sources: a record's point (it has a `record_type`) is left out."""
-    return models.Filter(
-        must=[
-            models.FieldCondition(key=OWNER, match=models.MatchValue(value=owner)),
-            models.FieldCondition(key=SOURCE, match=models.MatchAny(any=list(sources))),
-            models.IsEmptyCondition(is_empty=models.PayloadField(key=RECORD_TYPE)),
-        ]
-    )
+def _sources_filter(owner: str, sources: Sequence[str], kinds: Kinds = PASSAGES) -> models.Filter:
+    """The owner's points of these sources that `kinds` allows: passage points only (a record's point has a
+    `record_type`), every point, or the record points of one core type."""
+    must: list[models.Condition] = [
+        models.FieldCondition(key=OWNER, match=models.MatchValue(value=owner)),
+        models.FieldCondition(key=SOURCE, match=models.MatchAny(any=list(sources))),
+    ]
+    if not kinds.records:
+        must.append(models.IsEmptyCondition(is_empty=models.PayloadField(key=RECORD_TYPE)))
+    elif kinds.record_type is not None:
+        must.append(models.FieldCondition(key=RECORD_TYPE, match=models.MatchValue(value=kinds.record_type)))
+    return models.Filter(must=must)
 
 
 @dataclass
@@ -180,13 +211,20 @@ class PassageStore:
             raise StoreFailed from error
 
     def search(
-        self, owner: str, sources: Sequence[str], dense: Sequence[float], sparse: Sparse, limit: int
+        self,
+        owner: str,
+        sources: Sequence[str],
+        dense: Sequence[float],
+        sparse: Sparse,
+        limit: int,
+        *,
+        kinds: Kinds = PASSAGES,
     ) -> list[Found]:
-        """The owner's points of these sources nearest the question, fused by RRF, best first; nothing, and no call,
-        without a source."""
+        """The owner's points of these sources that `kinds` allows nearest the question, fused by RRF, best first;
+        nothing, and no call, without a source."""
         if not sources:
             return []
-        allowed = _sources_filter(owner, sources)
+        allowed = _sources_filter(owner, sources, kinds)
         prefetch = [models.Prefetch(query=list(dense), using=DENSE, limit=PREFETCH, filter=allowed)]
         if sparse.indices:
             prefetch.append(
@@ -204,12 +242,15 @@ class PassageStore:
                 query=models.FusionQuery(fusion=models.Fusion.RRF),
                 query_filter=allowed,
                 limit=limit,
-                with_payload=False,
+                with_payload=models.PayloadSelectorInclude(include=[RECORD_TYPE]) if kinds.records else False,
                 with_vectors=False,
             )
         except (ApiException, httpx.HTTPError, ValueError) as error:
             raise StoreFailed from error
-        return [Found(str(point.id), float(point.score)) for point in answer.points]
+        return [
+            Found(str(point.id), float(point.score), bool((point.payload or {}).get(RECORD_TYPE)))
+            for point in answer.points
+        ]
 
     def count(self, owner: str, source: str) -> int:
         """How many points the owner's source has."""

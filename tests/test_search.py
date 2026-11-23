@@ -1229,11 +1229,11 @@ def test_only_the_scopes_passages_are_returned_and_every_query_is_filtered_on_th
     queries = indexed.spy.queries[before:]
     assert len(queries) == 2
     for query, sources in zip(queries, ([PT], [SRD]), strict=True):
+        # Story 4.3 part B: the library search answers records too, so it has no condition on record_type.
         expected = models.Filter(
             must=[
                 models.FieldCondition(key="owner", match=models.MatchValue(value=OWNER)),
                 models.FieldCondition(key="source", match=models.MatchAny(any=sources)),
-                models.IsEmptyCondition(is_empty=models.PayloadField(key="record_type")),
             ]
         )
         assert query["query_filter"] == expected
@@ -1403,3 +1403,171 @@ def test_the_candidates_text_is_read_in_calls_of_at_most_100_ids_in_order() -> N
 
     assert [len(call) for call in reader.calls] == [100, 50]
     assert [item.passage_id for item in found] == [item for item, _ in candidates]
+
+
+# --- records in the library search (Story 4.3 part B)
+
+
+@dataclass
+class RecordLibrary:
+    """Every fixture passage indexed as in `library()`, plus record points of the SRD source: an item record with the
+    vectors of each of Frost Brand, Flame Tongue and Vorpal Sword, and a spell record with Fireball's. A record point's
+    payload names its core type and nothing else of it."""
+
+    spy: Spy
+    items: dict[str, str]
+    spells: dict[str, str]
+
+    @property
+    def records(self) -> set[str]:
+        return set(self.items.values()) | set(self.spells.values())
+
+
+@pytest.fixture(scope="module")
+def with_records() -> RecordLibrary:
+    lib = library()
+    passages = store.PassageStore(lib.spy.client)
+    wanted = {
+        "srd-frost-brand": "item",
+        "srd-flame-tongue": "item",
+        "srd-vorpal-sword": "item",
+        "srd-fireball": "spell",
+    }
+    fixtures = [BY_KEY[key] for key in wanted]
+    vectors = retrieval_fixtures.RecordedOllama().embedder().embed([(item.title, item.text) for item in fixtures])
+    items: dict[str, str] = {}
+    spells: dict[str, str] = {}
+    points: list[store.Point] = []
+    for item, vector in zip(fixtures, vectors, strict=True):
+        record_id = str(uuid.uuid4())
+        record_type = wanted[item.key]
+        (items if record_type == "item" else spells)[item.key] = record_id
+        sparse = keywords.keyword_vector(item.text, KEY)
+        points.append(
+            store.Point(record_id, vector.vector, sparse, OWNER, SRD, "rulebook", item.page, None, record_type)
+        )
+    passages.upsert(points)
+    return RecordLibrary(lib.spy, items, spells)
+
+
+def records_search(
+    stand_in: StandIn, lib: RecordLibrary, text: str, tiers: list[dict[str, Any]], record_type: str | None = None
+) -> Run:
+    job_input = search_input(text, tiers)
+    if record_type is not None:
+        job_input["recordType"] = record_type
+    return library_search(stand_in, Library(lib.spy), text, tiers, job_input)
+
+
+def test_a_library_search_returns_records_mixed_with_passages_and_reads_no_records_text(
+    stand_in: StandIn, with_records: RecordLibrary
+) -> None:
+    serve_fixtures(stand_in)
+    searched = SEARCHES["s-fire-damage"]
+    holding = {BY_KEY[key].passage_id for key in searched.expected}
+    before = len(with_records.spy.queries)
+
+    ids = records_search(stand_in, with_records, searched.query, [tier("system", [SRD])]).ids
+
+    # Records come back by their fused rank, next to the passages: those about fire are among the results.
+    found = with_records.records.intersection(ids)
+    assert {with_records.items["srd-frost-brand"], with_records.spells["srd-fireball"]} <= found
+    # The passages holding the query still come first, in their ranked order; the records follow by rank.
+    assert set(ids[:3]) == holding
+    # Only passages' text is read: a record has no text to read, and its id never goes to the passages route.
+    fetched = [item for call in passages_requests(stand_in) for item in call]
+    assert with_records.records.isdisjoint(fetched)
+    assert set(ids) - found <= set(fetched)
+    # The query reads back each point's record type only, with no condition on it.
+    query = with_records.spy.queries[before]
+    assert query["with_payload"] == models.PayloadSelectorInclude(include=["record_type"])
+    assert query["query_filter"] == models.Filter(
+        must=[
+            models.FieldCondition(key="owner", match=models.MatchValue(value=OWNER)),
+            models.FieldCondition(key="source", match=models.MatchAny(any=[SRD])),
+        ]
+    )
+
+
+def test_a_record_type_filter_leaves_only_records_of_that_type_and_reads_no_pending_passage(
+    stand_in: StandIn, with_records: RecordLibrary
+) -> None:
+    serve_fixtures(stand_in)
+    pending = [str(uuid.uuid4())]
+    stand_in.passages[pending[0]] = StandInPassage(NEW, "Fire damage everywhere.", ["N"], 1)
+    before = len(with_records.spy.queries)
+
+    spells = records_search(
+        stand_in, with_records, SEARCHES["s-fire-damage"].query, [tier("system", [SRD, NEW], pending)], "spell"
+    )
+    items = records_search(stand_in, with_records, SEARCHES["s-fire-damage"].query, [tier("system", [SRD])], "item")
+
+    assert spells.ids == [with_records.spells["srd-fireball"]]
+    assert set(items.ids) == set(with_records.items.values())
+    # No passage at all: neither a pending one (none is read) nor an indexed one.
+    assert passages_requests(stand_in) == []
+    query = with_records.spy.queries[before]
+    expected = models.Filter(
+        must=[
+            models.FieldCondition(key="owner", match=models.MatchValue(value=OWNER)),
+            models.FieldCondition(key="source", match=models.MatchAny(any=[SRD, NEW])),
+            models.FieldCondition(key="record_type", match=models.MatchValue(value="spell")),
+        ]
+    )
+    assert query["query_filter"] == expected
+    assert all(prefetch.filter == expected for prefetch in query["prefetch"])
+
+
+def test_an_answer_never_gets_a_record_even_where_records_are_indexed(
+    stand_in: StandIn, with_records: RecordLibrary
+) -> None:
+    serve_fixtures(stand_in)
+    before = len(with_records.spy.queries)
+
+    ids = ask(stand_in, Library(with_records.spy), SEARCHES["s-fire-damage"].query, [tier("system", [SRD])]).ids
+
+    assert ids
+    assert with_records.records.isdisjoint(ids)
+    query = with_records.spy.queries[before]
+    assert query["with_payload"] is False
+    assert models.IsEmptyCondition(is_empty=models.PayloadField(key="record_type")) in query["query_filter"].must
+
+
+def test_the_records_are_counted_in_the_done_line_by_ids_only(
+    stand_in: StandIn, with_records: RecordLibrary, capsys: pytest.CaptureFixture[str]
+) -> None:
+    serve_fixtures(stand_in)
+
+    run = records_search(stand_in, with_records, SEARCHES["s-fire-damage"].query, [tier("system", [SRD])], "item")
+
+    done = [line for line in log_lines(capsys.readouterr().out) if line["event"] == "retrieval.library_search_done"]
+    assert done[0]["ids"] == run.ids
+    assert done[0]["records"] == len(run.ids) == 3
+    assert done[0]["exact"] == 0
+
+
+@pytest.mark.parametrize("record_type", ["dragon", "", 5, "Spell", ["spell"], {"spell": True}])
+def test_a_record_type_that_is_not_a_core_key_or_one_in_a_question_input_is_invalid(record_type: object) -> None:
+    raw = search_input("Vorpal Sword", [tier("system", [SRD])])
+    raw["recordType"] = record_type
+    with pytest.raises(search.InputInvalid):
+        search.question_input(raw, field="query")
+    for in_question in ("spell", None):
+        asked = question_input("Vorpal Sword", [tier("system", [SRD])])
+        asked["recordType"] = in_question
+        with pytest.raises(search.InputInvalid):
+            search.question_input(asked)
+    raw["recordType"] = "character_sheet"
+    assert search.question_input(raw, field="query").record_type == "character_sheet"
+    assert search.question_input(search_input("Vorpal Sword", []), field="query").record_type is None
+
+
+def test_exact_first_moves_the_passages_holding_the_query_and_leaves_records_at_their_rank() -> None:
+    found = [read("a", "Nothing here."), read("c", "the Vorpal Sword cuts"), read("e", "vorpal   SWORD")]
+
+    # "r1" and "r2" are records: no text was read for them, so they keep their place among the rest.
+    ordered = lane_search.exact_first(found, "Vorpal Sword", ["r1", "a", "c", "r2", "e"])
+
+    assert ordered == ["c", "e", "r1", "a", "r2"]
+    assert lane_search.exact_first([], "Vorpal Sword", ["r1", "r2"]) == ["r1", "r2"]
+    assert lane_search.exact_first(found, "  ", ["r1", "a"]) == ["r1", "a"]
