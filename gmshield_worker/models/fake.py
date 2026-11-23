@@ -21,7 +21,8 @@ turn change it:
   with the passage ids of the user turn; once the results are in, the answer cites them.
 
 Story 4.2: when the records schema (`RECORDS_TOOL`, as `ingestion.records` names it) is bound as structured output,
-the answer is one call of it: a record for each `fake:record <type> <name>` line of a passage block (`<passage
+the answer is one call of it: a record for each `fake:record <type> <name>` line of a passage block (the type a record
+type key, Story 4.4 part B: `fake:record talento Ataque Poderoso`) (`<passage
 id="…" …>`), with one field and that passage's id, and no record otherwise, so the pipeline's end-to-end run reads
 prose into no record. `fake:refusal` and `fake:truncated` give no call and their stop, `fake:outage` fails as above.
 From Story 4.4 the call also holds a proposal for each `fake:proposal <record_type|term> <name>` line of a passage
@@ -66,7 +67,7 @@ RECORDS_TOOL = "extracted_records"
 RECORD = "fake:record"
 _RECORD_BLOCK = re.compile(r'<passage id="([0-9a-f-]{36})"[^>]*>(.*?)</passage>', re.ASCII | re.DOTALL)
 # The name starts with a character that is no blank, so no run of blanks is ever matched two ways (linear).
-_RECORD_LINE = re.compile(r"fake:record[ \t]+([a-z_]{1,32})[ \t]+([^\s<][^\n<]{0,199})")
+_RECORD_LINE = re.compile(r"fake:record[ \t]+([a-z][a-z0-9_]{0,31})[ \t]+([^\s<][^\n<]{0,199})")
 # Story 4.4: the line that asks the fake for one proposal, which quotes the line itself (the same linear shape).
 PROPOSAL = "fake:proposal"
 _PROPOSAL_LINE = re.compile(r"fake:proposal[ \t]+(record_type|term)[ \t]+([^\s<][^\n<]{0,119})")

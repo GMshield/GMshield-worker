@@ -1527,6 +1527,154 @@ def test_a_record_type_filter_leaves_only_records_of_that_type_and_reads_no_pend
     assert all(prefetch.filter == expected for prefetch in query["prefetch"])
 
 
+# --- Story 4.4 part B: the scope's record type keys
+
+
+@dataclass
+class TalentLibrary:
+    """Every fixture passage indexed as in `library()`, plus two record points of the SRD source: a `talento` record
+    (a type the GM approved) with Flame Tongue's vectors and a `spell` record with Fireball's."""
+
+    spy: Spy
+    talent: str
+    spell: str
+
+
+@pytest.fixture(scope="module")
+def with_talent() -> TalentLibrary:
+    lib = library()
+    found: dict[str, str] = {}
+    points: list[store.Point] = []
+    wanted = {"srd-flame-tongue": "talento", "srd-fireball": "spell"}
+    fixtures = [BY_KEY[key] for key in wanted]
+    vectors = retrieval_fixtures.RecordedOllama().embedder().embed([(item.title, item.text) for item in fixtures])
+    for item, vector in zip(fixtures, vectors, strict=True):
+        record_id = str(uuid.uuid4())
+        found[wanted[item.key]] = record_id
+        sparse = keywords.keyword_vector(item.text, KEY)
+        points.append(
+            store.Point(record_id, vector.vector, sparse, OWNER, SRD, "rulebook", item.page, None, wanted[item.key])
+        )
+    store.PassageStore(lib.spy.client).upsert(points)
+    return TalentLibrary(lib.spy, found["talento"], found["spell"])
+
+
+CORE_KEYS = ["character_sheet", "creature", "dungeon", "encounter", "item", "note", "rule", "spell"]
+
+
+def with_keys(job_input: dict[str, Any], keys: list[str]) -> dict[str, Any]:
+    return {**job_input, "recordTypes": keys}
+
+
+def test_a_library_search_finds_only_records_of_the_scopes_keys(stand_in: StandIn, with_talent: TalentLibrary) -> None:
+    serve_fixtures(stand_in)
+    text = SEARCHES["s-fire-damage"].query
+    tiers = [tier("system", [SRD])]
+    lib = Library(with_talent.spy)
+
+    # Matrix row "Two systems": the campaign's system never approved `talento`, so its record is never found.
+    before = len(with_talent.spy.queries)
+    without = library_search(stand_in, lib, text, tiers, with_keys(search_input(text, tiers), CORE_KEYS)).ids
+    assert with_talent.talent not in without
+    assert with_talent.spell in without
+    query = with_talent.spy.queries[before]
+    allowed = models.FieldCondition(key="record_type", match=models.MatchAny(any=CORE_KEYS))
+    no_type = models.IsEmptyCondition(is_empty=models.PayloadField(key="record_type"))
+    assert query["query_filter"].must[-1] == models.Filter(should=[no_type, allowed])
+    # Its system approved it: the record comes back, and the search's filter by its key finds only it.
+    keys = sorted([*CORE_KEYS, "talento"])
+    found = library_search(stand_in, lib, text, tiers, with_keys(search_input(text, tiers), keys)).ids
+    assert with_talent.talent in found
+    filtered = with_keys({**search_input(text, tiers), "recordType": "talento"}, keys)
+    assert library_search(stand_in, lib, text, tiers, filtered).ids == [with_talent.talent]
+    # A filter by a key the scope does not have finds nothing, and asks for no passage.
+    outside = with_keys({**search_input(text, tiers), "recordType": "talento"}, CORE_KEYS)
+    assert library_search(stand_in, lib, text, tiers, outside).ids == []
+    # Without `recordTypes` (a backend before internal contract 1.21.0) nothing is limited.
+    assert with_talent.talent in library_search(stand_in, lib, text, tiers).ids
+
+
+def test_an_answers_records_search_keeps_to_the_scopes_keys(stand_in: StandIn, with_talent: TalentLibrary) -> None:
+    serve_fixtures(stand_in)
+    stand_in.records[with_talent.talent] = StandInRecord(SRD, "talento", "Língua Flamejante", [], 1, ["Talentos"])
+    stand_in.records[with_talent.spell] = StandInRecord(SRD, "spell", "Fireball", [], 1, ["Magias"])
+    text = SEARCHES["s-fire-damage"].query
+    tiers = [tier("system", [SRD])]
+    api = JobsApi(stand_in.url, CREDENTIAL)
+
+    def sources(keys: list[str]) -> search.Sources:
+        job = claim(stand_in, with_keys(question_input(text, tiers), keys))
+        return search.find_sources(
+            job,
+            search.question_input(job.input),
+            embedder=retrieval_fixtures.RecordedOllama().embedder(),
+            stores=lambda: local(with_talent.spy),
+            reader=api,
+            log=TraceLog("test", job.trace_id),
+            record_reader=api,
+        )
+
+    before = len(with_talent.spy.queries)
+    core = [item.record_id for item in sources(CORE_KEYS).records]
+    assert with_talent.talent not in core
+    assert with_talent.spell in core
+    records_query = with_talent.spy.queries[before + 1]
+    assert records_query["query_filter"] == models.Filter(
+        must=[
+            models.FieldCondition(key="owner", match=models.MatchValue(value=OWNER)),
+            models.FieldCondition(key="source", match=models.MatchAny(any=[SRD])),
+            models.FieldCondition(key="record_type", match=models.MatchAny(any=CORE_KEYS)),
+        ]
+    )
+    # The passages search is untouched: passages only, as before.
+    assert_filtered(with_talent.spy.queries[before], [SRD])
+    approved = sources(sorted([*CORE_KEYS, "talento"])).records
+    assert with_talent.talent in [item.record_id for item in approved]
+    assert next(item.type for item in approved if item.record_id == with_talent.talent) == "talento"
+
+
+@pytest.mark.parametrize(
+    "keys",
+    ["spell", [""], ["Spell"], ["spell", "spell"], ["3d6"], [5], ["a" * 33], ["x"] * (search.MAX_RECORD_TYPES + 1)],
+)
+def test_record_type_keys_that_are_not_a_list_of_distinct_keys_are_invalid(keys: object) -> None:
+    for raw, field_name in (
+        (search_input("Vorpal Sword", [tier("system", [SRD])]), "query"),
+        (question_input("Vorpal Sword", [tier("system", [SRD])]), "question"),
+    ):
+        raw["recordTypes"] = keys
+        with pytest.raises(search.InputInvalid):
+            search.question_input(raw, field=field_name)
+        raw["recordTypes"] = ["spell", "talento"]
+        assert search.question_input(raw, field=field_name).record_types == ("spell", "talento")
+        raw["recordTypes"] = []
+        assert search.question_input(raw, field=field_name).record_types == ()
+        del raw["recordTypes"]
+        assert search.question_input(raw, field=field_name).record_types is None
+
+
+def test_no_key_at_all_leaves_passages_only_or_nothing() -> None:
+    no_type = models.IsEmptyCondition(is_empty=models.PayloadField(key="record_type"))
+    everything = store._sources_filter(OWNER, [SRD], store.limited(store.EVERYTHING, ()))
+    assert isinstance(everything.must, list)
+    assert everything.must[-1] == no_type
+    nothing = store._sources_filter(OWNER, [SRD], store.limited(store.RECORDS, ()))
+    assert isinstance(nothing.must, list)
+    assert nothing.must_not == [no_type]
+    assert no_type in nothing.must
+    assert store.limited(store.RECORDS, None) == store.RECORDS
+    # A type filter never falls back to passages: with no allowed key, or one that lacks its key, it matches nothing.
+    for keys in ((), ("spell",)):
+        typed = store._sources_filter(OWNER, [SRD], store.limited(store.records_of("talento"), keys))
+        assert isinstance(typed.must, list)
+        assert typed.must_not == [no_type]
+        assert no_type in typed.must
+    allowed = store._sources_filter(OWNER, [SRD], store.limited(store.records_of("talento"), ("talento",)))
+    assert allowed.must_not is None
+    assert isinstance(allowed.must, list)
+    assert allowed.must[-1] == models.FieldCondition(key="record_type", match=models.MatchValue(value="talento"))
+
+
 def serve_records(stand_in: StandIn, lib: RecordLibrary) -> None:
     """The backend holds each record point of `lib` as a record of the SRD source, named after its fixture passage."""
     for key, record_id in {**lib.items, **lib.spells}.items():
@@ -1677,8 +1825,8 @@ def test_the_records_are_counted_in_the_done_line_by_ids_only(
     assert done[0]["exact"] == 0
 
 
-@pytest.mark.parametrize("record_type", ["dragon", "", 5, "Spell", ["spell"], {"spell": True}])
-def test_a_record_type_that_is_not_a_core_key_or_one_in_a_question_input_is_invalid(record_type: object) -> None:
+@pytest.mark.parametrize("record_type", ["3d6", "", 5, "Spell", "a" * 33, ["spell"], {"spell": True}])
+def test_a_record_type_that_is_not_a_key_or_one_in_a_question_input_is_invalid(record_type: object) -> None:
     raw = search_input("Vorpal Sword", [tier("system", [SRD])])
     raw["recordType"] = record_type
     with pytest.raises(search.InputInvalid):
@@ -1690,6 +1838,9 @@ def test_a_record_type_that_is_not_a_core_key_or_one_in_a_question_input_is_inva
             search.question_input(asked)
     raw["recordType"] = "character_sheet"
     assert search.question_input(raw, field="query").record_type == "character_sheet"
+    # Story 4.4 part B: any record type key, an approved type's too.
+    raw["recordType"] = "talento"
+    assert search.question_input(raw, field="query").record_type == "talento"
     assert search.question_input(search_input("Vorpal Sword", []), field="query").record_type is None
 
 

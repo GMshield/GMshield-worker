@@ -1,14 +1,15 @@
 """The Qdrant collection `passages` (Story 2.1, AD-10): one point per passage, its id the passage's id, and (Story 4.2
 part B) one point per record of an accepted version, its id the record's id.
 
-The collection is created when missing: the named vectors `dense` (768 dimensions, cosine) and `sparse` (Qdrant's
-`idf` modifier), a tenant keyword index on `owner`, and keyword indexes on `source` and `record_type` (whichever index
-is missing is added to an existing collection). A passage's point has the payload exactly `{owner, source, kind, page,
+The collection is created when missing: the named vectors `dense` (768 dimensions, cosine) and `sparse` (Qdrant's `idf`
+modifier), a tenant keyword index on `owner`, and keyword indexes on `source` and `record_type` (whichever index is
+missing is added to an existing collection). A passage's point has the payload exactly `{owner, source, kind, page,
 language}`; a record's point has exactly `{owner, source, kind, page, language, record_type}`, its page the record's
-first page and `record_type` its core type's key: no text, no title, no name, no field, nothing a GM can switch. An
-upsert of the same passage or record writes the same point again, so a retried job leaves one point per item. A
-removal deletes by a filter on owner and source, never by a list of ids, so it is safe to repeat, takes a version's
-record points with its passage points, and also takes what an index change wrote before it was cancelled.
+first page and `record_type` its type's key (a core key or, from Story 4.4 part B, an approved type's): no text, no
+title, no name, no field, nothing a GM can switch. An upsert of the same passage or record writes the same point again,
+so a retried job leaves one point per item. A removal deletes by a filter on owner and source, never by a list of ids,
+so it is safe to repeat, takes a version's record points with its passage points, and also takes what an index change
+wrote before it was cancelled.
 
 A search (Story 2.3) is one `query_points` call per tier: a dense and a sparse prefetch (`PREFETCH` each) fused by
 Qdrant's reciprocal rank fusion (`FusionQuery(Fusion.RRF)`, whose constant is `RRF_K`), `limit` points, with the filter
@@ -21,8 +22,12 @@ every time. The kinds (`Kinds`) say which points a search may answer:
   any type, and no passage. An answer runs it beside its passages search, so records never take a passage's slot.
 - `EVERYTHING` (Story 4.3 part B, the library search): no condition on `record_type`, so passages and records come back
   mixed by their fused rank.
-- `records_of(key)` (a library search with a record-type filter): `record_type == key`, so only records of that core
+- `records_of(key)` (a library search with a record-type filter): `record_type == key`, so only records of that
   type, and no passage.
+- Story 4.4 part B, `limited(kinds, keys)` (the scope's `recordTypes`, the keys of the campaign's system): a record
+  point answers only when its `record_type` is one of `keys` (`MatchAny`), so a record of a type the campaign's system
+  never approved stays out; passages are untouched (`record_type is empty` or one of `keys`, when both may answer). No
+  key at all leaves no record.
 
 It answers ids and fused scores, and whether each point is a record (only `record_type` of its payload is read, and
 only when records may come back; no vector). A question with no keyword token has no sparse prefetch.
@@ -37,7 +42,7 @@ from __future__ import annotations
 import ssl
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -83,11 +88,13 @@ class Found:
 @dataclass(frozen=True)
 class Kinds:
     """Which points a search may answer, as the module says: passages only (`records` false), passages and records,
-    records only (`passages` false), or only the records of one core type (`record_type`)."""
+    records only (`passages` false), or only the records of one type (`record_type`); from Story 4.4 part B, records
+    of the keys `allowed` only, when it is not None."""
 
     records: bool = False
     record_type: str | None = None
     passages: bool = True
+    allowed: tuple[str, ...] | None = None
 
 
 PASSAGES = Kinds()
@@ -96,8 +103,15 @@ EVERYTHING = Kinds(records=True)
 
 
 def records_of(key: str) -> Kinds:
-    """Only the records of the core type `key`."""
-    return Kinds(records=True, record_type=key)
+    """Only the records of the type `key`, never a passage (with no allowed key, nothing at all)."""
+    return Kinds(records=True, record_type=key, passages=False)
+
+
+def limited(kinds: Kinds, keys: Sequence[str] | None) -> Kinds:
+    """`kinds` whose records are only those of `keys` (Story 4.4 part B); unchanged when `keys` is None."""
+    if keys is None:
+        return kinds
+    return replace(kinds, allowed=tuple(keys))
 
 
 @dataclass(frozen=True)
@@ -139,19 +153,34 @@ def _source_filter(owner: str, source: str) -> models.Filter:
 
 def _sources_filter(owner: str, sources: Sequence[str], kinds: Kinds = PASSAGES) -> models.Filter:
     """The owner's points of these sources that `kinds` allows: passage points only (a record's point has a
-    `record_type`), every point, every record point, or the record points of one core type."""
+    `record_type`), every point, every record point, or the record points of one type; a record point of a key outside
+    `kinds.allowed` (when it is not None) never."""
     must: list[models.Condition] = [
         models.FieldCondition(key=OWNER, match=models.MatchValue(value=owner)),
         models.FieldCondition(key=SOURCE, match=models.MatchAny(any=list(sources))),
     ]
-    if not kinds.records:
-        must.append(models.IsEmptyCondition(is_empty=models.PayloadField(key=RECORD_TYPE)))
-    elif kinds.record_type is not None:
+    no_type = models.IsEmptyCondition(is_empty=models.PayloadField(key=RECORD_TYPE))
+    allowed = kinds.allowed
+    if not kinds.records or (allowed is not None and not allowed and kinds.passages):
+        # Passages only: no record at all, or none of an allowed key.
+        must.append(no_type)
+        return models.Filter(must=must)
+    if allowed is not None and (not allowed or (kinds.record_type is not None and kinds.record_type not in allowed)):
+        # Records only, of no allowed key: a filter nothing matches.
+        return models.Filter(must=[*must, no_type], must_not=[no_type])
+    in_allowed = (
+        None if allowed is None else models.FieldCondition(key=RECORD_TYPE, match=models.MatchAny(any=list(allowed)))
+    )
+    if kinds.record_type is not None:
         must.append(models.FieldCondition(key=RECORD_TYPE, match=models.MatchValue(value=kinds.record_type)))
     elif not kinds.passages:
-        return models.Filter(
-            must=must, must_not=[models.IsEmptyCondition(is_empty=models.PayloadField(key=RECORD_TYPE))]
-        )
+        if in_allowed is not None:
+            must.append(in_allowed)
+            return models.Filter(must=must)
+        return models.Filter(must=must, must_not=[no_type])
+    elif in_allowed is not None:
+        # Passages, and the records of an allowed key.
+        must.append(models.Filter(should=[no_type, in_allowed]))
     return models.Filter(must=must)
 
 

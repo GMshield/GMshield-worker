@@ -943,7 +943,10 @@ def record_line(**changes: Any) -> bytes:
         record_line(page=1_000_001),
         record_line(page="1"),
         record_line(page=True),
-        record_line(type="monster"),
+        record_line(type="Monster"),
+        record_line(type="3d6"),
+        record_line(type=""),
+        record_line(type="a" * 33),
         record_line(type=["spell"]),
         record_line(type=None),
         record_line(name=""),
@@ -963,13 +966,17 @@ def test_records_that_are_not_the_backends_are_refused(body: bytes) -> None:
         indexing.read_records(body)
 
 
-def test_every_core_type_is_read_and_fields_keep_their_order() -> None:
+CORE_KEYS = ("rule", "spell", "item", "creature", "character_sheet", "encounter", "dungeon", "note")
+
+
+def test_every_core_type_and_an_approved_key_are_read_and_fields_keep_their_order() -> None:
+    # Story 4.4 part B: any record type key, a core key or an approved type's (`talento`, `t_3d6_tabela`).
+    keys = [*CORE_KEYS, "talento", "t_3d6_tabela", "a" + "b" * 31]
     body = b"".join(
-        record_line(id=f"0195a3c0-0000-7000-8000-0000000000{index:02d}", type=core, page=index + 1)
-        for index, core in enumerate(sorted(indexing.CORE_TYPES))
+        record_line(id=f"0195a3c0-0000-7000-8000-0000000000{index:02d}", type=key, page=index + 1)
+        for index, key in enumerate(keys)
     )
-    assert [record.record_type for record in indexing.read_records(body)] == sorted(indexing.CORE_TYPES)
-    assert len(indexing.CORE_TYPES) == 8
+    assert [record.record_type for record in indexing.read_records(body)] == keys
     ordered = indexing.read_records(
         record_line(fields=[{"name": "B", "value": "2"}, {"name": "A", "value": "1"}, {"name": "", "value": ""}])
     )

@@ -27,7 +27,7 @@ with the tier whose sources hold it. `passages_status` forces a refusal with `pa
 
 Since Story 4.3 part C (contract 1.19.0) it serves `POST .../records` the same way over `records` (`StandInRecord`:
 1 to 100 ids, else 400 `job.records_invalid`; any id not a record of a tier's source 403 `scope.passage_refused`, a
-passage's id included), each with its tier, core type, name, fields, page and section path; `records_status` forces a
+passage's id included), each with its tier, type key, name, fields, page and section path; `records_status` forces a
 refusal with `records_code`. A citation event names exactly one of `passageId` and `recordId`.
 
 Since Story 2.10 (contract 1.9.0) a claim may state `providers` (at most 8 words of `[a-z0-9-]{1,32}`, else 400), each
@@ -130,7 +130,7 @@ class StandInPassage:
 
 @dataclass(frozen=True)
 class StandInRecord:
-    """A record the backend holds (Story 4.3 part C): its source (a version id), core type, name, fields (name, value)
+    """A record the backend holds (Story 4.3 part C): its source (a version id), type key, name, fields (name, value)
     in order, first page and section path."""
 
     source: str
