@@ -17,6 +17,13 @@ corpus-independent average), instead of its count; Qdrant's `idf` modifier stays
 While "2" re-indexes after a deploy, the points still under "1" carry raw counts. The passages themselves change only
 for new uploads (pipeline "7"): an accepted version keeps its pipeline-"6" passages until it is uploaded again.
 
+Records under "2" (Story 4.2 part B): a record's point is embedded as `title: {name} | text: {lines}`, `{lines}` its
+fields as `name: value` lines joined by line feeds (its name alone when it has no field), name and lines cut together
+to 16,384 code points, name first; its keyword vector is computed as a passage's, over the name and the lines (the
+name alone without fields); its payload adds `record_type`. This adds a format without changing how a passage is
+embedded, and no version accepted before it has records (records are extracted from pipeline "8", first released with
+it), so no point is stale: "2" stays. Any later change to the record format bumps the recipe like any other.
+
 A question (Story 2.3) is embedded under embeddinggemma's query prompt, `task: search result | query: {question}`, with
 the same model and `truncate: false`, and its keyword vector has the same token numbers, each valued 1
 (`keywords.query_vector`). The query prompt is part of the

@@ -330,30 +330,45 @@ lockfile and the production image:
   deploy, not at the first job claimed. A run that fails stays not indexed: the backend keeps its passages in the
   keyword fallback's `pending` and retries the failed run alone every 10 minutes, at most 3 times. The worker is the
   only reader and writer of Qdrant.
-  - `index.change`: the claim input is `{source, owner, kind, language, tokenKey, passages}`; the run (at most 200
-    passages) is read whole from the input `passages`, JSON Lines `{id, ordinal, page, title, text}`. Four at a
-    time (`BATCH`), each passage is embedded by `embeddinggemma:300m` through `POST {GMSHIELD_OLLAMA_URL}/api/embed`
-    (plain httpx; input `title: {title or "none"} | text: {text}`, `truncate: false`). Questions go first: within the
-    worker, no index call (a batch, or one passage or one part of a split passage) starts while a question's embedding
-    waits or runs (`QUESTIONS_FIRST`, one gate shared by every `Embedder`), waiting at most 10 s
-    (`INDEX_WAIT_SECONDS`) before it goes anyway. Ollama embeds one request at a time (about 0.6 s a passage), so a
-    question waits behind at most one batch of 4. The gate holds within one worker process: that bound assumes one
-    worker process per Ollama, as deployed. Neither the batch size nor the gate is part of the index recipe. When Ollama
-    refuses an input as longer than the context, the passage is split in two by `ingestion.passages.split`, each half
-    embedded with the same title and split again if refused, at most 4 times deep, and its vector is the L2-normalized
-    mean of its parts: nothing is cut silently. The keyword vector folds the text (NFKC, casefold, diacritics stripped),
-    takes its Unicode word tokens and numbers each by the first 4 bytes, big-endian, of HMAC-SHA256 under the owner's
+  - `index.change`: the claim input is `{source, owner, kind, language, tokenKey}` and exactly one of `passages` or
+    `records`, the name of the run's input. A passages run (at most 200 passages) is read whole from the input
+    `passages`, JSON Lines `{id, ordinal, page, title, text}`. Four at a time (`BATCH`), each passage is embedded by
+    `embeddinggemma:300m` through `POST {GMSHIELD_OLLAMA_URL}/api/embed` (plain httpx; input
+    `title: {title or "none"} | text: {text}`, `truncate: false`). Questions go first: within the worker, no index
+    call (a batch, or one passage or one part of a split passage) starts while a question's embedding waits or runs
+    (`QUESTIONS_FIRST`, one gate shared by every `Embedder`), waiting at most 10 s (`INDEX_WAIT_SECONDS`) before it
+    goes anyway. Ollama embeds one request at a time (about 0.6 s a passage), so a question waits behind at most one
+    batch of 4. The gate holds within one worker process: that bound assumes one worker process per Ollama, as
+    deployed. Neither the batch size nor the gate is part of the index recipe. When Ollama refuses an input as longer
+    than the context, the passage is split in two by `ingestion.passages.split`, each half embedded with the same
+    title and split again if refused, at most 4 times deep, and its vector is the L2-normalized mean of its parts:
+    nothing is cut silently. The keyword vector folds the text (NFKC, casefold, diacritics stripped), takes its
+    Unicode word tokens and numbers each by the first 4 bytes, big-endian, of HMAC-SHA256 under the owner's
     `tokenKey`, valued by BM25's term weight `tf·(k1+1) / (tf + k1·(1 - b + b·L/AVG))` (k1 = 1.2, b = 0.75, L the
     passage's token count, AVG = 250, a fixed, corpus-independent average) under index recipe "2"; under "1" each
     token was valued by its count. Qdrant applies the `idf` modifier. While a deploy's recipe "2" re-indexes, the
-    points still under "1" carry raw counts, so a search may mix the two weightings until every source is re-indexed. Each passage is upserted as one point (id: the
-    passage id; vectors `dense` and `sparse`; payload exactly `{owner, source, kind, page, language}`). The result is
-    `{indexRecipe, points}`.
+    points still under "1" carry raw counts, so a search may mix the two weightings until every source is re-indexed.
+    Each passage is upserted as one point (id: the passage id; vectors `dense` and `sparse`; payload exactly
+    `{owner, source, kind, page, language}`). The result is `{indexRecipe, points}`.
+  - The records run (Story 4.2 part B): when an accepted version has records, its index set also holds runs of its
+    records, about 200 each, cut by the backend at a page's end. The input `records` holds JSON Lines `{id, page, type,
+    name, fields: [{name, value}]}` (the record's first page and its core type's key), checked by
+    `indexing.read_records` (a UUID id once, a page within 1 to 1,000,000, one of the eight core keys, a non-empty
+    name, fields as name/value strings; anything else is `index.input_invalid`). Each record is embedded as
+    `title: {name} | text: {lines}`, its fields as `name: value` lines (its name alone without fields), name and lines
+    cut together to 16,384 code points; its keyword vector covers the same name and lines. Its point's id is the
+    record's id and its payload exactly `{owner, source, kind, page, language, record_type}`: no name, field or text.
+    The index recipe stays "2" (`recipe.py` says why). Failures and retries are a passages run's; once a records
+    run's retries are spent, the backend's next reconcile cuts only the records runs again, never the passages. The
+    version records its recipe only once its records runs are done too, but passage search ignores record points
+    (below) and the backend's indexing notices count passages only, until Story 4.3 searches records.
   - The collection `passages` is created when missing: `dense` (768, cosine), `sparse` (`idf`), a tenant keyword index
-    on `owner` and a keyword index on `source`. Qdrant is reached over REST at `GMSHIELD_QDRANT_URL` with its API key,
+    on `owner` and keyword indexes on `source` and `record_type` (a missing index is added to an existing
+    collection). Passage search filters every query and prefetch on `record_type` being empty (Qdrant's `is_empty`),
+    so it never answers a record's id. Qdrant is reached over REST at `GMSHIELD_QDRANT_URL` with its API key,
     an https URL verified against `/run/gmshield/certs/ca.crt`, one client per job.
-  - `index.removal`: the claim input is `{source, owner}`; the points go by a filter on both, never by ids. Safe to
-    repeat.
+  - `index.removal`: the claim input is `{source, owner}`; the points go by a filter on both, never by ids, so a
+    version's record points go with its passage points. Safe to repeat.
   - Failures: `index.input_invalid` and `index.passage_too_long` with `retry: false`; `index.embedding_unavailable`
     (Ollama), `index.store_unavailable` (Qdrant) and `index.input_unavailable` (the backend's input route) for the
     backend to retry; a re-run upserts the same ids. Lines carry ids, counts and codes only; the token key is held with
@@ -390,9 +405,9 @@ lockfile and the production image:
     prompt `task: search result | query: {question}`; its keyword vector is `query_vector(question, tokenKey)`, the
     same token numbers each valued 1. The query side is not part of the index recipe.
   - Per tier with sources, one `query_points` call: a dense and a sparse prefetch (40 each) fused by Qdrant's RRF
-    (`FusionQuery(Fusion.RRF)`), 8 points, the filter `owner == the job's owner AND source IN the tier's sources` on
-    the query and on each prefetch. A question with no keyword token has no sparse prefetch. No payload or vector is
-    read back.
+    (`FusionQuery(Fusion.RRF)`), 8 points, the filter `owner == the job's owner AND source IN the tier's sources AND
+    record_type is empty` (passages only, Story 4.2 part B) on the query and on each prefetch. A question with no
+    keyword token has no sparse prefetch. No payload or vector is read back.
   - Pending: once every tier is searched, the first 5,000 (`MAX_PENDING`) `pending` ids of each tier, in input order,
     are read by id in pages of 100 (`PAGE`, the backend's most per passages call), at most 8 at a time (`PARALLEL`),
     the tiers' pages in turns (campaign, system, other, campaign, ..., then the rest of the longer ones), under one

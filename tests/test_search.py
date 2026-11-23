@@ -178,6 +178,7 @@ def assert_filtered(query: dict[str, Any], sources: list[str]) -> None:
         must=[
             models.FieldCondition(key="owner", match=models.MatchValue(value=OWNER)),
             models.FieldCondition(key="source", match=models.MatchAny(any=sources)),
+            models.IsEmptyCondition(is_empty=models.PayloadField(key="record_type")),
         ]
     )
     assert query["query_filter"] == expected
@@ -1232,6 +1233,7 @@ def test_only_the_scopes_passages_are_returned_and_every_query_is_filtered_on_th
             must=[
                 models.FieldCondition(key="owner", match=models.MatchValue(value=OWNER)),
                 models.FieldCondition(key="source", match=models.MatchAny(any=sources)),
+                models.IsEmptyCondition(is_empty=models.PayloadField(key="record_type")),
             ]
         )
         assert query["query_filter"] == expected
