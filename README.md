@@ -334,6 +334,20 @@ lockfile and the production image:
     for the reread pages.
   - Deploy the backend (internal contract 1.17.0) first: `MINIMUM_BACKEND_CONTRACT_VERSION` is 1.17.0. A chain started
     under pipeline "7" restarts under "8" (`ingestion.pipeline_changed`).
+- **Extract approved record types (Story 4.4 part B, backend internal contract 1.21.0; no pipeline bump).** A record
+  type is any key of `[a-z][a-z0-9_]{0,31}` (`indexing.RECORD_TYPE_KEY`): a core key or the key of a type the GM
+  approved. Every input is read so that a backend of contract 1.20.0 still works, so `MINIMUM_BACKEND_CONTRACT_VERSION`
+  stays 1.20.0; deploy this worker before the frontend and the backend.
+  - A records step's `recordTypes` holds `rule`, `spell`, `item`, then the approved keys of the material's systems (at
+    most `records.MAX_TYPES`, 1,000), and the optional `recordTypeNames` names each (`records.record_type_names`: it
+    covers the keys exactly, each name 1 to 120 code points; absent, each key is its own name). The user turn writes
+    `<record-type key="…">name</record-type>`, escaped, inside the delimiter; `records.SYSTEM_PROMPT` asks for the key,
+    never the name. `ingestion.step_done` counts `rule`, `spell` and `item` by name and every other key as `approved`.
+  - A question's and a search's input may carry `recordTypes`, the keys of the campaign's system (distinct, at most
+    `search.MAX_RECORD_TYPES`): every Qdrant query that may answer records adds a `MatchAny` on `record_type`
+    (`store.limited`), so a record of a type that system never approved is never found (the backend refuses one
+    anyway). Passages are untouched; without the field nothing is limited. Test mode: `fake:record <key> <name>` takes
+    any key.
 - **Index an accepted material (Story 2.1, AD-10, backend contract 1.7.0 or later).** Every claim states the
   worker's `INDEX_RECIPE` (`retrieval/recipe.py`; bump it on any change to the model, the embedding input, the
   splitting or the keyword scheme): the backend re-indexes each source recorded under another one. From backend
@@ -364,7 +378,8 @@ lockfile and the production image:
   - The records run (Story 4.2 part B): when an accepted version has records, its index set also holds runs of its
     records, about 200 each, cut by the backend at a page's end. The input `records` holds JSON Lines `{id, page, type,
     name, fields: [{name, value}]}` (the record's first page and its core type's key), checked by
-    `indexing.read_records` (a UUID id once, a page within 1 to 1,000,000, one of the eight core keys, a non-empty
+    `indexing.read_records` (a UUID id once, a page within 1 to 1,000,000, a record type key — one of the eight core
+    keys or, from Story 4.4 part B, an approved type's, `indexing.RECORD_TYPE_KEY` — a non-empty
     name, fields as name/value strings; anything else is `index.input_invalid`). Each record is embedded as
     `title: {name} | text: {lines}`, its fields as `name: value` lines (its name alone without fields), name and lines
     cut together to 16,384 code points; its keyword vector covers the same name and lines. Its point's id is the
@@ -491,7 +506,7 @@ lockfile and the production image:
   - Records (Story 4.3 part B, backend internal contract 1.18.0). The library search also answers record points
     (`store.EVERYTHING`: no condition on `record_type`), mixed with passages by their fused score; Qdrant returns only
     each point's `record_type` (`with_payload` limited to it), which tells a record from a passage. A search input may
-    carry `recordType`, one of the eight core keys (`indexing.CORE_TYPES`; anything else, or `recordType` in a
+    carry `recordType`, a record type key (`indexing.RECORD_TYPE_KEY`; anything else, or `recordType` in a
     question input, is `retrieval.input_invalid`): then the filter is `record_type == key` (`store.records_of`), no
     passage is found and no pending passage is read. Only passage candidates have their text read; `exact_first`
     moves the passages holding the query to the front and leaves every record at its fused rank among the rest (the

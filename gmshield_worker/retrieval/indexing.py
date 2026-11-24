@@ -9,10 +9,11 @@ material's kind and language or null, Base64 of the owner's 32-byte token key) a
   (`read_passages`). Each passage is embedded with its title in the title slot (`embedding.py`) and its keyword vector
   computed over its text.
 - A records run (Story 4.2 part B), about 200 records cut at a page's end by the backend, is read whole from its input
-  as JSON Lines `{id, page, type, name, fields: [{name, value}]}` (`read_records`: a record's first page and its core
-  type's key). Each record is embedded with its name in the title slot and its fields as `name: value` lines as the
-  text (its name alone when it has none), the two cut together to `RECORD_TEXT_LIMIT` (16,384) code points, name
-  first; its keyword vector is computed over the same name and text. Its point's payload adds `record_type`.
+  as JSON Lines `{id, page, type, name, fields: [{name, value}]}` (`read_records`: a record's first page and its type's
+  key, a core key or, from Story 4.4 part B, an approved type's). Each record is embedded with its name in the title
+  slot and its fields as `name: value` lines as the text (its name alone when it has none), the two cut together to
+  `RECORD_TEXT_LIMIT` (16,384) code points, name first; its keyword vector is computed over the same name and text.
+  Its point's payload adds `record_type`.
 
 Either way, `BATCH` items at a time, each point is upserted with the item's id as the point id (`store.py`), the
 claim's cancellation checked between batches. The result is `{indexRecipe, points}`. A re-run upserts the same ids.
@@ -37,7 +38,7 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeIs
 
 import httpx
 
@@ -63,8 +64,9 @@ PASSAGES = "passages"
 RECORDS = "records"
 # A record's embedded text, its name and its fields' lines together, is cut to this many code points.
 RECORD_TEXT_LIMIT = 16_384
-# The core vocabulary's keys (Story 4.1): a record's type as the backend stores it.
-CORE_TYPES = frozenset({"rule", "spell", "item", "creature", "character_sheet", "encounter", "dungeon", "note"})
+# A record type's key as the backend stores it (Story 4.4 part B, internal contract 1.21.0): a core key (`rule`,
+# `spell`, ...) or the key of a type the GM approved. One pattern for the index, the searches and the records step.
+RECORD_TYPE_KEY = re.compile(r"[a-z][a-z0-9_]{0,31}", re.ASCII)
 _UUID = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", re.ASCII)
 _INPUT_NAME = re.compile(r"[a-z][a-z0-9_.-]{0,63}", re.ASCII)
 # A material's kind (`rulebook`, `campaign_notes`, ...) or language (`pt-BR`, `en`), as the backend checks them.
@@ -232,18 +234,22 @@ def _fields(value: object) -> tuple[tuple[str, str], ...]:
     return tuple(found)
 
 
+def is_record_type(value: object) -> TypeIs[str]:
+    """Whether `value` is a record type key's text (`RECORD_TYPE_KEY`): a core key or an approved type's."""
+    return isinstance(value, str) and RECORD_TYPE_KEY.fullmatch(value) is not None
+
+
 def read_records(body: bytes) -> list[Record]:
     """The records run's JSON Lines, each `{id, page, type, name, fields: [{name, value}]}`: a UUID id (no id twice),
-    a page within 1 to `MAX_PAGE`, a type among the core keys, a non-empty name, and fields of name/value strings;
-    `InputInvalid` otherwise."""
+    a page within 1 to `MAX_PAGE`, a type that is a record type key (`RECORD_TYPE_KEY`), a non-empty name, and fields
+    of name/value strings; `InputInvalid` otherwise."""
     found: list[Record] = []
     for item in _lines(body):
         page, record_type, name = item.get("page"), item.get("type"), item.get("name")
         if (
             type(page) is not int
             or not 1 <= page <= MAX_PAGE
-            or not isinstance(record_type, str)
-            or record_type not in CORE_TYPES
+            or not is_record_type(record_type)
             or not isinstance(name, str)
             or not name.strip()
         ):

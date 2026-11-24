@@ -34,18 +34,25 @@ search below never reads it.
    1.8.0): the handed-over list is `[Handed(id, tier, text, section_path, page)]`. Library text reaches the worker by
    no other path, and nothing of it reaches Qdrant.
 6. Story 4.3 part C (contract 1.19.0), an answer only (`find_sources` with a record reader): per tier, beside its
-   passages search and with the same vectors, one more Qdrant query for record points only (`store.RECORDS`, any core
-   type, `RECORD_LIMIT` points), so records never take a passage's slot and passages rank exactly as before. The found
-   record ids, in rank order, campaign tier first, are read in one call to `POST …/records`, never `…/passages`: the
-   handed-over records are `[HandedRecord(id, tier, type, name, fields, page, section_path)]`. A record id never
-   reaches the pending ranking. `retrieval.search_done` keeps `ids` (the passages) and adds `records` (the record ids).
+   passages search and with the same vectors, one more Qdrant query for record points only (`store.RECORDS`, any type of
+   the scope's `recordTypes`, `RECORD_LIMIT` points), so records never take a passage's slot and passages rank exactly
+   as before. The found record ids, in rank order, campaign tier first, are read in one call to `POST …/records`, never
+   `…/passages`: the handed-over records are `[HandedRecord(id, tier, type, name, fields, page, section_path)]`. A
+   record id never reaches the pending ranking. `retrieval.search_done` keeps `ids` (the passages) and adds `records`
+   (the record ids).
 
 The library search (Story 3.9, `lanes/search.py`) reuses steps 1 to 4 (`rank_tiers`) on the backend's search input
 (`Scopes.searchInput`: the same shape with `query`, 1 to `MAX_QUERY` code points, in place of `question`;
 `question_input(raw, field="query")`), with its own limit per tier, and keeps each id's fused score. From internal
 contract 1.18.0 (Story 4.3 part B) it searches records too (`store.EVERYTHING`), and a search input may carry
-`recordType`, a core key (`indexing.CORE_TYPES`), which leaves only that type's records (`store.records_of`): then no
-pending passage is read, since a passage is never a record. An answer still searches passages only (`store.PASSAGES`).
+`recordType`, a record type key (`indexing.RECORD_TYPE_KEY`; a core key before Story 4.4 part B), which leaves only
+that type's records (`store.records_of`): then no pending passage is read, since a passage is never a record. An
+answer still searches passages only (`store.PASSAGES`) beside its records search.
+
+Story 4.4 part B (internal contract 1.21.0): a question or a search input may carry `recordTypes`, the record type keys
+of the campaign's system (distinct, at most `MAX_RECORD_TYPES`). Every Qdrant query that may answer records then keeps
+only record points of those keys (`store.limited`, a `MatchAny` on `record_type`), so a record of a type that system
+never approved is never found; passages are untouched. An input without it (a backend before 1.21.0) limits nothing.
 
 Failures (`SearchFailed`): Ollama `retrieval.embedding_unavailable` and Qdrant `retrieval.store_unavailable`, both
 retryable (nothing has been sent yet); a question the model refuses as too long `retrieval.question_too_long`; a refusal
@@ -76,9 +83,9 @@ import httpx
 from gmshield_worker.backend.client import ClaimedJob, PassagesAnswer, ReadPassage, ReadRecord, RecordsAnswer
 from gmshield_worker.log import TraceLog
 from gmshield_worker.retrieval.embedding import Embedder, EmbeddingFailed
-from gmshield_worker.retrieval.indexing import CORE_TYPES, StoreFactory
+from gmshield_worker.retrieval.indexing import StoreFactory, is_record_type
 from gmshield_worker.retrieval.keywords import KEY_BYTES, query_vector, tokens
-from gmshield_worker.retrieval.store import PASSAGES, RECORDS, RRF_K, Found, Kinds, StoreFailed
+from gmshield_worker.retrieval.store import PASSAGES, RECORDS, RRF_K, Found, Kinds, StoreFailed, limited
 
 TIERS = ("campaign", "system", "other")
 LIMIT = 8
@@ -101,6 +108,8 @@ MAX_QUERY = 500
 # backend's `Conversations.HISTORY_TURNS` and `HISTORY_ANSWER`).
 MAX_HISTORY = 6
 MAX_HISTORY_ANSWER = 4000
+# Story 4.4 part B: the most record type keys a question or a search input carries (a system's core and approved types).
+MAX_RECORD_TYPES = 1000
 INPUT_INVALID = "retrieval.input_invalid"
 EMBEDDING_UNAVAILABLE = "retrieval.embedding_unavailable"
 STORE_UNAVAILABLE = "retrieval.store_unavailable"
@@ -147,8 +156,9 @@ class QuestionInput:
     """The checked question input. `model_knowledge` (Story 3.8, contract 1.15.0) is the turn's frozen switch: whether
     the model may add its own knowledge, each such part under `[[tier:model]]`; absent from the input, it is off.
     `history` (Story 3.10, contract 1.16.0) is the conversation's earlier turns, oldest first; absent, there is none.
-    `record_type` (Story 4.3 part B, contract 1.18.0) is a search's record-type filter, a core key; absent, None.
-    Retrieval reads `question` alone."""
+    `record_type` (Story 4.3 part B, contract 1.18.0) is a search's record-type filter, a record type key; absent,
+    None. `record_types` (Story 4.4 part B, contract 1.21.0) is the campaign's system's keys, to which every search
+    that may answer records is limited; absent, None (nothing is limited). Retrieval reads `question` alone."""
 
     owner: str
     tiers: tuple[TierScope, ...]
@@ -157,6 +167,7 @@ class QuestionInput:
     model_knowledge: bool = False
     history: tuple[EarlierTurn, ...] = field(default=(), repr=False)
     record_type: str | None = None
+    record_types: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -180,7 +191,7 @@ class HandedField:
 
 @dataclass(frozen=True)
 class HandedRecord:
-    """A record handed over for the question (Story 4.3 part C): its id, its tier, its core type key and its first page;
+    """A record handed over for the question (Story 4.3 part C): its id, its tier, its type key and its first page;
     its name, fields and section path never printed."""
 
     record_id: str
@@ -264,8 +275,8 @@ def _history(value: object) -> tuple[EarlierTurn, ...]:
 def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionInput:
     """The question input, checked; `InputInvalid` otherwise. With `field="query"` (Story 3.9) it is the backend's
     search input instead: the same shape, its text (1 to `MAX_QUERY` code points) under `query`, kept as `question`;
-    a search input carries no `history`, and may carry `recordType` (Story 4.3 part B), a core key, which a question
-    input never does."""
+    a search input carries no `history`, and may carry `recordType` (Story 4.3 part B), a record type key, which a
+    question input never does; either may carry `recordTypes` (Story 4.4 part B)."""
     if field not in ("question", "query"):
         raise ValueError(field)
     question = raw.get(field)
@@ -289,7 +300,7 @@ def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionI
     if field == "question" and "recordType" in raw:
         raise InputInvalid
     record_type = raw.get("recordType")
-    if record_type is not None and (not isinstance(record_type, str) or record_type not in CORE_TYPES):
+    if record_type is not None and not is_record_type(record_type):
         raise InputInvalid
     return QuestionInput(
         owner=_uuid(raw.get("owner")),
@@ -299,7 +310,17 @@ def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionI
         model_knowledge=model_knowledge,
         history=_history(raw["history"]) if "history" in raw else (),
         record_type=record_type,
+        record_types=_record_types(raw["recordTypes"]) if "recordTypes" in raw else None,
     )
+
+
+def _record_types(value: object) -> tuple[str, ...]:
+    """The scope's record type keys (Story 4.4 part B): a list of at most `MAX_RECORD_TYPES` distinct keys."""
+    if not isinstance(value, list) or len(value) > MAX_RECORD_TYPES:
+        raise InputInvalid
+    if not all(is_record_type(item) for item in value) or len(set(value)) != len(value):
+        raise InputInvalid
+    return tuple(value)
 
 
 @dataclass(frozen=True)
@@ -554,6 +575,9 @@ def rank_tiers(
     searched = [tier for tier in checked.tiers if tier.sources]
     if not searched:
         return Ranked([], 0, 0, 0, None)
+    # Story 4.4 part B: the records of the campaign's system's keys only, whichever search may answer them.
+    kinds = limited(kinds, checked.record_types)
+    record_kinds = limited(RECORDS, checked.record_types)
     timings = _Timings(clock)
     try:
         dense = embedder.embed_query(checked.question)
@@ -569,7 +593,7 @@ def rank_tiers(
             for tier in searched:
                 found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, limit, kinds=kinds)))
                 if records > 0:
-                    hits = store.search(checked.owner, tier.sources, dense, sparse, records, kinds=RECORDS)
+                    hits = store.search(checked.owner, tier.sources, dense, sparse, records, kinds=record_kinds)
                     found_records[tier.tier] = tuple(item.passage_id for item in hits if item.record)
                 timings.lap("searchSeconds")
     except StoreFailed as error:

@@ -36,16 +36,16 @@ size and SHA-256, and reports. Ranges of pages are inclusive and numbered as in 
   then come from the headings alone), and the original is deleted before the text files come. From pipeline "8"
   (Story 4.2), the report also asks one `records` step per run of `RECORDS_PAGES` pages that holds a passage, over the
   passages of those pages (`input: "passages"`): the backend mints the passages' ids, so it serves them only then.
-- `records` (Story 4.2; any format; the passages of its pages as JSON Lines, and the record types in the claim
-  input's `recordTypes`): `records.py` builds the prompt and checks the answer, and one structured call of the claim's
-  model (`models.chat.chat_model`, `RECORDS_TIMEOUT_SECONDS`, `models.structured.structured_call`) reads them; the
-  report gives the `records` kept and, from Story 4.4, the `proposals` kept (record types and terms the passages name,
-  each with its quotes; always present, empty when none), and the outcome the call's usage under its worker-minted call
-  id. A refusal, a
-  truncation, or a prompt filter's flag (`model.question_flagged`, `model.source_flagged`) fails the step with its code
-  and `retry: false` (`RECORDS_FINAL`), an outage or an answer that did not parse with its code
-  (the backend retries while attempts remain); a claim without a model fails with `model.input_invalid`, a provider
-  this worker cannot call with its code, both `retry: false`. The backend never fails the version for a records step.
+- `records` (Story 4.2; any format; the passages of its pages as JSON Lines, and the record types in the claim input's
+  `recordTypes`, from Story 4.4 part B each named in `recordTypeNames`): `records.py` builds the prompt and checks the
+  answer, and one structured call of the claim's model (`models.chat.chat_model`, `RECORDS_TIMEOUT_SECONDS`,
+  `models.structured.structured_call`) reads them; the report gives the `records` kept and, from Story 4.4, the
+  `proposals` kept (record types and terms the passages name, each with its quotes; always present, empty when none),
+  and the outcome the call's usage under its worker-minted call id. A refusal, a truncation, or a prompt filter's flag
+  (`model.question_flagged`, `model.source_flagged`) fails the step with its code and `retry: false` (`RECORDS_FINAL`),
+  an outage or an answer that did not parse with its code (the backend retries while attempts remain); a claim without a
+  model fails with `model.input_invalid`, a provider this worker cannot call with its code, both `retry: false`. The
+  backend never fails the version for a records step.
 
 Before anything is downloaded, a step whose input names the chain's `pipelineVersion` checks it against this worker's:
 another one fails the step with `ingestion.pipeline_changed` and `retry: false`, and the backend restarts the chain.
@@ -133,6 +133,8 @@ RECORDS_PAGES = 10
 # step's 10 minutes) and its answer's tokens.
 RECORDS_TIMEOUT_SECONDS = 480.0
 RECORDS_MAX_TOKENS = 16_000
+# The core types a records step extracts (Story 4.2): its result's counts name them; any other key counts as approved.
+CORE_EXTRACTED = frozenset({"rule", "spell", "item"})
 MODEL_INPUT_INVALID = "model.input_invalid"
 UNIT = "worker.ingestion"
 SOURCE_FILE = "source.pdf"
@@ -927,6 +929,7 @@ class IngestionStep:
             raise StepFailed(STEP_FAILED, retry=False)
         try:
             types = records.record_types(job.input.get("recordTypes"))
+            names = records.record_type_names(job.input.get("recordTypeNames"), types)
         except records.RecordsInputInvalid as error:
             raise StepFailed(STEP_FAILED, retry=False) from error
         path = folder / PASSAGES_FILE
@@ -948,7 +951,9 @@ class IngestionStep:
                 raise StepFailed(unavailable.code, retry=False) from unavailable
             call_id = new_call_id()
             started = time.monotonic()
-            answer = structured_call(model, records.schema(types), records.messages(given, types), call_id=call_id)
+            answer = structured_call(
+                model, records.schema(types), records.messages(given, types, names), call_id=call_id
+            )
             if answer.usage is not None:
                 usage.append(answer.usage)
             log.info(
@@ -971,7 +976,10 @@ class IngestionStep:
             "proposals": proposed,
             "next": [],
         }
-        by_type = {kind: sum(1 for item in found if item["type"] == kind) for kind in types}
+        # Counts by key: the core keys by name, every approved one (a slug of a name the GM approved) as one count, so a
+        # line names no library content.
+        by_type = {kind: sum(1 for item in found if item["type"] == kind) for kind in types if kind in CORE_EXTRACTED}
+        by_type["approved"] = len(found) - sum(by_type.values())
         return result, {
             "passages": len(given),
             "records": len(found),
