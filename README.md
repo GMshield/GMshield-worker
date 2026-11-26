@@ -373,6 +373,18 @@ lockfile and the production image:
   duration, the budget when it is late), `resolvedRecords` (those actually handed) and `resolvedLeftOut`). The library search resolves nothing. `MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.20.0; deploy the
   backend first, then this worker. The fixed pairs (`tests/fixtures/retrieval/questions.json`, `termPairs`, recorded
   with `tools/record_embeddings.py`) prove each Portuguese term finds its English record first among the records.
+- **Index a GM's artifact (Story 5.1 part B, backend internal contract 1.24.0; no pipeline or recipe bump).** Two new
+  job kinds, run by the existing handlers (`lanes/handlers.py`): `index.artifact` (`indexing.ARTIFACT`) by
+  `indexing.IndexChange`, as a records run of one record: the claim input is `{source, owner, kind: "artifact",
+  language: null, tokenKey, records}` (the source is the artifact's id) and its input one line `{id, page: 1, type,
+  name, fields}`, the artifact's content as a last field named `content`, so its point (id and source the artifact's
+  id, `kind` `artifact`, page 1, its `record_type`) is embedded and keyword-indexed like any record's, the text cut at
+  `RECORD_TEXT_LIMIT`; `index.artifact_removal` (`indexing.ARTIFACT_REMOVAL`) by `indexing.IndexRemoval`, which deletes
+  every point of that owner's source. The backend lists a campaign's artifacts among the campaign tier's sources of a
+  question only, and serves one through `POST …/records` as a campaign-tier record of page 1 (its content the last
+  field): the answer finds, reads and cites it as any record, by `recordId`. Only a backend at 1.24.0 creates either
+  kind, so `MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.20.0; deploy this worker first, then the backend, then the
+  frontend.
 - **Index an accepted material (Story 2.1, AD-10, backend contract 1.7.0 or later).** Every claim states the
   worker's `INDEX_RECIPE` (`retrieval/recipe.py`; bump it on any change to the model, the embedding input, the
   splitting or the keyword scheme): the backend re-indexes each source recorded under another one. From backend

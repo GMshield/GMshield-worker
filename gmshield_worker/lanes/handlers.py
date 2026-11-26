@@ -5,8 +5,8 @@ reports nothing.
 
 `ingestion` (Story 1.15, `gmshield_worker.ingestion.step`; its records steps call a model from Story 4.2),
 `index.change` and `index.removal` (Story 2.1, `gmshield_worker.retrieval.indexing`; `index.record_removal` from Story
-4.5 part B), `question.answer` (Story 2.4,
-`gmshield_worker.lanes.answer`) and
+4.5 part B; `index.artifact` and `index.artifact_removal`, by the same two handlers, from Story 5.1 part B),
+`question.answer` (Story 2.4, `gmshield_worker.lanes.answer`) and
 `library.search` (Story 3.9, `gmshield_worker.lanes.search`) run in every mode; `probe`, `test.question` (Story 2.3,
 `gmshield_worker.lanes.question`) and `test.model` (Story 2.10, `gmshield_worker.lanes.model_probe`) in test mode
 only. The index and question handlers open a Qdrant client of
@@ -45,6 +45,8 @@ def handlers_for(settings: Settings) -> Mapping[str, Handler]:
         indexing.CHANGE: indexing.IndexChange(files, embedder, stores),
         indexing.REMOVAL: indexing.IndexRemoval(stores),
         indexing.RECORD_REMOVAL: indexing.IndexRecordRemoval(stores),
+        indexing.ARTIFACT: indexing.IndexChange(files, embedder, stores),
+        indexing.ARTIFACT_REMOVAL: indexing.IndexRemoval(stores),
         answer.KIND: answer.AnswerJob(reader, embedder, stores, settings.models),
         search.KIND: search.SearchJob(reader, embedder, stores),
     }

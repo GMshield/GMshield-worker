@@ -26,6 +26,9 @@ import re
 # 1.22.0 creates one, so the minimum stays at 1.20.0 (deploy order: worker, then backend, then frontend).
 # 1.23.0 (Story 4.6): an answer resolves its question's terms (`POST …/terms`). A backend before 1.23.0 answers 404,
 # and the search then runs as before, so the minimum stays at 1.20.0 (deploy order: backend, then worker).
+# 1.24.0 (Story 5.1 part B): an `index.artifact` job indexes a GM's artifact as a records run of one record (kind
+# `artifact`), and an `index.artifact_removal` job deletes its points. Only a backend at 1.24.0 creates either, so the
+# minimum stays at 1.20.0 (deploy order: worker, then backend, then frontend).
 MINIMUM_BACKEND_CONTRACT_VERSION = "1.20.0"
 # The first contract with `PUT /internal/v1/index-recipe`: the worker states its index recipe at every check only to a
 # backend at least this new, and works as before with an older one (the minimum above stays).
