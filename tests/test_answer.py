@@ -997,3 +997,57 @@ def test_records_of_a_tier_with_no_passage_give_their_tier_and_its_mark_is_poste
     assert [event["tier"] for event in events if event["type"] == "tier"] == ["campaign", "system"]
     assert any(event.get("recordId") in ids.values() for event in events if event["type"] == "citation")
     assert any("passageId" in event for event in events if event["type"] == "citation")
+
+
+# --- Story 4.6: questions understand the system's terms
+
+
+@pytest.mark.parametrize("case", ["down", "refused", "older_backend", "late"])
+def test_an_answer_still_succeeds_when_its_terms_cannot_be_resolved(
+    stand_in: StandIn, lib: Library, capsys: pytest.CaptureFixture[str], case: str
+) -> None:
+    job = claimed(stand_in, ASKED.question, [tier("system", [SRD, PT])])
+    stand_in.terms = {"recordTypes": ["spell"], "names": ["Fireball"], "records": []}
+    if case == "down":
+        stand_in.terms_status = 503
+    elif case == "refused":
+        stand_in.terms_status = 403
+    elif case == "older_backend":
+        stand_in.terms = None
+    else:
+        stand_in.terms_delay = search.TERMS_BUDGET_SECONDS + 0.5
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    assert every_event(stand_in, job)
+    lines = log_lines(capsys.readouterr().out)
+    assert [line["event"] for line in lines if line["event"] == search.TERMS_UNAVAILABLE] == [search.TERMS_UNAVAILABLE]
+    assert next(line for line in lines if line["event"] == "answer.ended")["code"] == "none"
+
+
+def test_an_answer_hands_the_records_its_terms_named_first_and_never_their_names_alone(
+    stand_in: StandIn, campaign_records: tuple[Library, dict[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[list[BaseMessage]] = []
+
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
+            seen.append(list(messages))
+            return super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Recording(provider=choice.provider))
+    lib, ids = campaign_records
+    job = claimed(stand_in, ASKED.question, [tier("campaign", [CAMPAIGN_RECORDS]), tier("system", [SRD])])
+    serve_campaign_records(stand_in, ids)
+    named = ids["srd-flame-tongue"]
+    stand_in.terms = {"recordTypes": [], "names": ["Língua Flamejante", "Flame Tongue"], "records": [named]}
+
+    assert run(stand_in, lib, job) == Outcome.done()
+
+    user = str(next(message for message in seen[0] if isinstance(message, HumanMessage)).content)
+    # The named record is the first record block, read through the records route with the others.
+    assert user.index(f'<record id="{named}"') == user.index("<record ")
+    # The names themselves are no source: only a record's own block carries its name.
+    assert "Língua Flamejante" not in user
+    system = [str(message.content) for message in seen[0] if isinstance(message, SystemMessage)]
+    assert system == [answer.SYSTEM_PROMPT]

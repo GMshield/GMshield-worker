@@ -358,6 +358,21 @@ lockfile and the production image:
   number of ids it named (`ids`). A new kind rather than ids on `index.removal`, which an older worker would read as
   "the whole source". Only a backend at 1.22.0 creates the kind, so `MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.20.0;
   deploy this worker before the backend, then the frontend.
+- **Questions understand the system's terms (Story 4.6, backend internal contract 1.23.0; no pipeline or recipe
+  bump).** An answer asks the backend to resolve its question's terms (`POST …/terms`, `JobsApi.terms`, no body: the
+  backend matches the turn's question against the system's ontology and the scope's record names), alongside the
+  question's embedding (`search.TermResolver`, `rank_tiers`), and waits at most `search.TERMS_BUDGET_SECONDS` (1 s)
+  from the ask. It answers `{recordTypes, names, records}`: the names join the keyword query only; each tier's records
+  search gets one more Qdrant query of the resolved types the scope has, fused with it by RRF (`merge_records`); and
+  the resolved records come first among the records read, of whatever tier the backend labels, then the records
+  search's, at most `search.RESOLVED_LIMIT` (12) in all, so the prompt holds no more record blocks than before. An empty answer, a 404 (a backend before 1.23.0), any failure, an answer out of the contract or a
+  timeout leaves the search exactly as before, with `answer.terms_unavailable` (`reason`, `status`); a records read
+  refused with resolved records in it is read again without them. The answer never fails because of term resolution,
+  the worker derives no definition or type from the names, and no name reaches a prompt or a line
+  (`retrieval.terms_resolved` and `retrieval.search_done` carry counts, `termsSeconds` (the term call's own
+  duration, the budget when it is late), `resolvedRecords` (those actually handed) and `resolvedLeftOut`). The library search resolves nothing. `MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.20.0; deploy the
+  backend first, then this worker. The fixed pairs (`tests/fixtures/retrieval/questions.json`, `termPairs`, recorded
+  with `tools/record_embeddings.py`) prove each Portuguese term finds its English record first among the records.
 - **Index an accepted material (Story 2.1, AD-10, backend contract 1.7.0 or later).** Every claim states the
   worker's `INDEX_RECIPE` (`retrieval/recipe.py`; bump it on any change to the model, the embedding input, the
   splitting or the keyword scheme): the backend re-indexes each source recorded under another one. From backend

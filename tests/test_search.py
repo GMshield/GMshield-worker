@@ -32,6 +32,7 @@ from gmshield_worker.backend.client import (
     ReadRecord,
     RecordField,
     RecordsAnswer,
+    TermsAnswer,
 )
 from gmshield_worker.lanes import question
 from gmshield_worker.lanes import search as lane_search
@@ -1853,3 +1854,364 @@ def test_exact_first_moves_the_passages_holding_the_query_and_leaves_records_at_
     assert ordered == ["c", "e", "r1", "a", "r2"]
     assert lane_search.exact_first([], "Vorpal Sword", ["r1", "r2"]) == ["r1", "r2"]
     assert lane_search.exact_first(found, "  ", ["r1", "a"]) == ["r1", "a"]
+
+
+# --- Story 4.6: questions understand the system's terms
+
+PAIRS = retrieval_fixtures.term_pairs()
+SRD_RECORD_TYPES = {
+    "srd-vorpal-sword": "item",
+    "srd-sword-of-sharpness": "item",
+    "srd-sword-of-wounding": "item",
+    "srd-sword-of-life-stealing": "item",
+    "srd-sun-blade": "item",
+    "srd-frost-brand": "item",
+    "srd-flame-tongue": "item",
+    "srd-dancing-sword": "item",
+    "srd-bag-of-holding": "item",
+    "srd-fireball": "spell",
+}
+
+
+@dataclass
+class SrdRecords:
+    """Every fixture passage indexed as in `library()`, plus one record point per SRD passage (15, many more than an
+    answer's records search finds): its passage's recorded vectors, a keyword vector of its name and text as the index
+    writes a record's, and its type (items and Fireball's spell, the rest rules)."""
+
+    spy: Spy
+    ids: dict[str, str]
+
+
+@pytest.fixture(scope="module")
+def srd_records() -> SrdRecords:
+    lib = library()
+    fixtures = [item for item in PASSAGES if item.srd]
+    vectors = retrieval_fixtures.RecordedOllama().embedder().embed([(item.title, item.text) for item in fixtures])
+    ids: dict[str, str] = {}
+    points: list[store.Point] = []
+    for item, vector in zip(fixtures, vectors, strict=True):
+        record_id = str(uuid.uuid4())
+        ids[item.key] = record_id
+        record_type = SRD_RECORD_TYPES.get(item.key, "rule")
+        sparse = keywords.keyword_vector(f"{item.title}\n{item.text}", KEY)
+        points.append(
+            store.Point(record_id, vector.vector, sparse, OWNER, SRD, "rulebook", item.page, None, record_type)
+        )
+    store.PassageStore(lib.spy.client).upsert(points)
+    return SrdRecords(lib.spy, ids)
+
+
+def serve_srd_records(stand_in: StandIn, lib: SrdRecords) -> None:
+    serve_fixtures(stand_in)
+    for key, record_id in lib.ids.items():
+        item = BY_KEY[key]
+        record_type = SRD_RECORD_TYPES.get(key, "rule")
+        stand_in.records[record_id] = StandInRecord(
+            SRD, record_type, item.title, [], item.page, list(item.section_path)
+        )
+
+
+def resolved_sources(
+    stand_in: StandIn, spy: Spy, text: str, tiers: list[dict[str, Any]], *, resolver: bool = True, budget: float = 5.0
+) -> search.Sources:
+    """`find_sources` as an answer calls it from Story 4.6: with a record reader and (unless `resolver` is false) the
+    backend's terms route as its resolver."""
+    job = answer_claim(stand_in, with_keys(question_input(text, tiers), CORE_KEYS))
+    api = JobsApi(stand_in.url, CREDENTIAL)
+    return search.find_sources(
+        job,
+        search.question_input(job.input),
+        embedder=retrieval_fixtures.RecordedOllama().embedder(),
+        stores=lambda: local(spy),
+        reader=api,
+        log=TraceLog("test", job.trace_id),
+        record_reader=api,
+        resolver=api if resolver else None,
+        terms_budget=budget,
+    )
+
+
+def answer_claim(stand_in: StandIn, job_input: dict[str, Any]) -> ClaimedJob:
+    """The claim of an answer job (`question.answer`, the only kind the terms route answers) with this input."""
+    job_id = stand_in.offer("question.answer", job_input, new_trace_id())
+    answer = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(job_id), new_trace_id())
+    assert answer.job is not None
+    return answer.job
+
+
+def terms_requests(stand_in: StandIn) -> list[dict[str, str]]:
+    return [item for item in stand_in.requests if item["path"].endswith("/terms")]
+
+
+@pytest.mark.parametrize("pair", PAIRS, ids=[pair.key for pair in PAIRS])
+def test_a_portuguese_term_finds_its_english_record_among_the_answers_records(
+    stand_in: StandIn, srd_records: SrdRecords, pair: retrieval_fixtures.FixtureTermPair
+) -> None:
+    serve_srd_records(stand_in, srd_records)
+    # The backend resolves the term by its name: its name and every alias (the GM merged the English name in), and the
+    # types the question names. "bola de fogo" names no record, so no record id comes back.
+    stand_in.terms = {"recordTypes": pair.record_types, "names": [pair.term, *pair.aliases], "records": []}
+
+    found = resolved_sources(stand_in, srd_records.spy, pair.question, [tier("system", [SRD])])
+
+    # Among the answer's records, and with the names in the keyword query it ranks first (the embedding alone already
+    # finds each, measured 2026-11-26, but put "Marca Congelante" and "Visão no Escuro" second).
+    records = [item.record_id for item in found.records]
+    assert srd_records.ids[pair.expected] in records
+    assert records[0] == srd_records.ids[pair.expected]
+    assert len(found.records) <= search.RECORD_LIMIT
+    assert len(terms_requests(stand_in)) == 1
+
+
+def test_the_fixed_pairs_cover_types_and_aliases_and_keep_the_existing_fixtures() -> None:
+    assert len(PAIRS) >= 5
+    assert {pair.expected for pair in PAIRS} <= {item.key for item in PASSAGES if item.srd}
+    assert any(pair.record_types for pair in PAIRS)
+    recorded = retrieval_fixtures.recorded()
+    assert all(embedding.query_input(pair.question) in recorded for pair in PAIRS)
+    assert list(recorded) == retrieval_fixtures.inputs()
+
+
+def test_resolved_names_join_the_keyword_query_types_get_one_more_records_query_and_records_come_first(
+    stand_in: StandIn, srd_records: SrdRecords, capsys: pytest.CaptureFixture[str]
+) -> None:
+    serve_srd_records(stand_in, srd_records)
+    pair = next(item for item in PAIRS if item.key == "t-bola-de-fogo")
+    sun_blade = srd_records.ids["srd-sun-blade"]
+    names = [pair.term, *pair.aliases]
+    stand_in.terms = {"recordTypes": ["spell", "talento"], "names": names, "records": [sun_blade.upper()]}
+    tiers = [tier("campaign", [PT]), tier("system", [SRD])]
+    before = len(srd_records.spy.queries)
+
+    found = resolved_sources(stand_in, srd_records.spy, pair.question, tiers)
+
+    queries = srd_records.spy.queries[before:]
+    # Per tier: the passages query, the records query, then one records query of the resolved types the scope has
+    # (`talento` is not one of its keys, so only `spell`).
+    assert len(queries) == 6
+    for typed, sources in ((queries[2], [PT]), (queries[5], [SRD])):
+        assert typed["query_filter"] == models.Filter(
+            must=[
+                models.FieldCondition(key="owner", match=models.MatchValue(value=OWNER)),
+                models.FieldCondition(key="source", match=models.MatchAny(any=sources)),
+                models.FieldCondition(key="record_type", match=models.MatchAny(any=["spell"])),
+            ]
+        )
+        assert typed["limit"] == search.RECORD_LIMIT
+    # The keyword query holds the question's tokens and the names' tokens, each once.
+    sparse = next(prefetch for prefetch in queries[0]["prefetch"] if prefetch.using == "sparse").query
+    expected = keywords.query_vector("\n".join([pair.question, *names]), KEY)
+    assert sparse.indices == expected.indices
+    assert set(keywords.query_vector("Fireball", KEY).indices) <= set(sparse.indices)
+    assert set(keywords.query_vector(pair.question, KEY).indices) < set(sparse.indices)
+    # The named record comes first, of the tier the backend labels it, then the records search's; Fireball among them.
+    records = [item.record_id for item in found.records]
+    assert records[0] == sun_blade
+    assert found.records[0].tier == "system"
+    assert srd_records.ids["srd-fireball"] in records
+    assert len(records) == len(set(records))
+    assert records_requests(stand_in)[-1] == records
+    # Lines carry counts and seconds, never a name.
+    out = capsys.readouterr().out
+    lines = log_lines(out)
+    resolved = [line for line in lines if line["event"] == "retrieval.terms_resolved"]
+    assert resolved == [resolved[0]]
+    assert (resolved[0]["recordTypes"], resolved[0]["names"], resolved[0]["records"]) == (2, 2, 1)
+    done = [line for line in lines if line["event"] == "retrieval.search_done"][-1]
+    assert isinstance(done["termsSeconds"], float)
+    assert done["resolvedRecords"] == 1
+    for name in names:
+        assert name not in out
+
+
+def test_the_spell_query_ranks_the_resolved_type_with_rrf_adding_scores() -> None:
+    found = [store.Found("a", 0.5, True), store.Found("b", 0.4, True), store.Found("c", 0.3, True)]
+    typed = [store.Found("c", 0.5, True), store.Found("d", 0.45, True)]
+
+    merged = search.merge_records(found, typed, 3)
+
+    assert [item.passage_id for item in merged] == ["c", "a", "d"]
+    assert merged[0].score == pytest.approx(0.8)
+    assert all(item.record for item in merged)
+    assert search.merge_records(found, [], 2) == found[:2]
+
+
+@pytest.mark.parametrize("case", ["empty", "not_found", "down", "refused", "invalid", "late"])
+def test_a_resolution_that_gives_nothing_leaves_the_queries_and_the_sources_exactly_as_before(
+    stand_in: StandIn, srd_records: SrdRecords, capsys: pytest.CaptureFixture[str], case: str
+) -> None:
+    serve_srd_records(stand_in, srd_records)
+    # A question that names no term of the system ("Como funciona a iniciativa?" in the story's matrix).
+    text = QUESTIONS["q-pt-falling"].question
+    tiers = [tier("system", [SRD])]
+    before = len(srd_records.spy.queries)
+    plain = resolved_sources(stand_in, srd_records.spy, text, tiers, resolver=False)
+    plain_queries = srd_records.spy.queries[before:]
+    capsys.readouterr()
+    stand_in.terms = {"recordTypes": [], "names": [], "records": []}
+    if case == "not_found":
+        stand_in.terms = None
+    elif case in ("down", "refused"):
+        stand_in.terms_status = 503 if case == "down" else 403
+    elif case == "invalid":
+        stand_in.terms = {"recordTypes": ["Not A Key"], "names": ["x"], "records": []}
+    elif case == "late":
+        stand_in.terms = {"recordTypes": ["spell"], "names": ["Fireball"], "records": []}
+        stand_in.terms_delay = 0.5
+    before = len(srd_records.spy.queries)
+
+    started = time.monotonic()
+    found = resolved_sources(stand_in, srd_records.spy, text, tiers, budget=0.2)
+    took = time.monotonic() - started
+
+    assert srd_records.spy.queries[before:] == plain_queries
+    assert found == plain
+    lines = log_lines(capsys.readouterr().out)
+    done = [line for line in lines if line["event"] == "retrieval.search_done"][-1]
+    assert isinstance(done["termsSeconds"], float)
+    unavailable = [line for line in lines if line["event"] == search.TERMS_UNAVAILABLE]
+    if case == "empty":
+        assert unavailable == []
+        assert [line["records"] for line in lines if line["event"] == "retrieval.terms_resolved"] == [0]
+    else:
+        assert len(unavailable) == 1
+        expected = {"not_found": 404, "down": 503, "refused": 403, "invalid": 200, "late": 0}[case]
+        assert unavailable[0]["status"] == expected
+        assert unavailable[0]["level"] == "WARN"
+    if case == "late":
+        # Not waited for past the budget: the answer goes on without it, and the budget waited is its time.
+        assert took < 0.5
+        assert unavailable[0]["reason"] == "timeout"
+        assert done["termsSeconds"] == unavailable[0]["termsSeconds"] == 0.2
+
+
+def test_a_transport_failure_of_the_terms_call_leaves_the_search_as_before(
+    stand_in: StandIn, srd_records: SrdRecords, capsys: pytest.CaptureFixture[str]
+) -> None:
+    serve_srd_records(stand_in, srd_records)
+    text = QUESTIONS["q-pt-falling"].question
+    tiers = [tier("system", [SRD])]
+    plain = resolved_sources(stand_in, srd_records.spy, text, tiers, resolver=False)
+    job = answer_claim(stand_in, with_keys(question_input(text, tiers), CORE_KEYS))
+    api = JobsApi(stand_in.url, CREDENTIAL)
+
+    class Broken:
+        def terms(self, job: ClaimedJob) -> Any:
+            raise httpx.ConnectError("refused")
+
+    capsys.readouterr()
+    found = search.find_sources(
+        job,
+        search.question_input(job.input),
+        embedder=retrieval_fixtures.RecordedOllama().embedder(),
+        stores=lambda: local(srd_records.spy),
+        reader=api,
+        log=TraceLog("test", job.trace_id),
+        record_reader=api,
+        resolver=Broken(),
+    )
+
+    assert found == plain
+    unavailable = [line for line in log_lines(capsys.readouterr().out) if line["event"] == search.TERMS_UNAVAILABLE]
+    assert unavailable[0]["reason"] == "transport:ConnectError"
+
+
+def test_a_refused_records_read_with_named_records_reads_the_found_ones_alone(
+    stand_in: StandIn, srd_records: SrdRecords, capsys: pytest.CaptureFixture[str]
+) -> None:
+    serve_srd_records(stand_in, srd_records)
+    text = QUESTIONS["q-pt-falling"].question
+    tiers = [tier("system", [SRD])]
+    plain = resolved_sources(stand_in, srd_records.spy, text, tiers, resolver=False)
+    # A record that left the scope since the terms were resolved: the backend refuses the whole read.
+    gone = str(uuid.uuid4())
+    stand_in.terms = {"recordTypes": [], "names": [], "records": [gone]}
+    capsys.readouterr()
+
+    found = resolved_sources(stand_in, srd_records.spy, text, tiers)
+
+    assert found == plain
+    assert records_requests(stand_in)[-2][0] == gone
+    assert gone not in records_requests(stand_in)[-1]
+    lines = log_lines(capsys.readouterr().out)
+    unavailable = [line for line in lines if line["event"] == search.TERMS_UNAVAILABLE]
+    assert (unavailable[0]["reason"], unavailable[0]["code"], unavailable[0]["retry"]) == (
+        "records",
+        "scope.passage_refused",
+        False,
+    )
+    assert "status" not in unavailable[0]
+    # The named record was let go: none counts as handed.
+    done = [line for line in lines if line["event"] == "retrieval.search_done"][-1]
+    assert (done["resolvedRecords"], done["resolvedLeftOut"]) == (0, 1)
+
+
+def test_at_most_the_resolved_limit_of_named_records_is_read_and_the_rest_counted(
+    stand_in: StandIn, srd_records: SrdRecords, capsys: pytest.CaptureFixture[str]
+) -> None:
+    serve_srd_records(stand_in, srd_records)
+    named = list(srd_records.ids.values())
+    stand_in.terms = {"recordTypes": [], "names": [], "records": named}
+
+    found = resolved_sources(stand_in, srd_records.spy, QUESTIONS["q-pt-falling"].question, [tier("system", [SRD])])
+
+    # The named ones first, then the found ones, at most `RESOLVED_LIMIT` in all: the prompt holds no more records.
+    records = [item.record_id for item in found.records]
+    assert records == named[: search.RESOLVED_LIMIT]
+    done = [line for line in log_lines(capsys.readouterr().out) if line["event"] == "retrieval.search_done"][-1]
+    assert (done["resolvedRecords"], done["resolvedLeftOut"]) == (search.RESOLVED_LIMIT, 15 - search.RESOLVED_LIMIT)
+
+
+def test_a_library_search_never_resolves_terms(stand_in: StandIn, srd_records: SrdRecords) -> None:
+    serve_fixtures(stand_in)
+    stand_in.terms = {"recordTypes": ["spell"], "names": ["Fireball"], "records": []}
+
+    library_search(stand_in, Library(srd_records.spy), "Fire damage", [tier("system", [SRD])])
+
+    assert terms_requests(stand_in) == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        TermsAnswer(200, ["spell"], ["x"], ["not-a-uuid"]),
+        TermsAnswer(200, ["spell"], ["x"], [str(uuid.uuid4())] * (search.MAX_TERM_RECORDS + 1)),
+        TermsAnswer(200, None, ["x"], []),
+        TermsAnswer(200, ["spell"], [5], []),  # type: ignore[list-item]
+        TermsAnswer(404, code="request.not_found"),
+    ],
+)
+def test_a_terms_answer_out_of_the_contract_is_none(answer: TermsAnswer) -> None:
+    class Resolver:
+        def terms(self, job: ClaimedJob) -> TermsAnswer:
+            return answer
+
+    resolution = search._resolve(Resolver(), fake_job())
+
+    assert resolution.terms is None
+    assert resolution.reason
+    assert resolution.status == answer.status
+    assert resolution.seconds >= 0
+
+
+def test_terms_seconds_is_the_term_calls_own_time(
+    stand_in: StandIn, srd_records: SrdRecords, capsys: pytest.CaptureFixture[str]
+) -> None:
+    serve_srd_records(stand_in, srd_records)
+    stand_in.terms = {"recordTypes": [], "names": [], "records": []}
+    stand_in.terms_delay = 0.3
+
+    resolved_sources(stand_in, srd_records.spy, QUESTIONS["q-pt-falling"].question, [tier("system", [SRD])])
+
+    lines = log_lines(capsys.readouterr().out)
+    done = [line for line in lines if line["event"] == "retrieval.search_done"][-1]
+    resolved = next(line for line in lines if line["event"] == "retrieval.terms_resolved")
+    seconds = done["termsSeconds"]
+    assert isinstance(seconds, float)
+    assert seconds == resolved["termsSeconds"]
+    assert 0.3 <= seconds < 1.0
+    # The embedding (recorded, instant) is timed on its own.
+    embed = done["embedSeconds"]
+    assert isinstance(embed, float)
+    assert embed < 0.3
