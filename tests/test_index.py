@@ -1123,3 +1123,74 @@ def test_a_records_run_with_qdrant_down_is_retryable(stand_in: StandIn) -> None:
     ollama_down = change_handler(stand_in, FakeOllama(status=503), QdrantClient(":memory:"))
     unavailable = ollama_down(offer_records(stand_in, spells(2)).job, threading.Event())
     assert (unavailable.outcome, unavailable.code, unavailable.retry) == ("failed", "index.embedding_unavailable", None)
+
+
+# --- Story 5.1 part B: a GM's artifact
+
+
+ARTIFACT = "0195a3c0-0000-7000-8000-0000000000ee"
+
+
+def test_an_artifact_run_writes_one_point_its_source_and_id_the_artifact_and_a_removal_deletes_it(
+    stand_in: StandIn, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = FakeOllama()
+    client = QdrantClient(":memory:")
+    passages = store.PassageStore(client)
+    stand_in.credential = CREDENTIAL
+    item = {
+        "id": ARTIFACT,
+        "page": 1,
+        "type": "item",
+        "name": "Espada de Kael",
+        "fields": [
+            {"name": "Dano", "value": "1d8 cortante"},
+            {"name": "content", "value": "Forjada nas montanhas do norte."},
+        ],
+    }
+    job_input = {
+        "source": ARTIFACT,
+        "owner": OWNER,
+        "kind": "artifact",
+        "language": None,
+        "tokenKey": base64.b64encode(KEY).decode(),
+        "records": "records",
+    }
+    job_id = stand_in.offer(indexing.ARTIFACT, job_input, new_trace_id(), inputs={"records": lines([item])})
+    answer = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(job_id), new_trace_id())
+    assert answer.job is not None
+    handler = handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))[indexing.ARTIFACT]
+    assert isinstance(handler, indexing.IndexChange)
+
+    outcome = change_handler(stand_in, fake, client)(answer.job, threading.Event())
+
+    # Matrix row "Index": the one records line becomes one point, its id and its source the artifact's id.
+    assert outcome.outcome == "done"
+    assert outcome.result == {"indexRecipe": INDEX_RECIPE, "points": 1}
+    found = client.retrieve("passages", [ARTIFACT], with_payload=True)
+    assert [str(one.id) for one in found] == [ARTIFACT]
+    assert found[0].payload == {
+        "owner": OWNER,
+        "source": ARTIFACT,
+        "kind": "artifact",
+        "page": 1,
+        "language": None,
+        "record_type": "item",
+    }
+    # The content is embedded as the last field's line, after the others.
+    sent = [text for call in fake.calls for text in call["input"]]
+    assert sent == ["title: Espada de Kael | text: Dano: 1d8 cortante\ncontent: Forjada nas montanhas do norte."]
+    logged = capsys.readouterr().out
+    for secret in ("Espada", "Kael", "Forjada", "cortante"):
+        assert secret not in logged
+
+    # Its removal deletes the artifact's points by owner and source, and leaves another source's.
+    passages.upsert([point(str(uuid.uuid4()), source=OTHER_SOURCE)])
+    removal = handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))[indexing.ARTIFACT_REMOVAL]
+    assert isinstance(removal, indexing.IndexRemoval)
+    removal_id = stand_in.offer(indexing.ARTIFACT_REMOVAL, {"source": ARTIFACT, "owner": OWNER}, new_trace_id())
+    claimed = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(removal_id), new_trace_id())
+    assert claimed.job is not None
+    assert indexing.IndexRemoval(lambda: local(client))(claimed.job, threading.Event()).outcome == "done"
+    assert passages.count(OWNER, ARTIFACT) == 0
+    assert passages.count(OWNER, OTHER_SOURCE) == 1

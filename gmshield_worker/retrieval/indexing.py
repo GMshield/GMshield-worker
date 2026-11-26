@@ -26,6 +26,14 @@ source (`PassageStore.remove_points`), so a point of another owner or source sta
 than ids on `index.removal`: a worker that ignored `ids` would delete the whole source. A backend before 1.22.0 never
 creates one.
 
+`index.artifact` (Story 5.1 part B, internal contract 1.24.0): a GM's artifact, indexed as a records run of one record
+by the same handler as `index.change`. Its claim input is a records run's, `{source, owner, kind: "artifact", language:
+null, tokenKey, records}`, the source being the artifact's id, and its input one line `{id, page: 1, type, name,
+fields}` (the artifact's content, when it has one, as a last field named `content`), whose point's id is the artifact's
+id too. `index.artifact_removal` deletes an artifact's points by owner and source, as `index.removal` does: a kind of
+its own only because the backend's handler of `index.removal` keys on a material version. A backend before 1.24.0
+creates neither.
+
 Failures: an input that is not the backend's fails with `INPUT_INVALID` and `retry: false`; a passage or a record
 still too long after its splits with `index.passage_too_long` and `retry: false`; Ollama with
 `index.embedding_unavailable`, Qdrant with `index.store_unavailable` and the backend's input route with
@@ -59,6 +67,9 @@ from gmshield_worker.retrieval.store import STORE_UNAVAILABLE, PassageStore, Poi
 CHANGE = "index.change"
 REMOVAL = "index.removal"
 RECORD_REMOVAL = "index.record_removal"
+# Story 5.1 part B: an artifact's index change and its removal, run by the `index.change` and `index.removal` handlers.
+ARTIFACT = "index.artifact"
+ARTIFACT_REMOVAL = "index.artifact_removal"
 # The most ids one record removal names: the backend sends one per deleted record.
 MAX_REMOVAL_IDS = 100
 UNIT = "worker.index"
