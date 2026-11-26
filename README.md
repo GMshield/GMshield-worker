@@ -740,6 +740,8 @@ lockfile and the production image:
     tier the same way. `answer.started` logs `records` (a count). Deploy order: the backend, then this worker (its
     minimum backend contract becomes 1.19.0), then the frontend.
   - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
+  - A `content.draft` job (Story 5.3 part A, `lanes/draft.py`) logs the same `answer.*` events under the unit
+    `worker.draft` instead of `worker.answer`, the only difference in its lines.
 - **Text in a material is never an instruction (Story 2.8).** The passages go inside Azure's document delimiter
   (above); `tests/test_planted_instructions.py` pins the defences against one planted material,
   `tests/fixtures/planted/planted-instructions.md` (invented game content in pt-BR and en with a canary `ABACAXI-42`,

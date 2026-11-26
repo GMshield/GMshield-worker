@@ -332,12 +332,13 @@ def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tu
 
 
 def _terms(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
-    """`POST …/terms` (Story 4.6): no body; an answer job's resolved terms, any other kind refused."""
+    """`POST …/terms` (Story 4.6): no body; an answer job's (from Story 5.3 part A a draft job's too) resolved terms,
+    any other kind refused."""
     if state.terms is None:
         return problem(404, "request.not_found")
     if body:
         return problem(400, "request.invalid")
-    if job.kind != "question.answer":
+    if job.kind not in ("question.answer", "content.draft"):
         return problem(403, "job.terms_refused")
     if state.terms_status is not None:
         return problem(state.terms_status, "server.unavailable" if state.terms_status >= 500 else "job.grant_refused")

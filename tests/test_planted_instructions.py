@@ -20,6 +20,8 @@ structure the real model's run by hand relies on (`docs/_bmad-output/implementat
   passage id it quotes) is handed to the answer as one escaped `<record>` element inside the same delimiter; nothing in
   it is obeyed or cited but the record's own id, the worker calls only the passages, records and events routes, and
   nothing of the record is logged.
+- Story 5.3 part A: a `content.draft` job over the same planted passages sends `lanes.draft.DRAFT_PROMPT` exactly,
+  the same user turn, hands the model no tool, cites only handed ids and logs nothing of the material.
 - Story 4.2: an ingestion `records` step over the planted passages sends the model `records.SYSTEM_PROMPT` exactly
   and one user turn holding the record type names and every passage as escaped data inside one delimiter; no record,
   type or field follows the planted text (the fake reads only `fake:record` lines, and the real model's run is the
@@ -54,7 +56,7 @@ from gmshield_worker.agents.tools import READ_PASSAGES
 from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome
 from gmshield_worker.backend.files import JobFiles
 from gmshield_worker.ingestion import PIPELINE_VERSION, records, step
-from gmshield_worker.lanes import answer, model_probe
+from gmshield_worker.lanes import answer, draft, model_probe
 from gmshield_worker.log import new_trace_id
 from gmshield_worker.models.fake import FakeChatModel
 from gmshield_worker.retrieval import embedding, keywords, search, store
@@ -443,6 +445,71 @@ def test_planted_passages_stay_data_in_the_user_turn_and_only_handed_ids_are_cit
     assert_no_content_logged(logged.out + logged.err, [*planted_texts(), *FRAGMENTS, question])
 
 
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_a_draft_over_planted_passages_keeps_them_data_hands_no_tool_and_cites_only_handed_ids(
+    stand_in: StandIn,
+    library: QdrantClient,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    provider: str,
+) -> None:
+    # Story 5.3 part A: a `content.draft` job reads the same planted passages; the planted-instruction rules apply.
+    seen: list[list[BaseMessage]] = []
+    handed: dict[str, list[str]] = {}
+
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Iterator[Any]:
+            seen.append(list(messages))
+            yield from super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Recording(provider=choice.provider))
+    monkeypatch.setattr(answer, "AnswerWithTools", capturing(handed, "draft"))
+    stand_in.terms = {"recordTypes": [], "names": PLANTED_NAMES, "records": []}
+    question = QUESTIONS[0]
+    serve(stand_in)
+    job_input = {
+        "question": question,
+        "owner": OWNER,
+        "tiers": [{"tier": "campaign", "sources": [PLANTED_SOURCE], "pending": []}],
+        "tokenKey": base64.b64encode(KEY).decode(),
+    }
+    job_id = stand_in.offer(draft.KIND, job_input, new_trace_id(), model=model_of(provider))
+    claim = JobsApi(stand_in.url, CREDENTIAL, providers=PROVIDERS).claim(UUID(job_id), new_trace_id())
+    assert claim.job is not None
+    claimed_at = len(stand_in.requests)
+    embedder = embedding.Embedder("http://stand-in-ollama:11434", transport=httpx.MockTransport(constant_ollama))
+
+    outcome = draft.DraftJob(JobsApi(stand_in.url, CREDENTIAL), embedder, stores(library), FAKE)(
+        claim.job, threading.Event()
+    )
+
+    calls = stand_in.requests[claimed_at:]
+    assert outcome == Outcome.done()
+    assert handed == {"draft": []}
+    assert len(seen) == 1
+    system = [message for message in seen[0] if isinstance(message, SystemMessage)]
+    human = [message for message in seen[0] if isinstance(message, HumanMessage)]
+    assert [message.content for message in system] == [draft.DRAFT_PROMPT]
+    for text in planted_texts():
+        assert text not in draft.DRAFT_PROMPT
+    assert len(human) == 1
+    user = str(human[0].content)
+    assert_user_turn(user, question)
+    events = [event for batch in stand_in.batches.get(str(claim.job.job_id), []) for event in batch["events"]]
+    text = "".join(event["text"] for event in events if event["type"] == "delta")
+    assert text.startswith(f"## Rascunho simulado ({provider})")
+    assert CANARY not in text
+    cited = [event["passageId"] for event in events if event["type"] == "citation"]
+    assert set(cited) == set(PLANTED_IDS)
+    assert FOREIGN not in cited
+    assert not any(event["type"] == "tier" for event in events)
+    for name in PLANTED_NAMES:
+        assert name not in user
+    assert {route_of(request) for request in calls} == {"terms", "passages", "events"}
+    logged = capsys.readouterr()
+    assert_no_content_logged(logged.out + logged.err, [*planted_texts(), *FRAGMENTS, question])
+
+
 def test_a_planted_model_marker_with_model_knowledge_off_is_stripped_and_posts_no_tier(
     stand_in: StandIn, library: QdrantClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -613,6 +680,11 @@ def test_only_the_answer_lane_and_the_model_probe_build_an_answering_node() -> N
     (`bind_tools`, `bind(tools=…)`, LangGraph's `ToolNode` or `create_react_agent`)."""
     users = [path for path in modules_matching(lambda text: "AnswerWithTools" in text) if path != "agents/graphs.py"]
     assert users == ["lanes/answer.py", "lanes/model_probe.py"]
+    # Story 5.3 part A: the draft lane is the answer lane's handler with another system message (`DraftJob` subclasses
+    # `AnswerJob`), so it builds the answer's node with no tool (pinned by the planted draft case above).
+    assert issubclass(draft.DraftJob, answer.AnswerJob)
+    assert "AnswerWithTools" not in Path(draft.__file__).read_text(encoding="utf-8")
+    assert vars(draft.DraftJob).keys() & {"__call__", "_prepare"} == set()
     # graphs.py binds the node's tools; fake.py is the test-mode model's own `bind_tools` (it calls `bind(tools=…)`).
     assert modules_matching(lambda text: _BINDERS.search(text) is not None) == ["agents/graphs.py", "models/fake.py"]
 

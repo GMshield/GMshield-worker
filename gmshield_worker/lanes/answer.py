@@ -55,7 +55,7 @@ import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import ClassVar, Protocol
 from xml.sax.saxutils import escape, quoteattr
 
 from langchain_core.language_models import BaseChatModel
@@ -196,7 +196,10 @@ def user_turn(
 
 @dataclass
 class AnswerJob:
-    """The `question.answer` handler: `(job, cancel) -> Outcome`, as the lanes call it."""
+    """The `question.answer` handler: `(job, cancel) -> Outcome`, as the lanes call it.
+
+    Story 5.3 part A: `lanes.draft.DraftJob` is this handler with another system message (`instructions`) and log unit
+    (`unit`); everything else (the input, the sources, the user turn, the batches and the outcome rules) is shared."""
 
     api: AnswerRoutes
     embedder: Embedder
@@ -204,9 +207,14 @@ class AnswerJob:
     keys: ModelKeys
     interval: float = BATCH_INTERVAL_SECONDS
     max_events: int = MAX_EVENTS
+    unit: ClassVar[str] = UNIT
+
+    def instructions(self, model_knowledge: bool, history: bool) -> str:
+        """The system message for this input: an answer's (`system_prompt`)."""
+        return system_prompt(model_knowledge, history)
 
     def __call__(self, job: ClaimedJob, cancel: threading.Event, /) -> Outcome:
-        log = TraceLog(UNIT, job.trace_id)
+        log = TraceLog(self.unit, job.trace_id)
         job_id = str(job.job_id)
         started = time.monotonic()
         prepared = self._prepare(job, log)
@@ -223,7 +231,7 @@ class AnswerJob:
         if checked.model_knowledge:
             markers.give_tiers([MODEL_TIER])
         messages = [
-            SystemMessage(system_prompt(checked.model_knowledge, bool(checked.history))),
+            SystemMessage(self.instructions(checked.model_knowledge, bool(checked.history))),
             HumanMessage(user_turn(handed, checked.question, checked.history, records)),
         ]
         batcher = EventBatcher(self.api, job, cancel, log, interval=self.interval, max_events=self.max_events)

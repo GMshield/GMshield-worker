@@ -32,6 +32,11 @@ Story 4.3 part C: a record block of the user turn (`<record id="…" tier="…" 
 it after the passages) is cited by its id as a passage is, in the order the blocks come, with its tier like a
 passage's.
 
+Story 5.3 part A: when its system message is a draft's (it holds `DRAFT_MARKER`, which only `lanes.draft.DRAFT_PROMPT`
+writes there), it writes a draft instead (`draft_text`): "Rascunho simulado (provider)" under a heading, one field
+citing each id it was given, in their order and with no tier marker, or one sentence when it was given none; the model
+paragraph and the directives work as for an answer.
+
 Story 3.10: the earlier turns of a conversation (`<earlier-turn>` elements, as `lanes.answer.user_turn` writes them) are
 left out before anything is read from a user turn, so a directive or an id in an earlier question or answer neither
 changes the answer nor is cited: directives and cited ids come from the question and the passages only.
@@ -77,6 +82,9 @@ _TIERED = re.compile(r'<(?:passage|record) id="([0-9a-f-]{36})" tier="([a-z]+)"'
 TIER_ORDER = ("campaign", "system", "other")
 # Story 3.8: the marker the model-knowledge rule names in the system message, and that opens the fake's model paragraph.
 MODEL_MARKER = "[[tier:model]]"
+# Story 5.3 part A: the words that open a draft's system message (`lanes.draft.DRAFT_PROMPT`), which tell the fake to
+# write a draft instead of an answer.
+DRAFT_MARKER = "You write a draft of game content"
 _CHUNK = 7
 # Story 3.10: an earlier turn of the conversation, as `lanes.answer.user_turn` writes it (its text escaped inside).
 _EARLIER_OPEN = "<earlier-turn>"
@@ -151,6 +159,19 @@ def answer_text(
         return model if model_knowledge else f"Resposta simulada ({provider}): as fontes não dizem nada sobre isso."
     sourced = _sourced_text(provider, ids, tiers)
     return f"{sourced}\n\n{model}" if model_knowledge else sourced
+
+
+def draft_text(provider: str, ids: Sequence[str], *, model_knowledge: bool = False) -> str:
+    """The fake's draft (Story 5.3 part A): a heading naming "Rascunho simulado (provider)", then one cited field per
+    id in the order given (the backend's tier order, campaign first), with no tier marker; without any id, one sentence
+    saying nothing fits. With `model_knowledge`, a last paragraph opened by `MODEL_MARKER`, uncited, as `answer_text`
+    adds it; with no id, only that paragraph."""
+    model = f"{MODEL_MARKER}Conhecimento do modelo simulado ({provider}): em geral, assim se faz."
+    if not ids:
+        return model if model_knowledge else f"Rascunho simulado ({provider}): nada nas fontes serve para este pedido."
+    fields = "\n".join(f"- Elemento {number}: da fonte ✓[[{source}]]" for number, source in enumerate(ids, 1))
+    drafted = f"## Rascunho simulado ({provider})\n\n{fields}\n\nFim."
+    return f"{drafted}\n\n{model}" if model_knowledge else drafted
 
 
 def _sourced_text(provider: str, ids: Sequence[str], tiers: Mapping[str, str] | None) -> str:
@@ -245,12 +266,13 @@ class FakeChatModel(BaseChatModel):
 
         given = " ".join(_text(message) for message in results) if results else asked
         tiers = {passage_id: tier for passage_id, tier in _TIERED.findall(given)}
-        model_knowledge = any(
-            isinstance(message, SystemMessage) and MODEL_MARKER in _text(message) for message in messages
-        )
-        text = answer_text(
-            self.provider, list(dict.fromkeys(_PASSAGE_ID.findall(given))), tiers, model_knowledge=model_knowledge
-        )
+        system = " ".join(_text(message) for message in messages if isinstance(message, SystemMessage))
+        model_knowledge = MODEL_MARKER in system
+        cited = list(dict.fromkeys(_PASSAGE_ID.findall(given)))
+        if DRAFT_MARKER in system:
+            text = draft_text(self.provider, cited, model_knowledge=model_knowledge)
+        else:
+            text = answer_text(self.provider, cited, tiers, model_knowledge=model_knowledge)
         if REFUSAL in asked:
             text, stop_reason = "", "refusal" if anthropic else "content_filter"
         elif TRUNCATED in asked:

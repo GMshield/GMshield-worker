@@ -404,6 +404,7 @@ def test_ingestion_runs_in_every_mode_and_the_probes_in_test_mode_only() -> None
         "index.artifact",
         "index.artifact_removal",
         "question.answer",
+        "content.draft",
         "library.search",
     }
     test_mode = check_settings({"GMSHIELD_MODE": "test"})
@@ -495,6 +496,7 @@ def test_build_lanes_puts_the_interactive_lane_first_with_its_capacity() -> None
         "index.artifact",
         "index.artifact_removal",
         "question.answer",
+        "content.draft",
         "library.search",
     }
     # Story 2.10: every claim states the providers; test mode states all three.
