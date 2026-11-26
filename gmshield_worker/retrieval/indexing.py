@@ -20,6 +20,12 @@ claim's cancellation checked between batches. The result is `{indexRecipe, point
 
 `index.removal`: the claim input is `{source, owner}`; every point of that owner's source is deleted by a filter.
 
+`index.record_removal` (Story 4.5 part B, internal contract 1.22.0): the claim input is `{owner, source, ids}`, the
+ids (1 to `MAX_REMOVAL_IDS`, UUIDs) of records the GM deleted; their points are deleted by id within that owner's
+source (`PassageStore.remove_points`), so a point of another owner or source stays whatever its id. A new kind rather
+than ids on `index.removal`: a worker that ignored `ids` would delete the whole source. A backend before 1.22.0 never
+creates one.
+
 Failures: an input that is not the backend's fails with `INPUT_INVALID` and `retry: false`; a passage or a record
 still too long after its splits with `index.passage_too_long` and `retry: false`; Ollama with
 `index.embedding_unavailable`, Qdrant with `index.store_unavailable` and the backend's input route with
@@ -52,6 +58,9 @@ from gmshield_worker.retrieval.store import STORE_UNAVAILABLE, PassageStore, Poi
 
 CHANGE = "index.change"
 REMOVAL = "index.removal"
+RECORD_REMOVAL = "index.record_removal"
+# The most ids one record removal names: the backend sends one per deleted record.
+MAX_REMOVAL_IDS = 100
 UNIT = "worker.index"
 INPUT_INVALID = "index.input_invalid"
 INPUT_UNAVAILABLE = "index.input_unavailable"
@@ -177,6 +186,25 @@ def change_input(raw: dict[str, Any]) -> ChangeInput:
 def removal_input(raw: dict[str, Any]) -> tuple[str, str]:
     """The `index.removal` input, checked: `(owner, source)`; `InputInvalid` otherwise."""
     return _uuid(raw.get("owner")), _uuid(raw.get("source"))
+
+
+@dataclass(frozen=True)
+class RecordRemovalInput:
+    owner: str
+    source: str
+    ids: tuple[str, ...]
+
+
+def record_removal_input(raw: dict[str, Any]) -> RecordRemovalInput:
+    """The `index.record_removal` input, checked: an owner, a source and 1 to `MAX_REMOVAL_IDS` distinct UUID ids;
+    `InputInvalid` otherwise."""
+    ids = raw.get("ids")
+    if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_REMOVAL_IDS:
+        raise InputInvalid
+    checked = tuple(_uuid(item) for item in ids)
+    if len(set(checked)) != len(checked):
+        raise InputInvalid
+    return RecordRemovalInput(owner=_uuid(raw.get("owner")), source=_uuid(raw.get("source")), ids=checked)
 
 
 def _lines(body: bytes) -> list[dict[str, Any]]:
@@ -376,6 +404,26 @@ class IndexRemoval:
         except (InputInvalid, StoreFailed) as error:
             return _failure(error, log, job_id, "index.removal_failed")
         log.info("index.removal_done", jobId=job_id, source=source)
+        return Outcome.done({})
+
+
+@dataclass
+class IndexRecordRemoval:
+    """The `index.record_removal` handler: deletes the deleted records' points, by id within the owner's source."""
+
+    stores: StoreFactory
+
+    def __call__(self, job: ClaimedJob, cancel: threading.Event, /) -> Outcome:
+        log = TraceLog(UNIT, job.trace_id)
+        job_id = str(job.job_id)
+        try:
+            checked = record_removal_input(job.input)
+            with self.stores() as store:
+                store.ensure_collection()
+                store.remove_points(checked.owner, checked.source, checked.ids)
+        except (InputInvalid, StoreFailed) as error:
+            return _failure(error, log, job_id, "index.record_removal_failed")
+        log.info("index.record_removal_done", jobId=job_id, source=checked.source, ids=len(checked.ids))
         return Outcome.done({})
 
 

@@ -9,7 +9,8 @@ first page and `record_type` its type's key (a core key or, from Story 4.4 part 
 title, no name, no field, nothing a GM can switch. An upsert of the same passage or record writes the same point again,
 so a retried job leaves one point per item. A removal deletes by a filter on owner and source, never by a list of ids,
 so it is safe to repeat, takes a version's record points with its passage points, and also takes what an index change
-wrote before it was cancelled.
+wrote before it was cancelled. From Story 4.5 part B a record the GM deleted loses its point by id (`remove_points`):
+the filter holds the owner, the source and the ids together, so no other owner's or source's point goes.
 
 A search (Story 2.3) is one `query_points` call per tier: a dense and a sparse prefetch (`PREFETCH` each) fused by
 Qdrant's reciprocal rank fusion (`FusionQuery(Fusion.RRF)`, whose constant is `RRF_K`), `limit` points, with the filter
@@ -243,6 +244,24 @@ class PassageStore:
             self.client.delete(
                 COLLECTION, points_selector=models.FilterSelector(filter=_source_filter(owner, source)), wait=True
             )
+        except (ApiException, httpx.HTTPError, ValueError) as error:
+            raise StoreFailed from error
+
+    def remove_points(self, owner: str, source: str, ids: Sequence[str]) -> None:
+        """Deletes the points with these ids (Story 4.5 part B: a record the GM deleted), by a filter on the owner, the
+        source and the ids together, so a point of another owner or source is never touched, whatever its id; safe to
+        repeat, and nothing when none is there."""
+        if not ids:
+            return
+        selector = models.Filter(
+            must=[
+                models.FieldCondition(key=OWNER, match=models.MatchValue(value=owner)),
+                models.FieldCondition(key=SOURCE, match=models.MatchValue(value=source)),
+                models.HasIdCondition(has_id=list(ids)),
+            ]
+        )
+        try:
+            self.client.delete(COLLECTION, points_selector=models.FilterSelector(filter=selector), wait=True)
         except (ApiException, httpx.HTTPError, ValueError) as error:
             raise StoreFailed from error
 
