@@ -41,6 +41,20 @@ search below never reads it.
    record id never reaches the pending ranking. `retrieval.search_done` keeps `ids` (the passages) and adds `records`
    (the record ids).
 
+7. Story 4.6 (contract 1.23.0), an answer only (`find_sources` with a term resolver): alongside the question's
+   embedding, the backend is asked to resolve the question's terms (`POST …/terms`, no body: it reads the turn's
+   question and matches its words against the system's ontology and the scope's record names). Its answer is used once
+   the embedding is back, waiting at most `TERMS_BUDGET_SECONDS` from the ask: the resolved names join the keyword
+   query (`query_vector` over the question and the names); each tier's records search gets one more Qdrant query,
+   records of the resolved types (those of the scope's `recordTypes`) only, fused with it by RRF (`merge_records`);
+   and the resolved record ids come first among the records read, any tier the backend labels, then the records
+   search's, at most `RESOLVED_LIMIT` in all (no more than that search alone hands). An empty answer, a 404 (a backend
+   before 1.23.0), any failure or a timeout leaves the search exactly as before, with the line
+   `answer.terms_unavailable` (its reason and status); a records read refused with named records in it is read again
+   without them (the line then carries the read's code and retry flag). The worker derives no definition and no type
+   from the names, and the names reach no prompt and no line: lines carry counts and `termsSeconds`, the term call's
+   own duration (the budget waited when it is late).
+
 The library search (Story 3.9, `lanes/search.py`) reuses steps 1 to 4 (`rank_tiers`) on the backend's search input
 (`Scopes.searchInput`: the same shape with `query`, 1 to `MAX_QUERY` code points, in place of `question`;
 `question_input(raw, field="query")`), with its own limit per tier, and keeps each id's fused score. From internal
@@ -73,19 +87,36 @@ import math
 import re
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
 
-from gmshield_worker.backend.client import ClaimedJob, PassagesAnswer, ReadPassage, ReadRecord, RecordsAnswer
+from gmshield_worker.backend.client import (
+    ClaimedJob,
+    PassagesAnswer,
+    ReadPassage,
+    ReadRecord,
+    RecordsAnswer,
+    TermsAnswer,
+)
 from gmshield_worker.log import TraceLog
 from gmshield_worker.retrieval.embedding import Embedder, EmbeddingFailed
 from gmshield_worker.retrieval.indexing import StoreFactory, is_record_type
-from gmshield_worker.retrieval.keywords import KEY_BYTES, query_vector, tokens
-from gmshield_worker.retrieval.store import PASSAGES, RECORDS, RRF_K, Found, Kinds, StoreFailed, limited
+from gmshield_worker.retrieval.keywords import KEY_BYTES, Sparse, query_vector, tokens
+from gmshield_worker.retrieval.store import (
+    PASSAGES,
+    RECORDS,
+    RRF_K,
+    Found,
+    Kinds,
+    PassageStore,
+    StoreFailed,
+    limited,
+)
 
 TIERS = ("campaign", "system", "other")
 LIMIT = 8
@@ -110,6 +141,16 @@ MAX_HISTORY = 6
 MAX_HISTORY_ANSWER = 4000
 # Story 4.4 part B: the most record type keys a question or a search input carries (a system's core and approved types).
 MAX_RECORD_TYPES = 1000
+# Story 4.6: how long an answer waits for its question's terms (`POST …/terms`, asked alongside the question's
+# embedding), from the moment it asked; past it the search runs as before.
+TERMS_BUDGET_SECONDS = 1.0
+# Story 4.6: the most record ids a terms answer may carry (the backend's `Scopes.MAX_TERM_RECORDS`), and the most
+# records an answer hands to the model, the named ones first, then its records search's: as many as that search alone
+# finds at most, so the prompt holds no more record blocks than before.
+MAX_TERM_RECORDS = 100
+RESOLVED_LIMIT = RECORD_LIMIT * 3
+# Story 4.6: the line of a term resolution that gave nothing to use (timeout, refusal, failure, an older backend).
+TERMS_UNAVAILABLE = "answer.terms_unavailable"
 INPUT_INVALID = "retrieval.input_invalid"
 EMBEDDING_UNAVAILABLE = "retrieval.embedding_unavailable"
 STORE_UNAVAILABLE = "retrieval.store_unavailable"
@@ -222,6 +263,27 @@ class RecordReader(Protocol):
     C)."""
 
     def records(self, job: ClaimedJob, ids: list[str]) -> RecordsAnswer: ...
+
+
+class TermResolver(Protocol):
+    """Resolving the question's terms under the claim's grant (`backend.client.JobsApi`, or a stand-in in tests; Story
+    4.6)."""
+
+    def terms(self, job: ClaimedJob) -> TermsAnswer: ...
+
+
+@dataclass(frozen=True)
+class ResolvedTerms:
+    """What the backend resolved the question's terms to (Story 4.6): the record type keys it names, the names of its
+    matched terms (with their aliases) and records, and the ids of the in-scope records it names, in the backend's
+    order. The names are library data: they join the keyword query only, never a prompt, a line or a repr."""
+
+    record_types: tuple[str, ...] = ()
+    names: tuple[str, ...] = field(default=(), repr=False)
+    records: tuple[str, ...] = ()
+
+
+NO_TERMS_RESOLVED = ResolvedTerms()
 
 
 def _uuid(value: object) -> str:
@@ -399,16 +461,20 @@ def read_passages(reader: PassageReader, job: ClaimedJob, ids: list[str], tiers:
     raise SearchFailed(PASSAGES_UNAVAILABLE, retry=True)
 
 
-def read_records(reader: RecordReader, job: ClaimedJob, ids: list[str], tiers: dict[str, str]) -> list[ReadRecord]:
-    """The records with these ids (1 to `PAGE`), in this order, each of the expected tier; `SearchFailed`
-    otherwise."""
+def read_records(
+    reader: RecordReader, job: ClaimedJob, ids: list[str], tiers: Mapping[str, str | None]
+) -> list[ReadRecord]:
+    """The records with these ids (1 to `PAGE`), in this order, each of the expected tier (any of `TIERS` for an id
+    whose tier is None: a record the question's terms named, Story 4.6); `SearchFailed` otherwise."""
     try:
         answer = reader.records(job, ids)
     except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
         raise SearchFailed(RECORDS_UNAVAILABLE, retry=True) from error
     if answer.status == 200 and answer.records is not None:
         read = answer.records
-        if [item.record_id for item in read] != ids or any(item.tier != tiers[item.record_id] for item in read):
+        if [item.record_id for item in read] != ids or any(
+            item.tier not in TIERS or tiers[item.record_id] not in (None, item.tier) for item in read
+        ):
             raise SearchFailed(RECORDS_UNAVAILABLE, retry=True)
         return read
     if 400 <= answer.status < 500:
@@ -525,6 +591,12 @@ class _Timings:
         self.spent[name] = round(self.spent.get(name, 0.0) + now - self.started, 3)
         self.started = now
 
+    def record(self, name: str, seconds: float) -> None:
+        """`name` took `seconds`, timed on its own (Story 4.6: the term call, which ran alongside the embedding); the
+        next lap starts now, so the wait for it counts in no lap."""
+        self.spent[name] = round(seconds, 3)
+        self.started = self.clock()
+
 
 @dataclass(frozen=True)
 class TierRanking:
@@ -552,6 +624,141 @@ class Ranked:
     fetched: int
     skipped: int
     timings: _Timings | None
+    terms: ResolvedTerms = NO_TERMS_RESOLVED
+
+
+@dataclass(frozen=True)
+class _Resolution:
+    """What one term call gave: the checked terms, or None with why (`reason`) and the status; and how long the call
+    took (`seconds`, `time.monotonic` around it)."""
+
+    terms: ResolvedTerms | None
+    reason: str
+    status: int
+    seconds: float
+
+
+def _resolve(resolver: TermResolver, job: ClaimedJob) -> _Resolution:
+    """The question's terms as the backend resolved them, checked, timed around the call. Never raises: a term
+    resolution only sharpens the search."""
+    started = time.monotonic()
+    try:
+        answer = resolver.terms(job)
+    except Exception as error:  # any failure of the call leaves the search as it was
+        return _Resolution(None, f"transport:{type(error).__name__}", 0, time.monotonic() - started)
+    seconds = time.monotonic() - started
+    found, reason = _checked(answer)
+    return _Resolution(found, reason, answer.status, seconds)
+
+
+def _checked(answer: TermsAnswer) -> tuple[ResolvedTerms | None, str]:
+    """A terms answer's terms, or None with why: a refusal's code, or `invalid` for one out of the contract."""
+    if answer.status != 200:
+        return None, answer.code or "status"
+    record_types, names, records = answer.record_types, answer.names, answer.records
+    if (
+        record_types is None
+        or names is None
+        or records is None
+        or not all(is_record_type(item) for item in record_types)
+        or not all(isinstance(item, str) for item in names)
+        or len(records) > MAX_TERM_RECORDS
+        or not all(isinstance(item, str) and _UUID.fullmatch(item) for item in records)
+    ):
+        return None, "invalid"
+    unique = tuple(dict.fromkeys(item.lower() for item in records))
+    return ResolvedTerms(tuple(dict.fromkeys(record_types)), tuple(dict.fromkeys(names)), unique), ""
+
+
+def _await_terms(
+    future: Future[_Resolution], deadline: float, budget: float, job_id: str, log: TraceLog
+) -> tuple[ResolvedTerms, float]:
+    """The resolved terms once back, waiting at most until `deadline` (`time.monotonic`), and how long the term call
+    took (the `budget` waited when it is late); nothing when it failed or is late, with a line saying so
+    (`TERMS_UNAVAILABLE`)."""
+    try:
+        resolution = future.result(timeout=max(0.0, deadline - time.monotonic()))
+    except FutureTimeout:
+        resolution = _Resolution(None, "timeout", 0, budget)
+    seconds = round(resolution.seconds, 3)
+    resolved = resolution.terms
+    if resolved is None:
+        log.warn(
+            TERMS_UNAVAILABLE, jobId=job_id, reason=resolution.reason, status=resolution.status, termsSeconds=seconds
+        )
+        return NO_TERMS_RESOLVED, resolution.seconds
+    log.info(
+        "retrieval.terms_resolved",
+        jobId=job_id,
+        recordTypes=len(resolved.record_types),
+        names=len(resolved.names),
+        records=len(resolved.records),
+        termsSeconds=seconds,
+    )
+    return resolved, resolution.seconds
+
+
+def merge_records(found: Sequence[Found], typed: Sequence[Found], limit: int) -> list[Found]:
+    """A tier's records search and its resolved types' records search (Story 4.6) fused as RRF fuses its lists: an id
+    found by both is one entry whose two scores add up; best first, a tie keeping the records search's order, then the
+    typed one's; at most `limit`."""
+    scores: dict[str, float] = {}
+    for item in [*found, *typed]:
+        scores[item.passage_id] = scores.get(item.passage_id, 0.0) + item.score
+    ranked = sorted(scores, key=lambda passage_id: -scores[passage_id])[:limit]
+    return [Found(passage_id, scores[passage_id], record=True) for passage_id in ranked]
+
+
+def _embed_and_resolve(
+    job: ClaimedJob,
+    checked: QuestionInput,
+    *,
+    embedder: Embedder,
+    resolver: TermResolver | None,
+    terms_budget: float,
+    timings: _Timings,
+    log: TraceLog,
+) -> tuple[list[float], ResolvedTerms]:
+    """The question's embedding and (with a `resolver`, Story 4.6) its resolved terms, asked alongside it in a thread of
+    its own and waited for at most `terms_budget` seconds from the ask; `embedSeconds` and `termsSeconds` timed."""
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="terms") if resolver is not None else None
+    future = pool.submit(_resolve, resolver, job) if pool is not None and resolver is not None else None
+    deadline = time.monotonic() + terms_budget
+    try:
+        try:
+            dense = embedder.embed_query(checked.question)
+        except EmbeddingFailed as error:
+            raise SearchFailed(EMBEDDING_UNAVAILABLE if error.retry else error.code, retry=error.retry) from error
+        timings.lap("embedSeconds")
+        resolved = NO_TERMS_RESOLVED
+        if future is not None:
+            resolved, seconds = _await_terms(future, deadline, terms_budget, str(job.job_id), log)
+            timings.record("termsSeconds", seconds)
+    finally:
+        if pool is not None:
+            # A late resolution is not waited for: its thread ends on its own, its answer unread.
+            pool.shutdown(wait=False, cancel_futures=True)
+    return dense, resolved
+
+
+def _search_records(
+    store: PassageStore,
+    tier: TierScope,
+    *,
+    owner: str,
+    vectors: tuple[list[float], Sparse],
+    records: int,
+    searches: tuple[Kinds, Kinds | None],
+) -> list[Found]:
+    """A tier's records search (step 6): at most `records` record points of the scope's keys; with resolved types
+    (Story 4.6), one more query of those types only, fused with it (`merge_records`)."""
+    dense, sparse = vectors
+    any_kind, typed = searches
+    hits = [item for item in store.search(owner, tier.sources, dense, sparse, records, kinds=any_kind) if item.record]
+    if typed is None:
+        return hits
+    extra = [item for item in store.search(owner, tier.sources, dense, sparse, records, kinds=typed) if item.record]
+    return merge_records(hits, extra, records)
 
 
 def rank_tiers(
@@ -566,11 +773,14 @@ def rank_tiers(
     limit: int = LIMIT,
     kinds: Kinds = PASSAGES,
     records: int = 0,
+    resolver: TermResolver | None = None,
+    terms_budget: float = TERMS_BUDGET_SECONDS,
 ) -> Ranked:
     """Steps 1 to 4 of the module: each tier with sources searched in Qdrant (`limit` points of the `kinds` it may
     answer) and its pending passages ranked, fused into at most `limit` ids per tier with their scores. No passage text
     is read but the pending passages' (to rank them); with a record-type filter no pending passage is read at all.
-    With `records` above 0 (step 6), each tier is also searched for at most that many record points."""
+    With `records` above 0 (step 6), each tier is also searched for at most that many record points. With a `resolver`
+    (an answer, step 7), the question's terms are resolved alongside the embedding, within `terms_budget` seconds."""
     job_id = str(job.job_id)
     searched = [tier for tier in checked.tiers if tier.sources]
     if not searched:
@@ -579,12 +789,15 @@ def rank_tiers(
     kinds = limited(kinds, checked.record_types)
     record_kinds = limited(RECORDS, checked.record_types)
     timings = _Timings(clock)
-    try:
-        dense = embedder.embed_query(checked.question)
-    except EmbeddingFailed as error:
-        raise SearchFailed(EMBEDDING_UNAVAILABLE if error.retry else error.code, retry=error.retry) from error
-    sparse = query_vector(checked.question, checked.token_key)
-    timings.lap("embedSeconds")
+    dense, resolved = _embed_and_resolve(
+        job, checked, embedder=embedder, resolver=resolver, terms_budget=terms_budget, timings=timings, log=log
+    )
+    # Story 4.6: the names the question's terms resolved to join its keyword query; with none, it is exactly as before.
+    keywords = "\n".join((checked.question, *resolved.names)) if resolved.names else checked.question
+    sparse = query_vector(keywords, checked.token_key)
+    allowed = checked.record_types
+    typed = [key for key in resolved.record_types if allowed is None or key in allowed]
+    record_searches = (record_kinds, limited(RECORDS, typed) if typed else None) if records > 0 else None
     found: list[tuple[TierScope, list[Found]]] = []
     found_records: dict[str, tuple[str, ...]] = {}
     try:
@@ -592,9 +805,16 @@ def rank_tiers(
             store.ensure_collection()
             for tier in searched:
                 found.append((tier, store.search(checked.owner, tier.sources, dense, sparse, limit, kinds=kinds)))
-                if records > 0:
-                    hits = store.search(checked.owner, tier.sources, dense, sparse, records, kinds=record_kinds)
-                    found_records[tier.tier] = tuple(item.passage_id for item in hits if item.record)
+                if record_searches is not None:
+                    hits = _search_records(
+                        store,
+                        tier,
+                        owner=checked.owner,
+                        vectors=(dense, sparse),
+                        records=records,
+                        searches=record_searches,
+                    )
+                    found_records[tier.tier] = tuple(item.passage_id for item in hits)
                 timings.lap("searchSeconds")
     except StoreFailed as error:
         raise SearchFailed(STORE_UNAVAILABLE, retry=True) from error
@@ -635,7 +855,7 @@ def rank_tiers(
         )
     if read:
         timings.lap("rankSeconds")
-    return Ranked(ranked, len(searched), fetched, skipped, timings)
+    return Ranked(ranked, len(searched), fetched, skipped, timings, resolved)
 
 
 def find_passages(
@@ -662,9 +882,11 @@ def find_sources(
     log: TraceLog,
     clock: Callable[[], float] = time.monotonic,
     record_reader: RecordReader | None = None,
+    resolver: TermResolver | None = None,
+    terms_budget: float = TERMS_BUDGET_SECONDS,
 ) -> Sources:
     """The passages and, with a `record_reader` (an answer, Story 4.3 part C), the records that answer the question
-    within its scope, as the module says."""
+    within its scope, as the module says; with a `resolver` (an answer, Story 4.6), sharpened by its resolved terms."""
     job_id = str(job.job_id)
     ranked = rank_tiers(
         job,
@@ -676,6 +898,8 @@ def find_sources(
         clock=clock,
         limit=LIMIT,
         records=RECORD_LIMIT if record_reader is not None else 0,
+        resolver=resolver,
+        terms_budget=terms_budget,
     )
     timings = ranked.timings
     if timings is None:
@@ -690,22 +914,17 @@ def find_sources(
             for item in read_passages(reader, job, ids, tiers)
         ]
         timings.lap("readSeconds")
-    record_tiers = {record_id: tier.tier for tier in ranked.tiers for record_id in tier.found_records}
+    found_tiers = {record_id: tier.tier for tier in ranked.tiers for record_id in tier.found_records}
     records: list[HandedRecord] = []
-    if record_reader is not None and record_tiers:
-        records = [
-            HandedRecord(
-                item.record_id,
-                item.tier,
-                item.type,
-                item.page,
-                item.name,
-                tuple(HandedField(one.name, one.value) for one in item.fields),
-                list(item.section_path),
-            )
-            for item in read_records(record_reader, job, list(record_tiers), record_tiers)
-        ]
-        timings.lap("recordsSeconds")
+    named = 0
+    if record_reader is not None:
+        # Story 4.6: the records the question's terms named come first, then those the records search found.
+        resolved = list(ranked.terms.records)
+        records, named = _read_handed(
+            record_reader, job, resolved=resolved, found_tiers=found_tiers, job_id=job_id, log=log
+        )
+        if records or resolved or found_tiers:
+            timings.lap("recordsSeconds")
     log.info(
         "retrieval.search_done",
         jobId=job_id,
@@ -713,8 +932,53 @@ def find_sources(
         handed=len(handed),
         ids=[item.passage_id for item in handed],
         records=[item.record_id for item in records],
+        resolvedRecords=named,
+        resolvedLeftOut=len(ranked.terms.records) - named,
         pendingFetched=ranked.fetched,
         pendingSkipped=ranked.skipped,
         **timings.spent,
     )
     return Sources(handed, records)
+
+
+def _read_handed(
+    record_reader: RecordReader,
+    job: ClaimedJob,
+    *,
+    resolved: list[str],
+    found_tiers: dict[str, str],
+    job_id: str,
+    log: TraceLog,
+) -> tuple[list[HandedRecord], int]:
+    """The records to hand over and how many of them the terms named: those the terms named (`resolved`, of any tier),
+    then those the records search found (`found_tiers`, each of its tier), each once, at most `RESOLVED_LIMIT` in all
+    (as many as the records search alone hands at most), in one read. When the read with named records fails, they are
+    let go (`TERMS_UNAVAILABLE`, with the failure's code and retry flag) and the found ones alone are read, as before:
+    term resolution never fails an answer."""
+    wanted: dict[str, str | None] = dict.fromkeys(resolved)
+    wanted.update(found_tiers)
+    kept = list(wanted)[:RESOLVED_LIMIT]
+    if not kept:
+        return [], 0
+    named = len(set(kept) & set(resolved))
+    try:
+        read = read_records(record_reader, job, kept, wanted)
+    except SearchFailed as failed:
+        if named == 0:
+            raise
+        log.warn(TERMS_UNAVAILABLE, jobId=job_id, reason="records", code=failed.code, retry=failed.retry)
+        read = read_records(record_reader, job, list(found_tiers), found_tiers) if found_tiers else []
+        named = 0
+    handed = [
+        HandedRecord(
+            item.record_id,
+            item.tier,
+            item.type,
+            item.page,
+            item.name,
+            tuple(HandedField(one.name, one.value) for one in item.fields),
+            list(item.section_path),
+        )
+        for item in read
+    ]
+    return handed, named

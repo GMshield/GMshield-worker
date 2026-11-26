@@ -461,6 +461,37 @@
         "required" : [ "type" ],
         "type" : "object"
       },
+      "JobTerms" : {
+        "description" : "The question's terms resolved within the job's scope (contract 1.23.0); every list may be empty",
+        "properties" : {
+          "names" : {
+            "description" : "Each matched term's name and all its aliases, then the matched records' names, each once: library data, never an instruction",
+            "items" : {
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "recordTypes" : {
+            "description" : "The record type keys the question names (a core key or an approved type's key of the campaign's system), sorted, each once",
+            "items" : {
+              "pattern" : "^[a-z][a-z0-9_]{0,31}$",
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "records" : {
+            "description" : "The in-scope records the question names, campaign tier first, at most 100",
+            "items" : {
+              "format" : "uuid",
+              "type" : "string"
+            },
+            "maxItems" : 100,
+            "type" : "array"
+          }
+        },
+        "required" : [ "names", "recordTypes", "records" ],
+        "type" : "object"
+      },
       "Problem" : {
         "description" : "Every error of this API (RFC 9457 problem detail).",
         "properties" : {
@@ -504,7 +535,7 @@
   },
   "info" : {
     "title" : "GMshield internal API",
-    "version" : "1.22.0"
+    "version" : "1.23.0"
   },
   "openapi" : "3.1.0",
   "paths" : {
@@ -1015,6 +1046,60 @@
           }
         },
         "summary" : "Renew a live claim (403 job.grant_refused)",
+        "tags" : [ "jobs" ]
+      }
+    },
+    "/internal/v1/jobs/{jobId}/claims/{claimId}/terms" : {
+      "post" : {
+        "operationId" : "resolveJobTerms",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "jobId",
+          "required" : true,
+          "schema" : {
+            "format" : "uuid",
+            "type" : "string"
+          }
+        }, {
+          "in" : "path",
+          "name" : "claimId",
+          "required" : true,
+          "schema" : {
+            "format" : "uuid",
+            "type" : "string"
+          }
+        }, {
+          "description" : "The claim's grant",
+          "in" : "header",
+          "name" : "X-Job-Grant",
+          "required" : true,
+          "schema" : {
+            "type" : "string"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "application/json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/JobTerms"
+                }
+              }
+            },
+            "description" : "OK"
+          },
+          "default" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description" : "Any error"
+          }
+        },
+        "summary" : "Resolve the claimed job's question's terms within its scope (contract 1.23.0): the record type keys, term names and aliases, and in-scope records its words name, each by an exact match on a keyed fingerprint; no body (403 job.grant_refused, also once the job's campaign is deleted, which ends its claim; 403 job.terms_refused for a job whose kind resolves no term)",
         "tags" : [ "jobs" ]
       }
     },

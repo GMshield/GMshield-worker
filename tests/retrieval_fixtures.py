@@ -54,6 +54,20 @@ class FixtureSearch:
     expected: list[str]
 
 
+@dataclass(frozen=True)
+class FixtureTermPair:
+    """A fixed pair of Story 4.6: a Portuguese question naming a term the GM approved (`term`, with the English record's
+    name merged in as one of its `aliases`), the record type keys the backend resolves it to, and the English SRD
+    passage whose record the answer must find."""
+
+    key: str
+    question: str
+    term: str
+    aliases: list[str]
+    record_types: list[str]
+    expected: str
+
+
 def passages() -> list[FixturePassage]:
     raw: dict[str, Any] = json.loads(PASSAGES.read_text(encoding="utf-8"))
     return [
@@ -81,13 +95,30 @@ def searches() -> list[FixtureSearch]:
     return [FixtureSearch(item["key"], item["query"], list(item["expected"])) for item in raw["searches"]]
 
 
+def term_pairs() -> list[FixtureTermPair]:
+    raw: dict[str, Any] = json.loads(QUESTIONS.read_text(encoding="utf-8"))
+    return [
+        FixtureTermPair(
+            key=item["key"],
+            question=item["question"],
+            term=item["term"],
+            aliases=list(item["aliases"]),
+            record_types=list(item["recordTypes"]),
+            expected=item["expected"],
+        )
+        for item in raw["termPairs"]
+    ]
+
+
 def inputs() -> list[str]:
     """Every embedding input of the fixtures, in order: each passage's document prompt, then each question's query
-    prompt, then each library search's query prompt (Story 3.9), exactly as the worker sends them."""
+    prompt, then each library search's query prompt (Story 3.9), then each term pair's question (Story 4.6), exactly as
+    the worker sends them."""
     return (
         [embedding.embedding_input(item.title, item.text) for item in passages()]
         + [embedding.query_input(item.question) for item in questions()]
         + [embedding.query_input(item.query) for item in searches()]
+        + [embedding.query_input(item.question) for item in term_pairs()]
     )
 
 

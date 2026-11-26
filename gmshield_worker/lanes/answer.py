@@ -4,7 +4,11 @@
    `retrieval.search.question_input`; the claim's `model` names the provider, model and tier of this attempt.
 2. `retrieval.search.find_sources` finds the passages within the turn's scope and reads their text under the grant;
    from Story 4.3 part C (internal contract 1.19.0) it also finds the scope's records in a separate records-only search
-   (at most `search.RECORD_LIMIT` per tier) and reads their names and fields through `POST …/records`.
+   (at most `search.RECORD_LIMIT` per tier) and reads their names and fields through `POST …/records`. From Story 4.6
+   (internal contract 1.23.0) it first asks the backend to resolve the question's terms (`POST …/terms`, alongside the
+   embedding): the resolved names join the keyword query, the resolved types get one more records query, and the
+   resolved records come first among the records. A term resolution that fails, is late or finds nothing leaves the
+   search as it was: it never fails the answer, and nothing of it reaches the prompt but the records it read.
 3. One model call through a one-node LangGraph graph (`agents.graphs.answer_graph`, compiled by `compile_graph`, no
    tools), with `models.chat.chat_model(job.model)`. The `SystemMessage` holds instructions only; the one
    `HumanMessage` holds the passages as data blocks (`<passage id="…" tier="…" section="…">text</passage>`, in the
@@ -136,9 +140,9 @@ def system_prompt(model_knowledge: bool, history: bool = False) -> str:
     return " ".join(rules)
 
 
-class AnswerRoutes(search.PassageReader, search.RecordReader, EventPoster, Protocol):
-    """The internal API routes an answer uses: passages and records by id and event batches
-    (`backend.client.JobsApi`)."""
+class AnswerRoutes(search.PassageReader, search.RecordReader, search.TermResolver, EventPoster, Protocol):
+    """The internal API routes an answer uses: passages and records by id, its question's terms (Story 4.6) and event
+    batches (`backend.client.JobsApi`)."""
 
 
 def record_block(item: search.HandedRecord) -> str:
@@ -300,6 +304,7 @@ class AnswerJob:
                 reader=self.api,
                 log=log,
                 record_reader=self.api,
+                resolver=self.api,
             )
         except search.SearchFailed as failed:
             error_type = type(failed.__cause__).__name__ if failed.__cause__ is not None else type(failed).__name__

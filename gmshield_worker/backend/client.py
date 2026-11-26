@@ -30,6 +30,7 @@ from gmshield_worker.backend.generated.api.jobs import (
     read_job_records,
     renew_job_claim,
     report_job_outcome,
+    resolve_job_terms,
 )
 from gmshield_worker.backend.generated.api.jobs import state_index_recipe as index_recipe_route
 from gmshield_worker.backend.generated.models import (
@@ -49,6 +50,7 @@ from gmshield_worker.backend.generated.models import (
     JobRecordsRequest,
     JobRenewal,
     JobStreamEvent,
+    JobTerms,
     Problem,
 )
 from gmshield_worker.backend.generated.models.job_stream_event_tier import check_job_stream_event_tier
@@ -255,6 +257,18 @@ class RecordsAnswer:
 
 
 @dataclass(frozen=True)
+class TermsAnswer:
+    """What `POST .../terms` answered (contract 1.23.0, Story 4.6): on a 200 the record type keys, names and record ids
+    the question's terms resolved to, else the problem's code. The names are library data, never printed or logged."""
+
+    status: int
+    record_types: list[str] | None = None
+    names: list[str] | None = field(default=None, repr=False)
+    records: list[str] | None = None
+    code: str | None = None
+
+
+@dataclass(frozen=True)
 class EventsAnswer:
     """What `POST .../events` answered (contract 1.11.0): the status, and on a 200 whether the answer must stop (the GM
     stopped it, Story 2.6); else the problem's code."""
@@ -303,8 +317,9 @@ class JobsApi:
     recipe (contract 1.7.0, Story 2.1): the backend re-indexes what was indexed under another one. Every claim also
     states the providers this worker holds a key for (contract 1.9.0, Story 2.10): the backend refuses a kind that calls
     a model through another one. `passages` reads passage text by id under the claim's grant (contract 1.8.0, Story
-    2.3), and `records` a record's name and fields by id (contract 1.19.0, Story 4.3 part C); `events` posts a numbered
-    batch of answer events and usage (contract 1.10.0, Story 2.4)."""
+    2.3), and `records` a record's name and fields by id (contract 1.19.0, Story 4.3 part C); `terms` resolves an
+    answer's question's terms (contract 1.23.0, Story 4.6); `events` posts a numbered batch of answer events and usage
+    (contract 1.10.0, Story 2.4)."""
 
     base_url: str
     credential: str = field(repr=False)
@@ -401,6 +416,21 @@ class JobsApi:
                 ],
             )
         return RecordsAnswer(status=int(response.status_code), code=_code(parsed))
+
+    def terms(self, job: ClaimedJob) -> TermsAnswer:
+        """`POST /internal/v1/jobs/{id}/claims/{claimId}/terms` (contract 1.23.0, Story 4.6): the question's terms
+        resolved within the job's scope, under the claim's grant. No body: the backend reads the question itself."""
+        with self._client(job.trace_id) as client:
+            response = resolve_job_terms.sync_detailed(job.job_id, job.claim_id, client=client, x_job_grant=job.grant)
+        parsed = response.parsed
+        if response.status_code == 200 and isinstance(parsed, JobTerms):
+            return TermsAnswer(
+                status=200,
+                record_types=list(parsed.record_types),
+                names=list(parsed.names),
+                records=[str(item) for item in parsed.records],
+            )
+        return TermsAnswer(status=int(response.status_code), code=_code(parsed))
 
     def events(
         self, job: ClaimedJob, batch: int, events: Sequence[StreamedEvent], usage: Sequence[Usage] = ()

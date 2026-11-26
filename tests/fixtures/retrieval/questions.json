@@ -102,5 +102,69 @@
         "srd-fireball"
       ]
     }
+  ],
+  "termPairs": [
+    {
+      "key": "t-bola-de-fogo",
+      "question": "Qual o alcance da magia bola de fogo?",
+      "term": "Bola de Fogo",
+      "aliases": [
+        "Fireball"
+      ],
+      "recordTypes": [
+        "spell"
+      ],
+      "expected": "srd-fireball"
+    },
+    {
+      "key": "t-espada-vorpal",
+      "question": "Como funciona a espada vorpal?",
+      "term": "Espada Vorpal",
+      "aliases": [
+        "Vorpal Sword"
+      ],
+      "recordTypes": [],
+      "expected": "srd-vorpal-sword"
+    },
+    {
+      "key": "t-lingua-flamejante",
+      "question": "Que dano extra causa a língua flamejante?",
+      "term": "Língua Flamejante",
+      "aliases": [
+        "Flame Tongue"
+      ],
+      "recordTypes": [],
+      "expected": "srd-flame-tongue"
+    },
+    {
+      "key": "t-bolsa-devoradora",
+      "question": "Quanto peso aguenta uma bolsa devoradora?",
+      "term": "Bolsa Devoradora",
+      "aliases": [
+        "Bag of Holding"
+      ],
+      "recordTypes": [],
+      "expected": "srd-bag-of-holding"
+    },
+    {
+      "key": "t-marca-congelante",
+      "question": "O que a marca congelante faz contra o fogo?",
+      "term": "Marca Congelante",
+      "aliases": [
+        "Frost Brand"
+      ],
+      "recordTypes": [],
+      "expected": "srd-frost-brand"
+    },
+    {
+      "key": "t-visao-no-escuro",
+      "question": "Até onde enxergo com visão no escuro?",
+      "term": "Visão no Escuro",
+      "aliases": [
+        "Darkvision"
+      ],
+      "recordTypes": [],
+      "expected": "srd-darkvision"
+    }
   ]
 }

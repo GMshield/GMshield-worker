@@ -73,6 +73,7 @@ import json
 import re
 import secrets
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -86,7 +87,7 @@ PR_SET_DUMPABLE = 4
 PIPELINE_VERSION = re.compile(r"[A-Za-z0-9._-]{1,32}")
 CLAIMS = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims")
 CLAIM_ROUTE = re.compile(
-    r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs|passages|records|events)"
+    r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/(renewals|outcome|outputs|passages|records|events|terms)"
 )
 INPUT_ROUTE = re.compile(r"/internal/v1/jobs/([0-9a-f-]{36})/claims/([0-9a-f-]{36})/inputs/([^/]+)")
 
@@ -175,6 +176,11 @@ class StandIn:
     events_status: int | None = None
     events_failures: int | None = None
     stop_after: int | None = None
+    # Story 4.6: what `POST …/terms` answers an answer job: `{recordTypes, names, records}`; None answers 404, as a
+    # backend before contract 1.23.0 does. `terms_status` forces a problem, `terms_delay` holds the answer back.
+    terms: dict[str, Any] | None = None
+    terms_status: int | None = None
+    terms_delay: float = 0.0
     recipe_statements: list[str] = field(default_factory=list)
     recipe_status: int | None = None
 
@@ -319,8 +325,23 @@ def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tu
     job = _granted(state, job_id, claim_id, headers.get("x-job-grant"))
     if job is None:
         return problem(403, "job.grant_refused")
+    if action == "terms":
+        return _terms(state, job, body)
     answers = {"outputs": _output, "passages": _passages, "records": _records, "outcome": _outcome, "events": _events}
     return _renewal(state, job) if action == "renewals" else answers[action](state, job, body)
+
+
+def _terms(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
+    """`POST …/terms` (Story 4.6): no body; an answer job's resolved terms, any other kind refused."""
+    if state.terms is None:
+        return problem(404, "request.not_found")
+    if body:
+        return problem(400, "request.invalid")
+    if job.kind != "question.answer":
+        return problem(403, "job.terms_refused")
+    if state.terms_status is not None:
+        return problem(state.terms_status, "server.unavailable" if state.terms_status >= 500 else "job.grant_refused")
+    return 200, state.terms
 
 
 def _tier_of(job: StandInJob, source: str) -> str | None:
@@ -841,6 +862,9 @@ def _route(state: StandIn, method: str, path: str, headers: dict[str, str], body
         return _recipe(state, body)
     if method != "POST":
         return problem(404, "request.not_found")
+    if path.endswith("/terms") and state.terms_delay > 0:
+        # Outside the lock, so the answer's other calls go on meanwhile.
+        time.sleep(state.terms_delay)
     with state.lock:
         return _jobs(state, path, headers, body)
 
