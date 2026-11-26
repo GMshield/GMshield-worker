@@ -4,6 +4,9 @@ sandbox for the real thing, the batches, and the peak memory of a 1 GiB file."""
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -249,10 +252,22 @@ def test_a_1_gib_pdf_is_cleaned_with_a_peak_rss_under_512_mib(tmp_path: Path) ->
     pdfs.large(folder / "source.pdf", pages_count=64, image_bytes=16 * 1024 * 1024)
     assert (folder / "source.pdf").stat().st_size > 1024**3
 
-    result = sandbox.run_child(Path(clean.__file__), ["source.pdf", "out"], folder=folder, cancel=threading.Event())
+    # A child's peak RSS starts from its parent's resident size at the fork (Linux keeps the high-water mark across
+    # exec), so the child is launched from a fresh interpreter: from pytest, the reading would grow with the whole
+    # suite's memory (528 MiB in a full run on 2026-11-26, 91 MiB alone) and not measure the child.
+    launch = (
+        "import json, sys, threading; from pathlib import Path; from gmshield_worker.ingestion import clean, sandbox; "
+        "r = sandbox.run_child(Path(clean.__file__), ['source.pdf', 'out'], folder=Path(sys.argv[1]), "
+        "cancel=threading.Event()); print(json.dumps([r.returncode, r.max_rss_kib, r.seconds]))"
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+    ran = subprocess.run(  # noqa: S603 - this interpreter and a fixed program, never a shell or a user's value
+        [sys.executable, "-c", launch, str(folder)], capture_output=True, text=True, check=True, env=env
+    )
+    returncode, max_rss_kib, seconds = json.loads(ran.stdout)
 
-    assert result.returncode == 0
+    assert returncode == 0
     assert manifest(folder / "out")["pageTotal"] == 64
     assert (folder / "out" / "original.pdf").stat().st_size > 1024**3
-    print(f"1 GiB clean: {result.seconds:.1f} s, peak RSS {result.max_rss_kib / 1024:.0f} MiB")
-    assert result.max_rss_kib < 512 * 1024
+    print(f"1 GiB clean: {seconds:.1f} s, peak RSS {max_rss_kib / 1024:.0f} MiB")
+    assert max_rss_kib < 512 * 1024

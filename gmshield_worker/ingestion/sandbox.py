@@ -164,7 +164,8 @@ def child_environment(folder: Path, environment: dict[str, str] | None = None) -
 @dataclass(frozen=True)
 class ChildResult:
     """How a child ended: its exit status (negative: the signal), whether the deadline or a cancel killed it, its peak
-    resident memory in KiB, and how long it ran."""
+    resident memory in KiB, and how long it ran. The peak starts from this process's resident size when it forked the
+    child (Linux keeps the high-water mark across exec), so it is the child's own only when it is above that."""
 
     returncode: int
     timed_out: bool
