@@ -348,6 +348,16 @@ lockfile and the production image:
     (`store.limited`), so a record of a type that system never approved is never found (the backend refuses one
     anyway). Passages are untouched; without the field nothing is limited. Test mode: `fake:record <key> <name>` takes
     any key.
+- **Remove a deleted record's point (Story 4.5 part B, backend internal contract 1.22.0; no pipeline or recipe
+  bump).** The job kind `index.record_removal` (`indexing.IndexRecordRemoval`): the claim input is `{owner, source,
+  ids}`, 1 to `indexing.MAX_REMOVAL_IDS` (100) distinct record ids (UUIDs). Their points are deleted by a filter on the
+  owner, the source and the ids together (`PassageStore.remove_points`, Qdrant's `HasIdCondition`), so a point of
+  another owner or source stays whatever its id; a repeat deletes nothing more, and the result is `{}`. An input that
+  is not the backend's fails with `index.input_invalid` and `retry: false`; Qdrant down fails with
+  `index.store_unavailable`, which the backend retries. `index.record_removal_done` names the job, the source and the
+  number of ids it named (`ids`). A new kind rather than ids on `index.removal`, which an older worker would read as
+  "the whole source". Only a backend at 1.22.0 creates the kind, so `MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.20.0;
+  deploy this worker before the backend, then the frontend.
 - **Index an accepted material (Story 2.1, AD-10, backend contract 1.7.0 or later).** Every claim states the
   worker's `INDEX_RECIPE` (`retrieval/recipe.py`; bump it on any change to the model, the embedding input, the
   splitting or the keyword scheme): the backend re-indexes each source recorded under another one. From backend

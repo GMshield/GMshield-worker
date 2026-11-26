@@ -777,7 +777,112 @@ def test_an_index_removal_deletes_its_sources_points_only_and_is_safe_to_repeat(
 
 def test_the_index_handlers_run_in_every_mode() -> None:
     found = handlers.handlers_for(check_settings({"GMSHIELD_MODE": "test"}))
-    assert {"index.change", "index.removal"} <= set(found)
+    assert {"index.change", "index.removal", "index.record_removal"} <= set(found)
+    assert isinstance(found["index.record_removal"], indexing.IndexRecordRemoval)
+
+
+# --- Story 4.5 part B: a deleted record's point
+
+
+OTHER_OWNER = "0195a3c0-0000-7000-8000-0000000000dd"
+
+
+def test_a_points_removal_by_id_takes_only_the_owners_points_of_that_source_and_is_safe_to_repeat() -> None:
+    client = QdrantClient(":memory:")
+    passages = store.PassageStore(client)
+    passages.ensure_collection()
+    deleted, kept, elsewhere, theirs = (str(uuid.uuid4()) for _ in range(4))
+    passages.upsert(
+        [
+            dataclasses_replace(point(deleted), record_type="spell"),
+            dataclasses_replace(point(kept), record_type="spell"),
+            dataclasses_replace(point(elsewhere, source=OTHER_SOURCE), record_type="spell"),
+            dataclasses_replace(point(theirs), owner=OTHER_OWNER, record_type="spell"),
+        ]
+    )
+
+    # Every id is named, but only the owner's point of that source goes.
+    for _ in range(2):
+        passages.remove_points(OWNER, SOURCE, [deleted, elsewhere, theirs, str(uuid.uuid4())])
+    passages.remove_points(OWNER, SOURCE, [])
+
+    remaining = {str(found.id) for found in client.retrieve("passages", [deleted, kept, elsewhere, theirs])}
+    assert remaining == {kept, elsewhere, theirs}
+
+
+def offer_record_removal(stand_in: StandIn, job_input: dict[str, Any]) -> ClaimedJob:
+    stand_in.credential = CREDENTIAL
+    job_id = stand_in.offer("index.record_removal", job_input, new_trace_id())
+    answer = JobsApi(stand_in.url, CREDENTIAL).claim(UUID(job_id), new_trace_id())
+    assert answer.job is not None
+    return answer.job
+
+
+def test_a_record_removal_deletes_its_records_points_and_leaves_the_rest(
+    stand_in: StandIn, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = QdrantClient(":memory:")
+    passages = store.PassageStore(client)
+    passages.ensure_collection()
+    deleted, kept, passage_id = (str(uuid.uuid4()) for _ in range(3))
+    passages.upsert(
+        [
+            dataclasses_replace(point(deleted), record_type="spell"),
+            dataclasses_replace(point(kept), record_type="item"),
+            point(passage_id),
+        ]
+    )
+    removal = indexing.IndexRecordRemoval(lambda: local(client))
+
+    # Matrix row "After removal": the deleted record's point goes; a repeat is done too.
+    for _ in range(2):
+        job = offer_record_removal(stand_in, {"owner": OWNER, "source": SOURCE, "ids": [deleted.upper()]})
+        outcome = removal(job, threading.Event())
+        assert (outcome.outcome, outcome.result) == ("done", {})
+
+    assert passages.count(OWNER, SOURCE) == 2
+    assert {str(found.id) for found in client.retrieve("passages", [deleted, kept, passage_id])} == {kept, passage_id}
+    done = [line for line in log_lines(capsys.readouterr().out) if line["event"] == "index.record_removal_done"]
+    assert done and done[-1]["ids"] == 1 and done[-1]["source"] == SOURCE
+
+
+@pytest.mark.parametrize(
+    "job_input",
+    [
+        {"owner": OWNER, "source": SOURCE},
+        {"owner": OWNER, "source": SOURCE, "ids": []},
+        {"owner": OWNER, "source": SOURCE, "ids": "0195a3c0-0000-7000-8000-0000000000ee"},
+        {"owner": OWNER, "source": SOURCE, "ids": ["not-an-id"]},
+        {"owner": OWNER, "source": SOURCE, "ids": [None]},
+        {"owner": OWNER, "source": SOURCE, "ids": [SOURCE, SOURCE.upper()]},
+        {"owner": OWNER, "source": SOURCE, "ids": [str(uuid.uuid4()) for _ in range(101)]},
+        {"owner": "not-an-id", "source": SOURCE, "ids": [SOURCE]},
+        {"source": SOURCE, "ids": [SOURCE]},
+        {"owner": OWNER, "ids": [SOURCE]},
+    ],
+)
+def test_a_record_removal_input_that_is_not_the_backends_fails_without_a_retry(
+    stand_in: StandIn, job_input: dict[str, Any]
+) -> None:
+    client = QdrantClient(":memory:")
+    passages = store.PassageStore(client)
+    passages.ensure_collection()
+    passages.upsert([dataclasses_replace(point(SOURCE), record_type="spell")])
+    outcome = indexing.IndexRecordRemoval(lambda: local(client))(
+        offer_record_removal(stand_in, job_input), threading.Event()
+    )
+    assert (outcome.outcome, outcome.code, outcome.retry) == ("failed", "index.input_invalid", False)
+    assert passages.count(OWNER, SOURCE) == 1
+
+
+def test_a_record_removal_with_qdrant_down_is_retryable(stand_in: StandIn) -> None:
+    down = IndexSettings(qdrant_url="http://127.0.0.1:9")
+    removal = indexing.IndexRecordRemoval(lambda: store.passage_store(down))
+
+    # Matrix row "After removal", its error handling: the backend retries it, and the record stays hidden meanwhile.
+    job = offer_record_removal(stand_in, {"owner": OWNER, "source": SOURCE, "ids": [str(uuid.uuid4())]})
+    outcome = removal(job, threading.Event())
+    assert (outcome.outcome, outcome.code, outcome.retry) == ("failed", "index.store_unavailable", None)
 
 
 # --- Story 4.2 part B: the records run
