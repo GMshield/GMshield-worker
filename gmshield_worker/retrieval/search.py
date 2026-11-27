@@ -68,6 +68,13 @@ of the campaign's system (distinct, at most `MAX_RECORD_TYPES`). Every Qdrant qu
 only record points of those keys (`store.limited`, a `MatchAny` on `record_type`), so a record of a type that system
 never approved is never found; passages are untouched. An input without it (a backend before 1.21.0) limits nothing.
 
+Story 5.5 part A (internal contract 1.27.0): a record read may carry `overrides` (an artifact of the campaign that
+replaces a system record) and `overriddenBy` (a system record an artifact of the campaign replaces); the backend sets
+each only when both sides are in the job's scope, and the worker copies them, never works them out. When a handed
+record names an artifact that overrides it and that artifact is not handed, the artifact is read in one more call to
+`POST …/records` (after `RESOLVED_LIMIT`, so the override is never left out), and every overriding artifact is handed
+just before the record it replaces (`with_overriders`). An older backend sends neither, and nothing changes.
+
 Story 5.3 part B (internal contract 1.26.0): a draft's input may carry `recordTypeNames`, each `recordTypes` key with
 the name of the system's type (`QuestionInput.record_type_names`); retrieval never reads it, and a key it does not name
 (or an input without it, a backend before 1.26.0) is named by the key itself (`QuestionInput.named_types`).
@@ -85,6 +92,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import dataclasses
 import functools
 import itertools
 import math
@@ -157,6 +165,8 @@ MAX_TERM_RECORDS = 100
 RESOLVED_LIMIT = RECORD_LIMIT * 3
 # Story 4.6: the line of a term resolution that gave nothing to use (timeout, refusal, failure, an older backend).
 TERMS_UNAVAILABLE = "answer.terms_unavailable"
+# Story 5.5 part A: the line of an overriding artifact's read that failed; the records then answer without the mark.
+OVERRIDES_UNAVAILABLE = "answer.overrides_unavailable"
 INPUT_INVALID = "retrieval.input_invalid"
 EMBEDDING_UNAVAILABLE = "retrieval.embedding_unavailable"
 STORE_UNAVAILABLE = "retrieval.store_unavailable"
@@ -246,7 +256,8 @@ class HandedField:
 @dataclass(frozen=True)
 class HandedRecord:
     """A record handed over for the question (Story 4.3 part C): its id, its tier, its type key and its first page;
-    its name, fields and section path never printed."""
+    its name, fields and section path never printed. From Story 5.5 part A the record it overrides (`overrides`, on an
+    artifact) and the artifact that overrides it (`overridden_by`, on a system record), each None for none."""
 
     record_id: str
     tier: str
@@ -255,6 +266,8 @@ class HandedRecord:
     name: str = field(repr=False)
     fields: tuple[HandedField, ...] = field(repr=False)
     section_path: list[str] = field(repr=False)
+    overrides: str | None = None
+    overridden_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -983,7 +996,7 @@ def _read_handed(
     then those the records search found (`found_tiers`, each of its tier), each once, at most `RESOLVED_LIMIT` in all
     (as many as the records search alone hands at most), in one read. When the read with named records fails, they are
     let go (`TERMS_UNAVAILABLE`, with the failure's code and retry flag) and the found ones alone are read, as before:
-    term resolution never fails an answer."""
+    term resolution never fails an answer. Story 5.5 part A: then the overriding artifacts (`with_overriders`)."""
     wanted: dict[str, str | None] = dict.fromkeys(resolved)
     wanted.update(found_tiers)
     kept = list(wanted)[:RESOLVED_LIMIT]
@@ -998,6 +1011,7 @@ def _read_handed(
         log.warn(TERMS_UNAVAILABLE, jobId=job_id, reason="records", code=failed.code, retry=failed.retry)
         read = read_records(record_reader, job, list(found_tiers), found_tiers) if found_tiers else []
         named = 0
+    read = with_overriders(record_reader, job, read, job_id=job_id, log=log)
     handed = [
         HandedRecord(
             item.record_id,
@@ -1007,7 +1021,51 @@ def _read_handed(
             item.name,
             tuple(HandedField(one.name, one.value) for one in item.fields),
             list(item.section_path),
+            item.overrides,
+            item.overridden_by,
         )
         for item in read
     ]
     return handed, named
+
+
+def with_overriders(
+    record_reader: RecordReader, job: ClaimedJob, read: list[ReadRecord], *, job_id: str, log: TraceLog
+) -> list[ReadRecord]:
+    """The records read with their overriding artifacts (Story 5.5 part A): when a record names the artifact that
+    overrides it (`overridden_by`) and that artifact was not read, it is read in one more call (each of the campaign
+    tier, in the order their records come); then each overriding artifact stands just before the first record it
+    overrides, and every other record keeps its order. A read with no such record asks nothing more. When that read
+    fails (refused, short, unavailable), it is logged (`OVERRIDES_UNAVAILABLE`, with its code and retry flag) and the
+    records whose artifact was not read lose their mark: an override never fails an answer, as term resolution never
+    does."""
+    if not any(item.overridden_by for item in read):
+        return read
+    have = {item.record_id for item in read}
+    missing = list(
+        dict.fromkeys(item.overridden_by for item in read if item.overridden_by and item.overridden_by not in have)
+    )
+    extra: list[ReadRecord] = []
+    if missing:
+        try:
+            extra = read_records(record_reader, job, missing, dict.fromkeys(missing, "campaign"))
+        except SearchFailed as failed:
+            log.warn(OVERRIDES_UNAVAILABLE, jobId=job_id, missing=len(missing), code=failed.code, retry=failed.retry)
+            read = [
+                dataclasses.replace(item, overridden_by=None) if item.overridden_by in missing else item
+                for item in read
+            ]
+    by_id = {item.record_id: item for item in [*read, *extra]}
+    leading = {item.overridden_by for item in read if item.overridden_by in by_id}
+    placed: set[str] = set()
+    ordered: list[ReadRecord] = []
+    for item in read:
+        artifact = item.overridden_by
+        if artifact is not None and artifact in leading and artifact not in placed:
+            ordered.append(by_id[artifact])
+            placed.add(artifact)
+        if item.record_id not in placed:
+            ordered.append(item)
+            placed.add(item.record_id)
+    log.info("answer.overrides_read", jobId=job_id, read=len(extra), overrides=len(leading))
+    return ordered

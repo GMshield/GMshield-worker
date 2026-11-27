@@ -103,6 +103,8 @@ SYSTEM_PROMPT = (
     "version as an alternative, in the order campaign, system, other. Give each version its own paragraph, start that "
     "paragraph with [[tier:<tier>]] (for example [[tier:campaign]], the first version included), and keep the "
     "[[<passage id>]] or [[<record id>]] after each of its statements. "
+    "A record with an overrides attribute replaces the record whose id it names in the GM's campaign: it always "
+    "counts as disagreeing with that record, so state its version first, then the replaced record's as an alternative. "
     "When the tiers agree, or only one tier speaks to the question, answer normally and write no [[tier:...]] marker. "
     "Answer in the language of the question. "
     "If the sources do not answer the question, say so in one sentence and add nothing else."
@@ -145,13 +147,15 @@ class AnswerRoutes(search.PassageReader, search.RecordReader, search.TermResolve
     batches (`backend.client.JobsApi`)."""
 
 
-def record_block(item: search.HandedRecord) -> str:
+def record_block(item: search.HandedRecord, handed: frozenset[str] = frozenset()) -> str:
     """One record as a data block (Story 4.3 part C): its id, tier and type as attributes, its name and each field as
-    escaped elements, in stored order."""
+    escaped elements, in stored order. Story 5.5 part A: an artifact that overrides a record among the `handed` ids
+    carries `overrides` with that record's id; otherwise the block is as before."""
     fields = "".join(f"<field name={quoteattr(one.name)}>{escape(one.value)}</field>" for one in item.fields)
+    overrides = f" overrides={quoteattr(item.overrides)}" if item.overrides and item.overrides in handed else ""
     return (
-        f"<record id={quoteattr(item.record_id)} tier={quoteattr(item.tier)} type={quoteattr(item.type)}>"
-        f"<name>{escape(item.name)}</name>{fields}</record>"
+        f"<record id={quoteattr(item.record_id)} tier={quoteattr(item.tier)} type={quoteattr(item.type)}"
+        f"{overrides}><name>{escape(item.name)}</name>{fields}</record>"
     )
 
 
@@ -179,7 +183,8 @@ def user_turn(
     else:
         passages = NO_PASSAGES
     if records:
-        passages += f"\n{RECORDS_LABEL}:\n" + "\n".join(record_block(item) for item in records)
+        ids = frozenset(item.record_id for item in records)
+        passages += f"\n{RECORDS_LABEL}:\n" + "\n".join(record_block(item, ids) for item in records)
     if history:
         earlier = "\n".join(
             f"<earlier-turn><question>{escape(turn.question)}</question>"
