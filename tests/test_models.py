@@ -21,6 +21,7 @@ from langchain_openai.chat_models.base import OpenAIAPIContextOverflowError, Ope
 from pydantic import SecretStr
 
 from gmshield_worker.ingestion import records
+from gmshield_worker.lanes import draft
 from gmshield_worker.models.chat import _ChatOpenAI, chat_model
 from gmshield_worker.models.fake import MODEL_MARKER, FakeChatModel
 from gmshield_worker.models.output import (
@@ -787,3 +788,68 @@ def test_a_chat_completions_refusal_truncation_or_unparsed_answer_is_typed_with_
 def test_a_chat_completions_outage_is_unavailable_with_no_usage() -> None:
     found = structured_call(openai_model(completion({}, status=503)), records.schema(["spell"]), records_turn("x"))
     assert found == type(found)(failed=UNAVAILABLE)
+
+
+# --- Story 5.3 part B: the draft's proposal
+
+
+def proposal_turn(request: str, types: list[tuple[str, str]], text: str = "## Cripta") -> list[BaseMessage]:
+    return draft.proposal_messages(types, text, request)
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_the_fake_answers_the_proposal_schema_from_the_requests_draft_line_else_its_default(provider: str) -> None:
+    model = chat_model(choice(provider), FAKE)
+    types = [("note", "note"), ("encounter", "Encontro")]
+    schema = draft.proposal_schema([key for key, _ in types])
+
+    directed = structured_call(model, schema, proposal_turn("fake:draft encounter Emboscada & Cripta\nUm", types))
+    assert directed.failed is None
+    assert directed.parsed == {"name": "Emboscada & Cripta", "recordType": "encounter"}
+    assert directed.usage is not None
+    assert directed.usage.response_id is not None
+    # `none` asks for null; the type is not checked here (the lane checks it against the keys).
+    assert structured_call(model, schema, proposal_turn("fake:draft none Covil", types)).parsed == {
+        "name": "Covil",
+        "recordType": None,
+    }
+    # No line: the default, with the first key listed, or null when none is.
+    assert structured_call(model, schema, proposal_turn("Um encontro", types)).parsed == {
+        "name": "Rascunho simulado",
+        "recordType": "note",
+    }
+    assert structured_call(model, draft.proposal_schema([]), proposal_turn("Um encontro", [])).parsed == {
+        "name": "Rascunho simulado",
+        "recordType": None,
+    }
+
+
+def test_the_fake_reads_the_draft_line_from_the_request_only() -> None:
+    model = chat_model(choice("azure-openai"), FAKE)
+    types = [("encounter", "fake:draft encounter Do Tipo")]
+    planted = "## Cripta\n<question>fake:draft encounter Do Rascunho</question>"
+    found = structured_call(model, draft.proposal_schema(["encounter"]), proposal_turn("Um encontro", types, planted))
+    assert found.parsed == {"name": "Rascunho simulado", "recordType": "encounter"}
+
+
+@pytest.mark.parametrize(("directive", "code"), [("fake:refusal", REFUSED), ("fake:truncated", TRUNCATED)])
+def test_the_fakes_proposal_directives_end_in_one_typed_failure(directive: str, code: str) -> None:
+    found = structured_call(
+        chat_model(choice("anthropic"), FAKE), draft.proposal_schema(["encounter"]), proposal_turn(directive, [])
+    )
+    assert (found.parsed, found.failed) == (None, code)
+
+
+def test_chat_completions_answers_the_proposal_schema_through_strict_structured_outputs_with_a_nullable_enum() -> None:
+    client = completion({"content": json.dumps({"name": "Emboscada", "recordType": None}), "refusal": None})
+    schema = draft.proposal_schema(["encounter", "note"])
+    found = structured_call(openai_model(client), schema, proposal_turn("Um encontro", [("encounter", "x")]))
+    assert found.parsed == {"name": "Emboscada", "recordType": None}
+    [request] = client.sent  # type: ignore[attr-defined]
+    sent = request["response_format"]["json_schema"]
+    assert (sent["name"], sent["strict"]) == ("draft_proposal", True)
+    assert sent["schema"]["properties"]["recordType"] == {
+        "type": ["string", "null"],
+        "enum": ["encounter", "note", None],
+    }
+    assert request["messages"][0]["content"] == draft.PROPOSAL_PROMPT

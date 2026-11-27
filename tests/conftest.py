@@ -332,12 +332,13 @@ def _jobs(state: StandIn, path: str, headers: dict[str, str], body: bytes) -> tu
 
 
 def _terms(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
-    """`POST …/terms` (Story 4.6): no body; an answer job's resolved terms, any other kind refused."""
+    """`POST …/terms` (Story 4.6): no body; an answer job's (from Story 5.3 part A a draft job's too) resolved terms,
+    any other kind refused."""
     if state.terms is None:
         return problem(404, "request.not_found")
     if body:
         return problem(400, "request.invalid")
-    if job.kind != "question.answer":
+    if job.kind not in ("question.answer", "content.draft"):
         return problem(403, "job.terms_refused")
     if state.terms_status is not None:
         return problem(state.terms_status, "server.unavailable" if state.terms_status >= 500 else "job.grant_refused")
@@ -789,6 +790,25 @@ def ingestion_result_valid(job: StandInJob, result: object) -> bool:
     )
 
 
+def draft_result_valid(result: object) -> bool:
+    """The backend's rules for a done `content.draft` (Story 5.3 part B, `DraftJobs.completed`): no result or no
+    proposal (a stopped draft, or part A's worker), or a result that is no object; else a proposal object whose name,
+    trimmed, is a string of 1 to 120 code points, and whose `recordType` is a string or null (a key the system lacks
+    is stored as null)."""
+    if not isinstance(result, dict) or "proposal" not in result:
+        # The backend reads a result that is no object (or has no proposal) as no proposal.
+        return True
+    proposal = result["proposal"]
+    if not isinstance(proposal, dict):
+        return False
+    name, record_type = proposal.get("name"), proposal.get("recordType")
+    return (
+        isinstance(name, str)
+        and 1 <= len(name.strip()) <= 120
+        and (record_type is None or isinstance(record_type, str))
+    )
+
+
 def index_result_valid(result: object) -> bool:
     """The backend's rule for a done `index.change` (`IndexChanges.completed`): the recipe it was indexed with."""
     return (
@@ -821,6 +841,8 @@ def _outcome(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
     if done and job.kind == "ingestion" and not ingestion_result_valid(job, outcome.get("result")):
         return problem(400, "job.result_invalid")
     if done and job.kind == "index.change" and not index_result_valid(outcome.get("result")):
+        return problem(400, "job.result_invalid")
+    if done and job.kind == "content.draft" and not draft_result_valid(outcome.get("result")):
         return problem(400, "job.result_invalid")
     job.outcomes.append(outcome)
     for item in outcome.get("usage") or []:

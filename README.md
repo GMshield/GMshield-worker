@@ -740,6 +740,22 @@ lockfile and the production image:
     tier the same way. `answer.started` logs `records` (a count). Deploy order: the backend, then this worker (its
     minimum backend contract becomes 1.19.0), then the frontend.
   - Lines (`answer.started`, `answer.ended`, `events.posted`) carry ids, counts and timings only.
+  - A `content.draft` job (Story 5.3 part A, `lanes/draft.py`) logs the same `answer.*` events under the unit
+    `worker.draft` instead of `worker.answer`, the only difference in its lines.
+  - **The draft's proposal (Story 5.3 part B, backend contract 1.26.0).** Once a draft has streamed to its plain end
+    (not stopped, not failed: `AnswerJob.finished`, which an answer leaves as `Outcome.done()`), one `structured_call`
+    of its own model (`PROPOSAL_MAX_TOKENS` 256, `PROPOSAL_TIMEOUT_SECONDS` 15, so a slow call ends in the fallback;
+    schema `draft_proposal`: `name`, and `recordType`, one of the input's `recordTypes` or null) gets
+    `PROPOSAL_PROMPT` (instructions only) and one user turn holding the record types (each key with its name from the
+    optional `recordTypeNames`, the key itself without one or when its entry is bad) and the draft as sent, escaped
+    inside the document delimiter, then the request. The outcome is `done` with `{"proposal": {name, recordType}}`
+    and that call's usage. A missing `recordType` is null and other properties are ignored; a refused, truncated,
+    unavailable, raising or invalid call (a blank name or one past 120 code points included) gives the fallback: the
+    draft's first Markdown heading (links, emphasis and code marks reduced to text), else the request, cut to 120,
+    with no type. `draft.proposed` logs ids, the code, `fallback`, a core type key (`approved` otherwise) and
+    `nameLength`, never the name. The fake model answers the proposal from a `fake:draft <type|none> <name>` line of
+    the request, else "Rascunho simulado" with the first key (null without keys). The minimum backend contract stays
+    1.20.0.
 - **Text in a material is never an instruction (Story 2.8).** The passages go inside Azure's document delimiter
   (above); `tests/test_planted_instructions.py` pins the defences against one planted material,
   `tests/fixtures/planted/planted-instructions.md` (invented game content in pt-BR and en with a canary `ABACAXI-42`,
