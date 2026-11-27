@@ -68,6 +68,10 @@ of the campaign's system (distinct, at most `MAX_RECORD_TYPES`). Every Qdrant qu
 only record points of those keys (`store.limited`, a `MatchAny` on `record_type`), so a record of a type that system
 never approved is never found; passages are untouched. An input without it (a backend before 1.21.0) limits nothing.
 
+Story 5.3 part B (internal contract 1.26.0): a draft's input may carry `recordTypeNames`, each `recordTypes` key with
+the name of the system's type (`QuestionInput.record_type_names`); retrieval never reads it, and a key it does not name
+(or an input without it, a backend before 1.26.0) is named by the key itself (`QuestionInput.named_types`).
+
 Failures (`SearchFailed`): Ollama `retrieval.embedding_unavailable` and Qdrant `retrieval.store_unavailable`, both
 retryable (nothing has been sent yet); a question the model refuses as too long `retrieval.question_too_long`; a refusal
 of the backend (4xx) its own code (`scope.passage_refused`, ...), or `retrieval.passages_refused` when it names none,
@@ -141,6 +145,8 @@ MAX_HISTORY = 6
 MAX_HISTORY_ANSWER = 4000
 # Story 4.4 part B: the most record type keys a question or a search input carries (a system's core and approved types).
 MAX_RECORD_TYPES = 1000
+# Story 5.3 part B: the longest record type name a draft's input names (the backend's record type name limit).
+MAX_RECORD_TYPE_NAME = 120
 # Story 4.6: how long an answer waits for its question's terms (`POST …/terms`, asked alongside the question's
 # embedding), from the moment it asked; past it the search runs as before.
 TERMS_BUDGET_SECONDS = 1.0
@@ -209,6 +215,13 @@ class QuestionInput:
     history: tuple[EarlierTurn, ...] = field(default=(), repr=False)
     record_type: str | None = None
     record_types: tuple[str, ...] | None = None
+    record_type_names: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+
+    def named_types(self) -> list[tuple[str, str]]:
+        """Story 5.3 part B: each of `record_types` (none when absent) with its name from `recordTypeNames`, the key
+        itself when the input names it not."""
+        names = dict(self.record_type_names)
+        return [(key, names.get(key, key)) for key in self.record_types or ()]
 
 
 @dataclass(frozen=True)
@@ -373,6 +386,7 @@ def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionI
         history=_history(raw["history"]) if "history" in raw else (),
         record_type=record_type,
         record_types=_record_types(raw["recordTypes"]) if "recordTypes" in raw else None,
+        record_type_names=_record_type_names(raw.get("recordTypeNames")),
     )
 
 
@@ -383,6 +397,21 @@ def _record_types(value: object) -> tuple[str, ...]:
     if not all(is_record_type(item) for item in value) or len(set(value)) != len(value):
         raise InputInvalid
     return tuple(value)
+
+
+def _record_type_names(value: object) -> tuple[tuple[str, str], ...]:
+    """A draft's `recordTypeNames` (Story 5.3 part B): an object of record type keys to names; absent, none. An entry
+    that is not a key with a name of 1 to `MAX_RECORD_TYPE_NAME` code points, not blank, is skipped (its key then names
+    itself), so one bad name never fails a draft."""
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise InputInvalid
+    return tuple(
+        (key, name)
+        for key, name in itertools.islice(value.items(), MAX_RECORD_TYPES)
+        if is_record_type(key) and isinstance(name, str) and 1 <= len(name) <= MAX_RECORD_TYPE_NAME and name.strip()
+    )
 
 
 @dataclass(frozen=True)

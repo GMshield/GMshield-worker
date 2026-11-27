@@ -67,7 +67,7 @@ from gmshield_worker.lanes.batches import BATCH_INTERVAL_SECONDS, MAX_EVENTS, Ev
 from gmshield_worker.log import TraceLog
 from gmshield_worker.models import documents
 from gmshield_worker.models.chat import chat_model
-from gmshield_worker.models.output import MODEL_TIER, UNAVAILABLE, CitationMarkers
+from gmshield_worker.models.output import MODEL_TIER, UNAVAILABLE, CitationMarkers, ModelEvent, TextDelta
 from gmshield_worker.models.providers import ModelChoice, ProviderUnavailable
 from gmshield_worker.retrieval import search
 from gmshield_worker.retrieval.embedding import Embedder
@@ -199,7 +199,9 @@ class AnswerJob:
     """The `question.answer` handler: `(job, cancel) -> Outcome`, as the lanes call it.
 
     Story 5.3 part A: `lanes.draft.DraftJob` is this handler with another system message (`instructions`) and log unit
-    (`unit`); everything else (the input, the sources, the user turn, the batches and the outcome rules) is shared."""
+    (`unit`); everything else (the input, the sources, the user turn, the batches and the outcome rules) is shared.
+    Story 5.3 part B: on the plain `done` path only, the outcome is `finished`'s, which a draft overrides to add its
+    proposal."""
 
     api: AnswerRoutes
     embedder: Embedder
@@ -212,6 +214,22 @@ class AnswerJob:
     def instructions(self, model_knowledge: bool, history: bool) -> str:
         """The system message for this input: an answer's (`system_prompt`)."""
         return system_prompt(model_knowledge, history)
+
+    def finished(
+        self,
+        job: ClaimedJob,
+        checked: search.QuestionInput,
+        *,
+        model: BaseChatModel,
+        text: str,
+        cancel: threading.Event,
+        log: TraceLog,
+    ) -> Outcome:
+        """Story 5.3 part B: the outcome of an attempt that streamed to its plain end (not stopped, not failed, no
+        batch refused), given the text the GM was sent (`text`, the deltas, citation markers removed). An answer's is
+        `Outcome.done()`, unchanged; a draft's adds its proposal (`lanes.draft.DraftJob.finished`)."""
+        del job, checked, model, text, cancel, log
+        return Outcome.done()
 
     def __call__(self, job: ClaimedJob, cancel: threading.Event, /) -> Outcome:
         log = TraceLog(self.unit, job.trace_id)
@@ -235,11 +253,19 @@ class AnswerJob:
             HumanMessage(user_turn(handed, checked.question, checked.history, records)),
         ]
         batcher = EventBatcher(self.api, job, cancel, log, interval=self.interval, max_events=self.max_events)
+        sent: list[str] = []
+
+        def emit(event: ModelEvent) -> None:
+            # Story 5.3 part B: the text the GM is sent, for `finished`.
+            if isinstance(event, TextDelta):
+                sent.append(event.text)
+            batcher.emit(event)
+
         node = AnswerWithTools(
             model=model,
             tools=[],
             markers=markers,
-            emit=batcher.emit,
+            emit=emit,
             max_calls=1,
             should_stop=lambda: cancel.is_set() or batcher.halted,
         )
@@ -281,7 +307,7 @@ class AnswerJob:
             # No splice: once a batch was accepted, the GM has seen words of this attempt.
             retry = None if failed == UNAVAILABLE and not batcher.delivered else False
             return Outcome.failed(failed, retry=retry)
-        return Outcome.done()
+        return self.finished(job, checked, model=model, text="".join(sent), cancel=cancel, log=log)
 
     def _prepare(
         self, job: ClaimedJob, log: TraceLog

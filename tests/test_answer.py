@@ -158,6 +158,26 @@ def test_the_fake_answer_streams_in_numbered_batches_the_first_delta_alone_citin
     assert any(line["event"] == "answer.ended" for line in log_lines(logged.out))
 
 
+def test_an_answer_reports_no_result_and_makes_no_proposal_call(
+    stand_in: StandIn, lib: Library, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Story 5.3 part B: only a draft proposes a name and a type; an answer's outcome is unchanged.
+    seen: list[list[BaseMessage]] = []
+    model = recording(seen)
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: model(provider=choice.provider))
+    job = claimed(stand_in, ASKED.question, [tier("system", [SRD, PT])])
+
+    outcome = run(stand_in, lib, job)
+
+    assert outcome == Outcome.done()
+    assert outcome.result is None
+    assert outcome.usage == ()
+    assert len(seen) == 1
+    reported = stand_in.jobs[str(job.job_id)].outcomes[-1]
+    assert reported.get("result") is None
+    assert not any(line["event"] == "draft.proposed" for line in log_lines(capsys.readouterr().out))
+
+
 class LateOutage(FakeChatModel):
     """Streams the first chunks of the fake's answer, then loses the provider."""
 

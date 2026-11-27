@@ -37,6 +37,12 @@ writes there), it writes a draft instead (`draft_text`): "Rascunho simulado (pro
 citing each id it was given, in their order and with no tier marker, or one sentence when it was given none; the model
 paragraph and the directives work as for an answer.
 
+Story 5.3 part B: when the draft's proposal schema (`PROPOSAL_TOOL`, as `lanes.draft.PROPOSAL_TITLE` names it) is
+bound as structured output, the answer is one call of it: `{name, recordType}` from a `fake:draft <type> <name>` line of
+the request (the `<question>` element only, never the draft or the record types; the type a record type key, or `none`
+for null), else "Rascunho simulado" with the first record type key of the user turn (`<record-type key="…">`), or null
+when it lists none. `fake:refusal` and `fake:truncated` give no call and their stop, as for the records schema.
+
 Story 3.10: the earlier turns of a conversation (`<earlier-turn>` elements, as `lanes.answer.user_turn` writes them) are
 left out before anything is read from a user turn, so a directive or an id in an earlier question or answer neither
 changes the answer nor is cited: directives and cited ids come from the question and the passages only.
@@ -45,6 +51,7 @@ changes the answer nor is cited: directives and cited ids come from the question
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -73,6 +80,14 @@ RECORD = "fake:record"
 _RECORD_BLOCK = re.compile(r'<passage id="([0-9a-f-]{36})"[^>]*>(.*?)</passage>', re.ASCII | re.DOTALL)
 # The name starts with a character that is no blank, so no run of blanks is ever matched two ways (linear).
 _RECORD_LINE = re.compile(r"fake:record[ \t]+([a-z][a-z0-9_]{0,31})[ \t]+([^\s<][^\n<]{0,199})")
+# Story 5.3 part B: the draft's proposal schema, the line of the request that sets its answer (the same linear shape
+# as a record's line), the request element and a record type block of the proposal's user turn.
+PROPOSAL_TOOL = "draft_proposal"
+DRAFT_PROPOSAL = "fake:draft"
+DRAFT_DEFAULT_NAME = "Rascunho simulado"
+_DRAFT_LINE = re.compile(r"fake:draft[ \t]+([a-z][a-z0-9_]{0,31})[ \t]+([^\s<][^\n<]{0,199})")
+_QUESTION = re.compile(r"<question>(.*?)</question>", re.DOTALL)
+_RECORD_TYPE = re.compile(r'<record-type key="([a-z][a-z0-9_]{0,31})">', re.ASCII)
 # Story 4.4: the line that asks the fake for one proposal, which quotes the line itself (the same linear shape).
 PROPOSAL = "fake:proposal"
 _PROPOSAL_LINE = re.compile(r"fake:proposal[ \t]+(record_type|term)[ \t]+([^\s<][^\n<]{0,119})")
@@ -146,6 +161,18 @@ def fake_proposals(text: str) -> list[dict[str, Any]]:
                 }
             )
     return found
+
+
+def fake_draft_proposal(text: str) -> dict[str, str | None]:
+    """The fake's draft proposal (Story 5.3 part B), as the module says: from the request's `fake:draft` line, else
+    `DRAFT_DEFAULT_NAME` with the first record type key listed."""
+    request = _QUESTION.search(text)
+    line = _DRAFT_LINE.search(request.group(1)) if request is not None else None
+    if line is not None:
+        kind = line.group(1)
+        return {"name": html.unescape(line.group(2).strip()), "recordType": None if kind == "none" else kind}
+    first = _RECORD_TYPE.search(text)
+    return {"name": DRAFT_DEFAULT_NAME, "recordType": first.group(1) if first is not None else None}
 
 
 def answer_text(
@@ -255,6 +282,12 @@ class FakeChatModel(BaseChatModel):
             yield from self._records(asked, response_id, words, anthropic=anthropic, digest=digest)
             return
 
+        if PROPOSAL_TOOL in tools:
+            yield from self._structured(
+                PROPOSAL_TOOL, fake_draft_proposal(asked), asked, response_id, words, anthropic=anthropic, digest=digest
+            )
+            return
+
         if TOOL in asked and READ_PASSAGES in tools and not results:
             ids = list(dict.fromkeys(_PASSAGE_ID.findall(asked)))
             call = tool_call_chunk(
@@ -290,6 +323,22 @@ class FakeChatModel(BaseChatModel):
     ) -> Iterator[ChatGenerationChunk]:
         """The structured answer of a records step (Story 4.2): one call of `RECORDS_TOOL` (from Story 4.4 with its
         proposals), or a refusal's or a truncation's stop with no call."""
+        found = {"records": fake_records(asked), "proposals": fake_proposals(asked)}
+        yield from self._structured(RECORDS_TOOL, found, asked, response_id, words, anthropic=anthropic, digest=digest)
+
+    def _structured(
+        self,
+        tool: str,
+        answer: Mapping[str, Any],
+        asked: str,
+        response_id: str,
+        words: int,
+        *,
+        anthropic: bool,
+        digest: str,
+    ) -> Iterator[ChatGenerationChunk]:
+        """A structured answer: one call of `tool` with `answer` as its arguments, or a refusal's or a truncation's
+        stop with no call."""
         if REFUSAL in asked:
             yield self._chunk(AIMessageChunk(content=""), response_id, first=True)
             yield self._last("refusal" if anthropic else "content_filter", response_id, words, 0)
@@ -298,8 +347,8 @@ class FakeChatModel(BaseChatModel):
             yield self._chunk(AIMessageChunk(content=""), response_id, first=True)
             yield self._last("max_tokens" if anthropic else "length", response_id, words, 1)
             return
-        args = json.dumps({"records": fake_records(asked), "proposals": fake_proposals(asked)}, ensure_ascii=False)
-        call = tool_call_chunk(name=RECORDS_TOOL, args=args, id=f"call_fake{digest[:12]}", index=0)
+        args = json.dumps(answer, ensure_ascii=False)
+        call = tool_call_chunk(name=tool, args=args, id=f"call_fake{digest[:12]}", index=0)
         yield self._chunk(AIMessageChunk(content="", tool_call_chunks=[call]), response_id, first=True)
         yield self._last("tool_use" if anthropic else "tool_calls", response_id, words, 1)
 
