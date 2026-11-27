@@ -48,6 +48,7 @@ from tests.model_fixtures import content_filter_error
 from tests.test_search import (
     BY_KEY,
     CREDENTIAL,
+    HOUSE,
     KEY,
     OWNER,
     PT,
@@ -60,6 +61,7 @@ from tests.test_search import (
     local,
     question_input,
     serve_fixtures,
+    serve_override,
     serve_records,
     tier,
     with_records,
@@ -1017,6 +1019,57 @@ def test_records_of_a_tier_with_no_passage_give_their_tier_and_its_mark_is_poste
     assert [event["tier"] for event in events if event["type"] == "tier"] == ["campaign", "system"]
     assert any(event.get("recordId") in ids.values() for event in events if event["type"] == "citation")
     assert any("passageId" in event for event in events if event["type"] == "citation")
+
+
+# --- Story 5.5 part A: an artifact overrides a system record
+
+
+def test_an_override_leads_with_the_artifact_marked_as_replacing_the_record_and_the_tiers_disagree(
+    stand_in: StandIn, with_records: RecordLibrary, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[list[BaseMessage]] = []
+
+    class Recording(FakeChatModel):
+        def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
+            seen.append(list(messages))
+            return super()._stream(messages, *args, **kwargs)
+
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: Recording(provider=choice.provider))
+    serve_records(stand_in, with_records)
+    fireball = serve_override(stand_in, with_records)
+    job = claimed(stand_in, SEARCHES["s-fire-damage"].query, [tier("campaign", [HOUSE]), tier("system", [SRD])])
+
+    assert run(stand_in, Library(with_records.spy), job) == Outcome.done()
+
+    user = str(next(message for message in seen[0] if isinstance(message, HumanMessage)).content)
+    house = f'<record id="{HOUSE}" tier="campaign" type="spell" overrides="{fireball}"><name>Bola de Fogo (casa)</name>'
+    assert house in user
+    assert user.index(house) < user.index(f'<record id="{fireball}" tier="system"')
+    assert user.count("overrides=") == 1
+    system = [str(message.content) for message in seen[0] if isinstance(message, SystemMessage)]
+    assert system == [answer.SYSTEM_PROMPT]
+    assert "always counts as disagreeing" in answer.SYSTEM_PROMPT
+    # The fake reads them as disagreeing: the artifact's version first, under the campaign tier, then the system's.
+    events = every_event(stand_in, job)
+    assert [event["tier"] for event in events if event["type"] == "tier"][:2] == ["campaign", "system"]
+    cited = [event.get("recordId") for event in events if event["type"] == "citation"]
+    assert cited.index(HOUSE) < cited.index(fireball)
+
+
+def test_an_artifact_names_the_record_it_overrides_only_when_that_record_is_handed_too() -> None:
+    record = search.HandedRecord(
+        HOUSE, "campaign", "spell", 1, "Bola de Fogo (casa)", (), [], overrides="0195a3c0-0000-7000-8000-0000000000f9"
+    )
+    alone = answer.user_turn([], "Bola de Fogo?", (), [record])
+    assert "overrides=" not in alone
+    assert f'<record id="{HOUSE}" tier="campaign" type="spell"><name>' in alone
+    target = search.HandedRecord(
+        "0195a3c0-0000-7000-8000-0000000000f9", "system", "spell", 1, "Bola de Fogo", (), [], overridden_by=HOUSE
+    )
+    both = answer.user_turn([], "Bola de Fogo?", (), [record, target])
+    assert 'overrides="0195a3c0-0000-7000-8000-0000000000f9"' in both
+    # The record it overrides carries no attribute of its own.
+    assert '<record id="0195a3c0-0000-7000-8000-0000000000f9" tier="system" type="spell"><name>' in both
 
 
 # --- Story 4.6: questions understand the system's terms

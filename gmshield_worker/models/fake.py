@@ -32,6 +32,11 @@ Story 4.3 part C: a record block of the user turn (`<record id="…" tier="…" 
 it after the passages) is cited by its id as a passage is, in the order the blocks come, with its tier like a
 passage's.
 
+Story 5.5 part A: an artifact's record block that names the record it overrides (`overrides="…"`, which
+`lanes.answer.record_block` writes only when that record is handed too) always meets that record's block of another
+tier (campaign and system), so the answer is one paragraph per tier, the artifact's campaign paragraph first: the fake
+reads an override as the tiers disagreeing, as `lanes.answer.SYSTEM_PROMPT` tells a real model to.
+
 Story 5.3 part A: when its system message is a draft's (it holds `DRAFT_MARKER`, which only `lanes.draft.DRAFT_PROMPT`
 writes there), it writes a draft instead (`draft_text`): "Rascunho simulado (provider)" under a heading, one field
 citing each id it was given, in their order and with no tier marker, or one sentence when it was given none; the model

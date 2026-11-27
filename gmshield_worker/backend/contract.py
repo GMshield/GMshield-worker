@@ -35,6 +35,9 @@ import re
 # 1.26.0 (Story 5.3 part B): a `content.draft` input may carry `recordTypeNames`, and a draft's result carries its
 # `proposal` {name, recordType}. The worker reads the names as optional (each key is its own name without them), and a
 # backend before 1.26.0 ignores a draft's result, so the minimum stays at 1.20.0 (deploy order: backend, then worker).
+# 1.27.0 (Story 5.5 part A): a records read may carry `overrides` (on an artifact) and `overriddenBy` (on a system
+# record). The worker reads both as optional (an older backend sends neither, and answers are as before), so the minimum
+# stays at 1.20.0 (deploy order: backend, then worker, then frontend).
 MINIMUM_BACKEND_CONTRACT_VERSION = "1.20.0"
 # The first contract with `PUT /internal/v1/index-recipe`: the worker states its index recipe at every check only to a
 # backend at least this new, and works as before with an older one (the minimum above stays).

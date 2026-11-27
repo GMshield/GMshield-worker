@@ -6,6 +6,7 @@ the Qdrant client proves the owner and source filters are on every query. No mod
 from __future__ import annotations
 
 import base64
+import dataclasses
 import itertools
 import json
 import math
@@ -2215,3 +2216,111 @@ def test_terms_seconds_is_the_term_calls_own_time(
     embed = done["embedSeconds"]
     assert isinstance(embed, float)
     assert embed < 0.3
+
+
+# --- Story 5.5 part A: an artifact overrides a system record
+
+HOUSE = "0195a3c0-0000-7000-8000-00000000a5a1"  # an artifact of the campaign (its own source, as the backend lists it)
+
+
+def serve_override(stand_in: StandIn, lib: RecordLibrary) -> str:
+    """The backend's marks: the campaign's artifact `HOUSE` overrides the SRD's Fireball record; its id."""
+    fireball = lib.spells["srd-fireball"]
+    stand_in.records[fireball] = dataclasses.replace(stand_in.records[fireball], overridden_by=HOUSE)
+    stand_in.records[HOUSE] = StandInRecord(HOUSE, "spell", "Bola de Fogo (casa)", [("Dano", "6d6")], 1, [], fireball)
+    return fireball
+
+
+def test_an_overridden_record_brings_its_artifact_just_before_it_in_one_more_read(
+    stand_in: StandIn, with_records: RecordLibrary, capsys: pytest.CaptureFixture[str]
+) -> None:
+    serve_fixtures(stand_in)
+    serve_records(stand_in, with_records)
+    fireball = serve_override(stand_in, with_records)
+    tiers = [tier("campaign", [HOUSE]), tier("system", [SRD])]
+
+    found = find_sources(stand_in, Library(with_records.spy), SEARCHES["s-fire-damage"].query, tiers)
+
+    records = [item.record_id for item in found.records]
+    assert records.index(HOUSE) == records.index(fireball) - 1
+    house = found.records[records.index(HOUSE)]
+    assert (house.tier, house.overrides, house.overridden_by) == ("campaign", fireball, None)
+    assert found.records[records.index(fireball)].overridden_by == HOUSE
+    # The search found the record, never the artifact: it is read in one more call, of its id alone.
+    reads = records_requests(stand_in)
+    assert len(reads) == 2
+    assert HOUSE not in reads[0]
+    assert reads[1] == [HOUSE]
+    lines = [line for line in log_lines(capsys.readouterr().out) if line["event"] == "answer.overrides_read"]
+    assert [(line["read"], line["overrides"]) for line in lines] == [(1, 1)]
+
+
+def _read(record_id: str, tier_name: str, *, overrides: str | None = None, by: str | None = None) -> ReadRecord:
+    return ReadRecord(record_id, tier_name, "spell", 1, "x", [RecordField("a", "b")], [], overrides, by)
+
+
+def _job() -> ClaimedJob:
+    now = datetime.now(UTC)
+    return ClaimedJob(uuid.uuid4(), uuid.uuid4(), 1, now, now, "question.answer", {}, new_trace_id(), "g" * 43)
+
+
+class _Reader:
+    """A records reader that answers each id it is asked as a campaign record, and counts its calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def records(self, job: ClaimedJob, ids: list[str]) -> RecordsAnswer:
+        self.calls.append(list(ids))
+        return RecordsAnswer(200, [_read(record_id, "campaign", overrides="r") for record_id in ids])
+
+
+def test_a_handed_overrider_moves_before_its_record_and_a_read_without_marks_asks_nothing_more() -> None:
+    reader = _Reader()
+    job = _job()
+    log = TraceLog("test", job.trace_id)
+    plain = [_read("a", "system"), _read("b", "system")]
+
+    assert search.with_overriders(reader, job, plain, job_id="j", log=log) == plain
+    # Handed after its record: moved just before it, and read no more.
+    handed = [_read("x", "system"), _read("r", "system", by="art"), _read("art", "campaign", overrides="r")]
+    ordered = search.with_overriders(reader, job, handed, job_id="j", log=log)
+    assert [item.record_id for item in ordered] == ["x", "art", "r"]
+    assert reader.calls == []
+    # Not handed: read once, even when it overrides two records it leads the first.
+    missing = [_read("r1", "system", by="art"), _read("y", "system"), _read("r2", "system", by="art")]
+    ordered = search.with_overriders(reader, job, missing, job_id="j", log=log)
+    assert [item.record_id for item in ordered] == ["art", "r1", "y", "r2"]
+    assert reader.calls == [["art"]]
+
+
+def test_an_overriding_artifact_the_backend_refuses_or_leaves_out_drops_the_mark_and_the_answer_goes_on(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Gone(_Reader):
+        def records(self, job: ClaimedJob, ids: list[str]) -> RecordsAnswer:
+            self.calls.append(list(ids))
+            return RecordsAnswer(200, [])
+
+    class Refused(_Reader):
+        def records(self, job: ClaimedJob, ids: list[str]) -> RecordsAnswer:
+            self.calls.append(list(ids))
+            return RecordsAnswer(403, None, "scope.passage_refused")
+
+    job = _job()
+    for reader, code in ((Gone(), search.RECORDS_UNAVAILABLE), (Refused(), "scope.passage_refused")):
+        read = [_read("x", "system"), _read("r", "system", by="art"), _read("y", "system", by="kept")]
+        read.append(_read("kept", "campaign", overrides="y"))
+
+        ordered = search.with_overriders(reader, job, read, job_id="j", log=TraceLog("test", job.trace_id))
+
+        assert reader.calls == [["art"]]
+        # The record whose artifact was not read answers alone, unmarked; the handed overrider still leads its record.
+        assert [(item.record_id, item.overridden_by) for item in ordered] == [
+            ("x", None),
+            ("r", None),
+            ("kept", None),
+            ("y", "kept"),
+        ]
+        lines = [line for line in log_lines(capsys.readouterr().out) if line["event"] == search.OVERRIDES_UNAVAILABLE]
+        assert [(line["missing"], line["code"]) for line in lines] == [(1, code)]

@@ -236,7 +236,9 @@ class RecordField:
 @dataclass(frozen=True)
 class ReadRecord:
     """A record the backend served by id (contract 1.19.0, Story 4.3 part C): library data, never an instruction. Its
-    id, tier, core type key and first page print; its name, fields and section path are never printed or logged."""
+    id, tier, core type key and first page print; its name, fields and section path are never printed or logged. From
+    contract 1.27.0 (Story 5.5 part A) an artifact may name the record it overrides (`overrides`) and a record the
+    artifact that overrides it (`overridden_by`), each None when absent (always, from an older backend)."""
 
     record_id: str
     tier: str
@@ -245,6 +247,8 @@ class ReadRecord:
     name: str = field(repr=False)
     fields: list[RecordField] = field(repr=False)
     section_path: list[str] = field(repr=False)
+    overrides: str | None = None
+    overridden_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -303,6 +307,11 @@ def _call_usage(usage: Usage) -> JobCallUsage:
 
 def _code(parsed: object) -> str | None:
     return parsed.code if isinstance(parsed, Problem) else None
+
+
+def _optional_id(value: UUID | Unset | None) -> str | None:
+    """An optional id of a response (contract 1.27.0's overrides): its text, or None when absent."""
+    return None if value is None or isinstance(value, Unset) else str(value)
 
 
 def _model(parsed: JobModel | Unset) -> ModelChoice | None:
@@ -411,6 +420,8 @@ class JobsApi:
                         name=item.name,
                         fields=[RecordField(one.name, one.value) for one in item.fields],
                         section_path=list(item.section_path),
+                        overrides=_optional_id(item.overrides),
+                        overridden_by=_optional_id(item.overridden_by),
                     )
                     for item in parsed.records
                 ],

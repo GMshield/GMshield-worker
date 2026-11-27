@@ -385,6 +385,18 @@ lockfile and the production image:
   field): the answer finds, reads and cites it as any record, by `recordId`. Only a backend at 1.24.0 creates either
   kind, so `MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.20.0; deploy this worker first, then the backend, then the
   frontend.
+- **An artifact overrides a system record (Story 5.5 part A, backend internal contract 1.27.0; no pipeline or recipe
+  bump).** A records read (`POST …/records`) may carry `overrides` on a campaign artifact (the id of the system record
+  it replaces in that campaign) and `overriddenBy` on that record (the artifact's id); the backend sets each only when
+  both sides are in the job's frozen scope, and the worker copies them (`ReadRecord`, `HandedRecord`). When a handed
+  record names an artifact that was not handed, `search.with_overriders` reads it in one more call (after
+  `RESOLVED_LIMIT`), and every overriding artifact is handed just before the record it replaces; the line
+  `answer.overrides_read` counts both; when that read fails, `answer.overrides_unavailable` logs it and those records answer without their mark. The artifact's record block carries `overrides="<id>"` only when that record is
+  handed too (`lanes.answer.record_block`), and `SYSTEM_PROMPT` says such a record always counts as disagreeing with
+  the one it names, so the artifact's version leads under `[[tier:campaign]]` and the record follows under
+  `[[tier:system]]`; the fake model answers the same way. Drafts follow the campaign version only, as before. An older
+  backend sends neither field, so answers are as before and `MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.20.0; deploy the
+  backend, then this worker, then the frontend.
 - **Index an accepted material (Story 2.1, AD-10, backend contract 1.7.0 or later).** Every claim states the
   worker's `INDEX_RECIPE` (`retrieval/recipe.py`; bump it on any change to the model, the embedding input, the
   splitting or the keyword scheme): the backend re-indexes each source recorded under another one. From backend

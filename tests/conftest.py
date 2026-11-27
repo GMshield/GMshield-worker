@@ -132,7 +132,9 @@ class StandInPassage:
 @dataclass(frozen=True)
 class StandInRecord:
     """A record the backend holds (Story 4.3 part C): its source (a version id), type key, name, fields (name, value)
-    in order, first page and section path."""
+    in order, first page and section path. Story 5.5 part A: the record it overrides and the artifact that overrides
+    it (contract 1.27.0's `overrides` and `overriddenBy`), each sent only when set; an artifact's source is its own id,
+    which the campaign tier lists, as the backend lists a campaign's artifacts."""
 
     source: str
     type: str
@@ -140,6 +142,8 @@ class StandInRecord:
     fields: list[tuple[str, str]]
     page: int
     section_path: list[str]
+    overrides: str | None = None
+    overridden_by: str | None = None
 
 
 @dataclass
@@ -390,17 +394,20 @@ def _records(state: StandIn, job: StandInJob, body: bytes) -> tuple[int, Any]:
         tier = _tier_of(job, record.source) if record is not None else None
         if record is None or tier is None:
             return problem(403, "scope.passage_refused")
-        found.append(
-            {
-                "id": record_id,
-                "tier": tier,
-                "type": record.type,
-                "name": record.name,
-                "fields": [{"name": name, "value": value} for name, value in record.fields],
-                "page": record.page,
-                "sectionPath": record.section_path,
-            }
-        )
+        served: dict[str, Any] = {
+            "id": record_id,
+            "tier": tier,
+            "type": record.type,
+            "name": record.name,
+            "fields": [{"name": name, "value": value} for name, value in record.fields],
+            "page": record.page,
+            "sectionPath": record.section_path,
+        }
+        if record.overrides is not None:
+            served["overrides"] = record.overrides
+        if record.overridden_by is not None:
+            served["overriddenBy"] = record.overridden_by
+        found.append(served)
     return 200, {"records": found}
 
 
