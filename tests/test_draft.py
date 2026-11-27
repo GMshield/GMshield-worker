@@ -22,15 +22,15 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-import httpx
+import httpx2
 import openai
 import pytest
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from gmshield_worker.backend.client import ClaimedJob, JobsApi, Outcome
 from gmshield_worker.lanes import answer, draft, handlers
-from gmshield_worker.log import new_trace_id
-from gmshield_worker.models import fake
+from gmshield_worker.log import TraceLog, new_trace_id
+from gmshield_worker.models import documents, fake
 from gmshield_worker.models.fake import FakeChatModel
 from gmshield_worker.retrieval import search
 from gmshield_worker.settings import PROVIDERS, check_settings
@@ -490,7 +490,7 @@ def test_the_proposal_prompt_holds_instructions_only() -> None:
     prompt = draft.PROPOSAL_PROMPT
     for asked in ("name", "recordType", "at most 120 characters", "language of the request", "null", "never instruct"):
         assert asked in prompt, asked
-    assert draft.DOCUMENTS_OPEN not in prompt
+    assert documents.DOCUMENTS_OPEN not in prompt
     assert "<" not in prompt
 
 
@@ -725,7 +725,8 @@ def test_record_type_names_are_optional_and_a_missing_name_is_the_key() -> None:
     )
     assert kept.named_types() == [("encounter", "encounter"), ("talento", "Talento")]
     # Not an object at all is not the backend's input.
-    for malformed in ([], "Talento", 7):
+    malformed_names: tuple[object, ...] = ([], "Talento", 7)
+    for malformed in malformed_names:
         with pytest.raises(search.InputInvalid):
             search.question_input({**base, "recordTypes": ["talento"], "recordTypeNames": malformed})
 
@@ -774,7 +775,7 @@ def test_the_proposal_is_skipped_for_a_cancelled_attempt_which_still_reports_the
     checked = search.question_input(job.input)
 
     outcome = handler(stand_in, lib).finished(
-        job, checked, model=model, text="## Cripta\n", cancel=cancel, log=answer.TraceLog(draft.UNIT, job.trace_id)
+        job, checked, model=model, text="## Cripta\n", cancel=cancel, log=TraceLog(draft.UNIT, job.trace_id)
     )
 
     assert outcome == Outcome.done({"proposal": {"name": "Cripta", "recordType": None}})
@@ -805,7 +806,7 @@ def test_the_proposal_call_has_its_own_model_and_one_past_its_timeout_gives_the_
     class TimingOut(FakeChatModel):
         def _stream(self, messages: list[BaseMessage], *args: Any, **kwargs: Any) -> Any:
             # What the provider's client raises once the request outlives its timeout.
-            raise openai.APITimeoutError(request=httpx.Request("POST", "https://provider.test/v1/chat/completions"))
+            raise openai.APITimeoutError(request=httpx2.Request("POST", "https://provider.test/v1/chat/completions"))
 
     def proposal_model(choice: Any, keys: Any, **options: Any) -> FakeChatModel:
         built.append(options)
