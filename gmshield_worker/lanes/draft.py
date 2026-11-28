@@ -18,10 +18,10 @@ message and its own log unit. Everything else is the answer's, unchanged:
 `DRAFT_PROMPT` asks for Markdown under a heading that names the content, with its fields, a `[[<id>]]` citation after
 each element drawn from a source, the campaign tier's version when tiers disagree (no alternative and no
 `[[tier:...]]` marker), the request's language, and one sentence when nothing fits. `HISTORY_RULE` is added as
-`lanes.answer.system_prompt` adds it, and, only when the turn's model knowledge is on, `DRAFT_MODEL_KNOWLEDGE_RULE`
-(the draft's wording of the answer's rule): one uncited paragraph opened by `[[tier:model]]` after the draft, the only
-tier marker allowed. Its opening words are `models.fake.DRAFT_MARKER`, which tells the test-mode fake model to write a
-draft. Nothing is written to the library.
+`lanes.answer.system_prompt` adds it, then `PARTY_RULE` when the input carries the party (Story 7.1), and, only when
+the turn's model knowledge is on, `DRAFT_MODEL_KNOWLEDGE_RULE` (the draft's wording of the answer's rule): one uncited
+paragraph opened by `[[tier:model]]` after the draft, the only tier marker allowed. Its opening words are
+`models.fake.DRAFT_MARKER`, which tells the test-mode fake model to write a draft. Nothing is written to the library.
 
 Story 5.3 part B (internal contract 1.26.0), the proposal: once a draft has streamed to its plain end (not stopped, not
 failed, no batch refused: `AnswerJob.finished`), one more model call says what it is.
@@ -59,7 +59,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from gmshield_worker.backend.client import ClaimedJob, Outcome
-from gmshield_worker.lanes.answer import DOCUMENTS_CLOSE, DOCUMENTS_OPEN, HISTORY_RULE, AnswerJob
+from gmshield_worker.lanes.answer import DOCUMENTS_CLOSE, DOCUMENTS_OPEN, HISTORY_RULE, PARTY_RULE, AnswerJob
 from gmshield_worker.log import TraceLog
 from gmshield_worker.models.chat import chat_model
 from gmshield_worker.models.output import Usage, new_call_id
@@ -100,13 +100,15 @@ DRAFT_MODEL_KNOWLEDGE_RULE = (
 )
 
 
-def draft_prompt(model_knowledge: bool, history: bool = False) -> str:
+def draft_prompt(model_knowledge: bool, history: bool = False, party: bool = False) -> str:
     """The system message of a draft: `DRAFT_PROMPT`, then `HISTORY_RULE` only when the input carries earlier turns,
-    then `DRAFT_MODEL_KNOWLEDGE_RULE` only when model knowledge is on, as `lanes.answer.system_prompt` adds an
-    answer's."""
+    then `PARTY_RULE` only when it carries the party (Story 7.1), then `DRAFT_MODEL_KNOWLEDGE_RULE` only when model
+    knowledge is on, as `lanes.answer.system_prompt` adds an answer's."""
     rules = [DRAFT_PROMPT]
     if history:
         rules.append(HISTORY_RULE)
+    if party:
+        rules.append(PARTY_RULE)
     if model_knowledge:
         rules.append(DRAFT_MODEL_KNOWLEDGE_RULE)
     return " ".join(rules)
@@ -118,9 +120,9 @@ class DraftJob(AnswerJob):
 
     unit: ClassVar[str] = UNIT
 
-    def instructions(self, model_knowledge: bool, history: bool) -> str:
+    def instructions(self, model_knowledge: bool, history: bool, party: bool = False) -> str:
         """The system message for this input: a draft's (`draft_prompt`)."""
-        return draft_prompt(model_knowledge, history)
+        return draft_prompt(model_knowledge, history, party)
 
     def finished(
         self,

@@ -397,6 +397,16 @@ lockfile and the production image:
   `[[tier:system]]`; the fake model answers the same way. Drafts follow the campaign version only, as before. An older
   backend sends neither field, so answers are as before and `MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.20.0; deploy the
   backend, then this worker, then the frontend.
+- **The party's size and level (Story 7.1, backend internal contract 1.28.0; no pipeline or recipe bump).** A
+  `question.answer` or `content.draft` input may carry `party: {size?, level?}`, the campaign's party frozen on the turn
+  (`search.Party`: each a whole number of 1 or more, at least one, no other key; anything else is
+  `retrieval.input_invalid`; the upper bounds are the backend's and are not repeated here, so raising one never fails a
+  question; a search input never carries it). The answer and the draft put it first inside the document delimiter as
+  one escaped `<party size="4" level="5"/>` element under `PARTY_LABEL` (an unset value has no attribute), data and
+  never instructions, and only then the system message adds `PARTY_RULE` (what the values are; never cited); no value reaches
+  the system message, the search or a line (`answer.started` logs `party` as a boolean). Without it the messages are as
+  before. Fitting loot and encounters to the party is Story 7.3. A backend before 1.28.0 sends none, so
+  `MINIMUM_BACKEND_CONTRACT_VERSION` stays 1.20.0; deploy this worker first, then the backend, then the frontend.
 - **Index an accepted material (Story 2.1, AD-10, backend contract 1.7.0 or later).** Every claim states the
   worker's `INDEX_RECIPE` (`retrieval/recipe.py`; bump it on any change to the model, the embedding input, the
   splitting or the keyword scheme): the backend re-indexes each source recorded under another one. From backend
