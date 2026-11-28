@@ -920,6 +920,20 @@ def test_an_unrecorded_question_fails_the_test(stand_in: StandIn, indexed: Libra
         {"history": [{"question": 1, "answer": "y"}]},
         {"history": [{"question": "x", "answer": None}]},
         {"history": ["x"]},
+        # Story 7.1: party, when present, holds a size and a level, each a whole number of 1 or more, at least one,
+        # nothing else.
+        {"party": None},
+        {"party": {}},
+        {"party": [4, 5]},
+        {"party": {"size": 0}},
+        {"party": {"size": 2.5}},
+        {"party": {"size": "4"}},
+        {"party": {"size": True}},
+        {"party": {"level": 0}},
+        {"party": {"level": -3}},
+        {"party": {"level": 2.5}},
+        {"party": {"size": None, "level": 5}},
+        {"party": {"size": 4, "players": ["Ana"]}},
     ],
 )
 def test_an_input_that_is_not_the_backends_fails_without_a_retry(
@@ -952,6 +966,20 @@ def test_history_is_read_oldest_first_absent_is_none_and_a_search_input_carries_
     assert search.question_input(query, field="query").history == ()
     with pytest.raises(search.InputInvalid):
         search.question_input({**query, "history": []}, field="query")
+
+
+def test_the_party_is_read_absent_is_none_and_a_search_input_carries_none() -> None:
+    raw = question_input("Vorpal Sword", [tier("system", [SRD])])
+    assert search.question_input(raw).party is None
+    assert search.question_input({**raw, "party": {"size": 4, "level": 5}}).party == search.Party(size=4, level=5)
+    assert search.question_input({**raw, "party": {"level": 40}}).party == search.Party(level=40)
+    assert search.question_input({**raw, "party": {"size": 20, "level": 999}}).party == search.Party(20, 999)
+    # No upper bound here: the backend owns the limits, so a raised one never fails a question.
+    assert search.question_input({**raw, "party": {"size": 21, "level": 1000}}).party == search.Party(21, 1000)
+    assert search.question_input({**raw, "party": {"size": 1}}).party == search.Party(size=1)
+    query = {**raw, "query": raw.pop("question")}
+    with pytest.raises(search.InputInvalid):
+        search.question_input({**query, "party": {"size": 4}}, field="query")
 
 
 def test_model_knowledge_is_read_from_the_input_and_absent_is_off() -> None:

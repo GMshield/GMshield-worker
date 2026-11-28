@@ -86,6 +86,7 @@ def claimed(
     history: list[dict[str, str]] | None = None,
     record_types: list[str] | None = None,
     record_type_names: dict[str, str] | None = None,
+    party: dict[str, int] | None = None,
 ) -> ClaimedJob:
     serve_fixtures(stand_in)
     job_input = question_input(text, tiers)
@@ -97,6 +98,8 @@ def claimed(
         job_input["recordTypes"] = record_types
     if record_type_names is not None:
         job_input["recordTypeNames"] = record_type_names
+    if party is not None:
+        job_input["party"] = party
     job_id = stand_in.offer(draft.KIND, job_input, new_trace_id(), model=model_of(provider))
     claim = JobsApi(stand_in.url, CREDENTIAL, providers=PROVIDERS).claim(UUID(job_id), new_trace_id())
     assert claim.job is not None, claim
@@ -358,6 +361,27 @@ def test_earlier_turns_add_the_history_rule_and_stay_escaped_data_never_cited(
     logged = capsys.readouterr().out
     assert "Rascunho antigo" not in logged
     assert [line["history"] for line in log_lines(logged) if line["event"] == "answer.started"] == [1]
+
+
+def test_a_party_adds_the_party_rule_and_stays_escaped_data(
+    stand_in: StandIn, lib: Library, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list[list[BaseMessage]] = []
+    model = recording(seen)
+    monkeypatch.setattr(answer, "chat_model", lambda choice, keys: model(provider=choice.provider))
+    job = claimed(stand_in, REQUEST, [tier("system", [SRD, PT])], party={"level": 40})
+
+    assert proposed(run(stand_in, lib, job))
+
+    system = [str(message.content) for message in seen[0] if isinstance(message, SystemMessage)]
+    assert system == [f"{draft.DRAFT_PROMPT} {answer.PARTY_RULE}"]
+    assert draft.draft_prompt(True, True, True) == (
+        f"{draft.DRAFT_PROMPT} {answer.HISTORY_RULE} {answer.PARTY_RULE} {draft.DRAFT_MODEL_KNOWLEDGE_RULE}"
+    )
+    user = str(next(message for message in seen[0] if isinstance(message, HumanMessage)).content)
+    assert user.count('<party level="40"/>') == 1
+    assert user.index("<party") < user.index(documents.DOCUMENTS_CLOSE)
+    assert [line["party"] for line in log_lines(capsys.readouterr().out) if line["event"] == "answer.started"] == [True]
 
 
 # ---- terms and records

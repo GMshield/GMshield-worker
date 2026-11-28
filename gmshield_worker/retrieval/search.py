@@ -79,6 +79,11 @@ Story 5.3 part B (internal contract 1.26.0): a draft's input may carry `recordTy
 the name of the system's type (`QuestionInput.record_type_names`); retrieval never reads it, and a key it does not name
 (or an input without it, a backend before 1.26.0) is named by the key itself (`QuestionInput.named_types`).
 
+Story 7.1 (internal contract 1.28.0): a question or draft input may carry `party`, the turn's frozen party size and
+level (`{"size": 4, "level": 5}`, each optional, at least one present). Retrieval never reads it; the answer and the
+draft put it in the user turn as data (`Party`). Absent (a backend before 1.28.0, or a campaign with neither value set),
+it is None.
+
 Failures (`SearchFailed`): Ollama `retrieval.embedding_unavailable` and Qdrant `retrieval.store_unavailable`, both
 retryable (nothing has been sent yet); a question the model refuses as too long `retrieval.question_too_long`; a refusal
 of the backend (4xx) its own code (`scope.passage_refused`, ...), or `retrieval.passages_refused` when it names none,
@@ -209,13 +214,23 @@ class EarlierTurn:
 
 
 @dataclass(frozen=True)
+class Party:
+    """The turn's frozen party (Story 7.1, contract 1.28.0): the number of players and their level, each None when the
+    GM has not set it, never both None. Campaign data the model may read, as data."""
+
+    size: int | None = None
+    level: int | None = None
+
+
+@dataclass(frozen=True)
 class QuestionInput:
     """The checked question input. `model_knowledge` (Story 3.8, contract 1.15.0) is the turn's frozen switch: whether
     the model may add its own knowledge, each such part under `[[tier:model]]`; absent from the input, it is off.
     `history` (Story 3.10, contract 1.16.0) is the conversation's earlier turns, oldest first; absent, there is none.
     `record_type` (Story 4.3 part B, contract 1.18.0) is a search's record-type filter, a record type key; absent,
     None. `record_types` (Story 4.4 part B, contract 1.21.0) is the campaign's system's keys, to which every search
-    that may answer records is limited; absent, None (nothing is limited). Retrieval reads `question` alone."""
+    that may answer records is limited; absent, None (nothing is limited). `party` (Story 7.1, contract 1.28.0) is the
+    turn's frozen party size and level; absent, None. Retrieval reads `question` alone."""
 
     owner: str
     tiers: tuple[TierScope, ...]
@@ -226,6 +241,7 @@ class QuestionInput:
     record_type: str | None = None
     record_types: tuple[str, ...] | None = None
     record_type_names: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    party: Party | None = None
 
     def named_types(self) -> list[tuple[str, str]]:
         """Story 5.3 part B: each of `record_types` (none when absent) with its name from `recordTypeNames`, the key
@@ -364,7 +380,8 @@ def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionI
     """The question input, checked; `InputInvalid` otherwise. With `field="query"` (Story 3.9) it is the backend's
     search input instead: the same shape, its text (1 to `MAX_QUERY` code points) under `query`, kept as `question`;
     a search input carries no `history`, and may carry `recordType` (Story 4.3 part B), a record type key, which a
-    question input never does; either may carry `recordTypes` (Story 4.4 part B)."""
+    question input never does; either may carry `recordTypes` (Story 4.4 part B). A question input may carry `party`
+    (Story 7.1), which a search input never does."""
     if field not in ("question", "query"):
         raise ValueError(field)
     question = raw.get(field)
@@ -387,6 +404,8 @@ def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionI
         raise InputInvalid
     if field == "question" and "recordType" in raw:
         raise InputInvalid
+    if field == "query" and "party" in raw:
+        raise InputInvalid
     record_type = raw.get("recordType")
     if record_type is not None and not is_record_type(record_type):
         raise InputInvalid
@@ -400,7 +419,28 @@ def question_input(raw: dict[str, Any], *, field: str = "question") -> QuestionI
         record_type=record_type,
         record_types=_record_types(raw["recordTypes"]) if "recordTypes" in raw else None,
         record_type_names=_record_type_names(raw.get("recordTypeNames")),
+        party=_party(raw["party"]) if "party" in raw else None,
     )
+
+
+def _party_value(value: object) -> int | None:
+    """One party value (Story 7.1): absent, None; otherwise a whole number (never a bool) of 1 or more. The upper bounds
+    are the backend's (`library`), not repeated here, so raising one there never fails a question here."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise InputInvalid
+    return value
+
+
+def _party(value: object) -> Party:
+    """The turn's party (Story 7.1): an object of `size` and `level`, each a whole number of 1 or more, each optional,
+    at least one present, and no other key."""
+    if not isinstance(value, dict) or not value or not set(value) <= {"size", "level"}:
+        raise InputInvalid
+    if any(item is None for item in value.values()):
+        raise InputInvalid
+    return Party(size=_party_value(value.get("size")), level=_party_value(value.get("level")))
 
 
 def _record_types(value: object) -> tuple[str, ...]:
